@@ -1,0 +1,347 @@
+{
+  "note": "Traditional Chinese names as the zh-TW game client writes them, by the Id in tartarus-data.json. Fill \"zh\" from the game screen; an empty \"zh\" falls back to the English name. Sources: the zh-TW screenshots and the card screenshots in chinese/SS14 塔羅斯困獸賽季機制Tier表.xlsx, each matched to its English entry by its effect text; 刑具, 獄中事變 and 典獄秘藏 also from tlidb.com/tw. 僭越·其一 is inferred from 其二 to 其四, which the screenshots show.",
+  "rarities": {
+    "201": {
+      "en": "Normal",
+      "zh": "普通"
+    },
+    "202": {
+      "en": "Magic",
+      "zh": "魔法"
+    },
+    "203": {
+      "en": "Rare",
+      "zh": "稀有"
+    },
+    "204": {
+      "en": "Legendary",
+      "zh": "傳奇"
+    },
+    "205": {
+      "en": "Ultimate",
+      "zh": "至臻"
+    },
+    "206": {
+      "en": "Chromatic",
+      "zh": "綺彩"
+    }
+  },
+  "species": {
+    "101": {
+      "en": "Mammoth",
+      "zh": "巨象"
+    },
+    "102": {
+      "en": "Berserk Lion",
+      "zh": "狂獅"
+    },
+    "103": {
+      "en": "Alpha Wolf",
+      "zh": "頭狼"
+    },
+    "104": {
+      "en": "Colossal Rat",
+      "zh": "碩鼠"
+    }
+  },
+  "instruments": {
+    "101": {
+      "en": "Raging Beast's Agonizing Muzzle",
+      "zh": "狂獸的劇痛口枷"
+    },
+    "102": {
+      "en": "Ferocious Beast's Ravenous Chains",
+      "zh": "凶獸的饑餓絞鏈"
+    },
+    "103": {
+      "en": "Maddened Beast's Barbed Collar",
+      "zh": "瘋獸的倒刺項圈"
+    },
+    "104": {
+      "en": "Avenger's Casket",
+      "zh": "復仇者之匣"
+    },
+    "105": {
+      "en": "Crowded Beastcage",
+      "zh": "擁擠獸籠"
+    },
+    "106": {
+      "en": "Barbed Whip",
+      "zh": "棘刺鐵鞭"
+    },
+    "107": {
+      "en": "Rusty Saw",
+      "zh": "鏽鋸"
+    },
+    "111": {
+      "en": "Executioner's Blacklist",
+      "zh": "執刑官的黑名冊"
+    },
+    "112": {
+      "en": "Lost Ring of Keys",
+      "zh": "遺落的鑰匙串"
+    },
+    "113": {
+      "en": "Kin's Coin of Fate",
+      "zh": "手足的命運硬幣"
+    },
+    "114": {
+      "en": "Searing Branding Iron",
+      "zh": "灼痛的烙鐵"
+    },
+    "115": {
+      "en": "Felon's Dog Tag",
+      "zh": "重刑銘牌"
+    },
+    "116": {
+      "en": "Forged Key",
+      "zh": "偽造鑰匙"
+    },
+    "117": {
+      "en": "Sorting Hook",
+      "zh": "挑揀鉤"
+    },
+    "121": {
+      "en": "Scapegoat's Guillotine",
+      "zh": "替罪人的斷頭臺"
+    },
+    "122": {
+      "en": "Gaoler's Execution Axe",
+      "zh": "獄卒的行刑巨斧"
+    },
+    "123": {
+      "en": "Severed Iron Maiden",
+      "zh": "切開的人形棺"
+    },
+    "124": {
+      "en": "Warden's Scales",
+      "zh": "典獄官的天平"
+    },
+    "125": {
+      "en": "Hangman's Noose",
+      "zh": "絞首繩"
+    },
+    "126": {
+      "en": "Burning Stake",
+      "zh": "火刑柱"
+    },
+    "127": {
+      "en": "Iron Pestle",
+      "zh": "鐵杵"
+    },
+    "131": {
+      "en": "Short-Chained Shackles",
+      "zh": "短鏈腳鐐"
+    },
+    "132": {
+      "en": "Long-Chained Shackles",
+      "zh": "長鏈腳鐐"
+    },
+    "141": {
+      "en": "Iron Tongs of Lust: Mammoth",
+      "zh": "惡欲鐵鉗：巨象"
+    },
+    "142": {
+      "en": "Elephant-Foot Maul: Mammoth",
+      "zh": "象腳重錘：巨象"
+    },
+    "143": {
+      "en": "Blood-Stained Trap: Berserk Lion",
+      "zh": "染紅的捕獸夾：狂獅"
+    },
+    "144": {
+      "en": "Iron Crown of the Prison King: Berserk Lion",
+      "zh": "牢中王的鐵冠：狂獅"
+    },
+    "145": {
+      "en": "Filthy Claws: Alpha Wolf",
+      "zh": "髒汙鐵爪：頭狼"
+    },
+    "146": {
+      "en": "Fanged Guillotine: Alpha Wolf",
+      "zh": "狼牙鍘刀：頭狼"
+    },
+    "147": {
+      "en": "Squirming Iron Box: Colossal Rat",
+      "zh": "蠕動鐵盒：碩鼠"
+    },
+    "148": {
+      "en": "Skewered Rat Heads: Colossal Rat",
+      "zh": "鼠頭串：碩鼠"
+    }
+  },
+  "incidents": {
+    "201": {
+      "en": "High-Risk Convict",
+      "zh": "重刑犯"
+    },
+    "202": {
+      "en": "Taste of Freedom",
+      "zh": "自由的滋味"
+    },
+    "203": {
+      "en": "Behind Closed Doors",
+      "zh": "暗箱操作"
+    },
+    "211": {
+      "en": "Ravenous Appetite",
+      "zh": "食欲大增"
+    },
+    "212": {
+      "en": "Extra Portion",
+      "zh": "加餐"
+    },
+    "213": {
+      "en": "Shared Fortune",
+      "zh": "有福同享"
+    },
+    "221": {
+      "en": "Archenemy",
+      "zh": "宿敵"
+    },
+    "222": {
+      "en": "Execution Efficiency",
+      "zh": "處刑效率"
+    },
+    "231": {
+      "en": "Crow Whispers",
+      "zh": "鴉語"
+    },
+    "232": {
+      "en": "\"Treasure\" Hunt",
+      "zh": "尋「寶」"
+    },
+    "241": {
+      "en": "Sewer Ratway",
+      "zh": "暗渠鼠道"
+    },
+    "242": {
+      "en": "Chain Reaction",
+      "zh": "連鎖反應"
+    },
+    "251": {
+      "en": "Transfer of Convicts",
+      "zh": "同罪移押"
+    },
+    "252": {
+      "en": "Usurpation I",
+      "zh": "僭越·其一"
+    },
+    "253": {
+      "en": "Usurpation II",
+      "zh": "僭越·其二"
+    },
+    "254": {
+      "en": "Usurpation III",
+      "zh": "僭越·其三"
+    },
+    "255": {
+      "en": "Usurpation IV",
+      "zh": "僭越·其四"
+    }
+  },
+  "objectives": {
+    "1": {
+      "en": "Objective: King of the Caged",
+      "zh": "目標：困獸稱王"
+    },
+    "2": {
+      "en": "Objective: Survival of the Fittest",
+      "zh": "目標：弱肉強食"
+    },
+    "3": {
+      "en": "Objective: Behind Cell Doors",
+      "zh": "目標：牢門之後"
+    },
+    "4": {
+      "en": "Objective: Undercurrents",
+      "zh": "目標：暗流湧動"
+    },
+    "5": {
+      "en": "Objective: Prison Walk",
+      "zh": "目標：巡獄之路"
+    }
+  },
+  "themes": {
+    "301": {
+      "en": "Tyranny",
+      "zh": "濫權"
+    },
+    "302": {
+      "en": "Opulence",
+      "zh": "奢靡"
+    },
+    "303": {
+      "en": "Iron Law",
+      "zh": "鐵律"
+    },
+    "304": {
+      "en": "Cage Fight",
+      "zh": "囚徒困鬥"
+    }
+  },
+  "chromaticRewards": {
+    "1": {
+      "en": "Three-Headed Thumb Ring",
+      "zh": "三首扳指"
+    },
+    "2": {
+      "en": "Brass Horn of Strife",
+      "zh": "鬥爭銅號"
+    },
+    "3": {
+      "en": "Crimson Vintage",
+      "zh": "赤色佳釀"
+    },
+    "4": {
+      "en": "Brand of Original Sin",
+      "zh": "原罪烙印"
+    }
+  },
+  "cards": {
+    "instigate": {
+      "en": "Instigate",
+      "zh": "煽動"
+    },
+    "bestow": {
+      "en": "Bestow",
+      "zh": "賞賜"
+    }
+  },
+  "actions": {
+    "consume": {
+      "en": "Consume",
+      "zh": "吃"
+    },
+    "replace": {
+      "en": "Replace",
+      "zh": "換"
+    },
+    "end": {
+      "en": "End",
+      "zh": "結束"
+    },
+    "hunt": {
+      "en": "Hunt",
+      "zh": "尋獵"
+    }
+  },
+  "glossary": {
+    "16000103": {
+      "en": "Prison Incident",
+      "zh": "獄中事變"
+    },
+    "16000105": {
+      "en": "Torture Instrument",
+      "zh": "刑具"
+    },
+    "16000118": {
+      "en": "Warden's Treasure",
+      "zh": "典獄長的珍藏"
+    },
+    "16000200": {
+      "en": "Warden's Cache",
+      "zh": "典獄秘藏"
+    }
+  }
+}

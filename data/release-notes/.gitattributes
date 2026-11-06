@@ -1,0 +1,2 @@
+# The release notes are built into the exe and must stay LF (see ui.rs RELEASE_NOTES).
+*.txt text eol=lf

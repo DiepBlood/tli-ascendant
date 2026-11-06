@@ -1,0 +1,665 @@
+{
+  "note": "Vorax（渴血手術）的繁中名稱，鍵是英文求解器 crates/vorax 的 id：藥劑與手術用具用 data/game.json 的 id；求解器沒有 id 的（手術方案、無法模擬的 Supreme 藥劑）用英文名；種族、稀有度用引擎的 serde 名稱（types.rs）。zh 只抄自 docs/vorax-實機紀錄-20261103.md 與 docs/vorax-繁中卡牌-20261103.md 實際看到的字，藥劑與手術用具都是效果文字和 effects.rs 實作逐條比對後才對上英文；沒抄到的 zh 是空字串，不猜。手術方案求解器沒有效果定義，7 個是依名稱語意對上英文。怪物名英文求解器沒有，en 留空，鍵用繁中名。繁中手術用具「接肢標本」（初始怪物改為6組隨機怪物）在英文 25 件裡沒有對應，所以不收。注意：錄影那局後來確認是教學局；名稱本身不受影響。",
+  "potions": {
+    "0": {
+      "en": "Probiotic Enzyme Solution",
+      "zh": "益生黴溶液"
+    },
+    "1": {
+      "en": "Slough Solution",
+      "zh": "蛻生皮溶液"
+    },
+    "2": {
+      "en": "Leptomeningeal Solution",
+      "zh": "軟腦膜溶液"
+    },
+    "3": {
+      "en": "Osteolytic Ointment",
+      "zh": "化骨油膏"
+    },
+    "4": {
+      "en": "Cleansing Ointment",
+      "zh": "清疽油膏"
+    },
+    "5": {
+      "en": "Fresh Spinal Powder",
+      "zh": "鮮脊髓藥粉"
+    },
+    "6": {
+      "en": "Petrified Spinal Solution",
+      "zh": "石化脊髓溶液"
+    },
+    "7": {
+      "en": "Viviparous Hormone",
+      "zh": "活性育卵激素"
+    },
+    "8": {
+      "en": "Eggshell Powder",
+      "zh": "卵殼藥粉"
+    },
+    "9": {
+      "en": "Brain Fog Tincture",
+      "zh": "腦霧酊劑"
+    },
+    "10": {
+      "en": "Osteogenic Powder",
+      "zh": "生骨藥粉"
+    },
+    "11": {
+      "en": "Gray Matter Spinal Solution",
+      "zh": "脊髓灰質溶液"
+    },
+    "12": {
+      "en": "Hollow Spinal Solution",
+      "zh": "空心脊髓溶液"
+    },
+    "13": {
+      "en": "Green Bile Solution",
+      "zh": "青膽汁溶液"
+    },
+    "14": {
+      "en": "Compound Leech Solution",
+      "zh": "混合活蛭溶液"
+    },
+    "15": {
+      "en": "Digestive Enzyme Solution",
+      "zh": "消化酶溶液"
+    },
+    "16": {
+      "en": "Vivigenic Powder",
+      "zh": "活殖藥粉"
+    },
+    "17": {
+      "en": "Potent Xenopurge Powder",
+      "zh": "強效祛異藥粉"
+    },
+    "18": {
+      "en": "Xenopurge Powder",
+      "zh": "祛異藥粉"
+    },
+    "19": {
+      "en": "Pure Leech Solution",
+      "zh": "純粹活蛭溶液"
+    },
+    "20": {
+      "en": "Bewitching Tincture",
+      "zh": "迷魂酊劑"
+    },
+    "21": {
+      "en": "Mutagenic Powder",
+      "zh": "誘變藥粉"
+    },
+    "22": {
+      "en": "Viscous Bile Solution",
+      "zh": "黏稠膽汁溶液"
+    },
+    "23": {
+      "en": "Slender-Limb Powder - Pest",
+      "zh": "細肢藥粉-蠱蟲"
+    },
+    "24": {
+      "en": "Twin Hormone - Pest",
+      "zh": "孿生激素-蠱蟲"
+    },
+    "25": {
+      "en": "Spinal Solution - Agito",
+      "zh": "脊髓溶液-覺醒者"
+    },
+    "26": {
+      "en": "Anesthetic Tincture - Agito",
+      "zh": "麻藥酊劑-覺醒者"
+    },
+    "27": {
+      "en": "Slender-Limb Powder - Bone Sentry",
+      "zh": "細肢藥粉-骨衛兵"
+    },
+    "28": {
+      "en": "Twin Hormone - Bone Sentry",
+      "zh": "孿生激素-骨衛兵"
+    },
+    "29": {
+      "en": "Anesthetic Tincture - Aemberon",
+      "zh": "麻藥酊劑-異魔"
+    },
+    "30": {
+      "en": "Spinal Solution - Aemberon",
+      "zh": "脊髓溶液-異魔"
+    },
+    "31": {
+      "en": "Xeno-Hormone",
+      "zh": "異種激素"
+    },
+    "32": {
+      "en": "Targeted Xeno-Hormone",
+      "zh": "靶向異種激素"
+    },
+    "33": {
+      "en": "Potion Kit (Large)",
+      "zh": "藥劑箱（大）"
+    },
+    "34": {
+      "en": "Potion Kit (Small)",
+      "zh": "藥劑箱（小）"
+    },
+    "35": {
+      "en": "Compound Revitalizing Pill",
+      "zh": "複方煥生丸劑"
+    },
+    "36": {
+      "en": "Fast-Acting Heart Tonic",
+      "zh": "速效強心劑"
+    },
+    "37": {
+      "en": "Plague Quarter Peat Poultice",
+      "zh": "疫區泥炭敷料"
+    },
+    "38": {
+      "en": "Insect Attractant",
+      "zh": "誘蟲劑"
+    },
+    "39": {
+      "en": "Purest Holy Water",
+      "zh": "至純聖水"
+    },
+    "40": {
+      "en": "Rare Potion Kit (Small)",
+      "zh": "稀有藥劑箱（小）"
+    },
+    "41": {
+      "en": "Rousing Salts",
+      "zh": "驚醒嗅鹽"
+    }
+  },
+  "unsimulatedPotions": {
+    "Xenopanacea: Osteotrophy": {
+      "en": "Xenopanacea: Osteotrophy",
+      "zh": "異種萬靈藥：壯骨"
+    },
+    "Xenopanacea: Brood": {
+      "en": "Xenopanacea: Brood",
+      "zh": "異種萬靈藥：育雛"
+    },
+    "Xenopanacea": {
+      "en": "Xenopanacea",
+      "zh": ""
+    },
+    "First Rite Holy Water: Confession": {
+      "en": "First Rite Holy Water: Confession",
+      "zh": "第一儀式聖水：告解"
+    },
+    "Ritual Holy Water: Flagellation": {
+      "en": "Ritual Holy Water: Flagellation",
+      "zh": "第二儀式聖水：鞭刑"
+    },
+    "Third Rite Holy Water: Illumination": {
+      "en": "Third Rite Holy Water: Illumination",
+      "zh": "第三儀式聖水：啟蒙"
+    },
+    "Fourth Rite Holy Water: Eucharist": {
+      "en": "Fourth Rite Holy Water: Eucharist",
+      "zh": "第四儀式聖水：聖餐"
+    },
+    "Dissection I: Vermectomy": {
+      "en": "Dissection I: Vermectomy",
+      "zh": "解剖術 I：除蠱術"
+    },
+    "Dissection II: Daemonectomy": {
+      "en": "Dissection II: Daemonectomy",
+      "zh": "解剖術 II：驅魔術"
+    },
+    "Dissection III: Craniotomy": {
+      "en": "Dissection III: Craniotomy",
+      "zh": "解剖術 III：開顱術"
+    },
+    "Dissection Infusion: Morbid Corpse": {
+      "en": "Dissection Infusion: Morbid Corpse",
+      "zh": "解剖浸液：病軀"
+    },
+    "Dissection Infusion: Intact Skeleton": {
+      "en": "Dissection Infusion: Intact Skeleton",
+      "zh": "解剖浸液：完整骨架"
+    },
+    "Incubation Elixir: Hollow Cocoon": {
+      "en": "Incubation Elixir: Hollow Cocoon",
+      "zh": "孵化靈藥：空心繭"
+    },
+    "F1 Gen: Parasite Egg": {
+      "en": "F1 Gen: Parasite Egg",
+      "zh": "子一代：寄生蠱卵"
+    },
+    "F1 Gen: Vermin Egg Cluster": {
+      "en": "F1 Gen: Vermin Egg Cluster",
+      "zh": "子一代：爬蠱卵簇"
+    },
+    "F2 Gen: Parasite Pupae": {
+      "en": "F2 Gen: Parasite Pupae",
+      "zh": "子二代：寄生蠱蛹"
+    },
+    "F2 Gen: Vermin Pupal Cluster": {
+      "en": "F2 Gen: Vermin Pupal Cluster",
+      "zh": "子二代：爬蠱蛹簇"
+    },
+    "F3 Gen: Parasitic Butterfly": {
+      "en": "F3 Gen: Parasitic Butterfly",
+      "zh": "子三代：寄生蝶"
+    },
+    "F3 Gen: Emergent Butterfly Swarm": {
+      "en": "F3 Gen: Emergent Butterfly Swarm",
+      "zh": "子三代：破繭蝶群"
+    },
+    "Incubation Elixir: Hollow Matriarch": {
+      "en": "Incubation Elixir: Hollow Matriarch",
+      "zh": "孵化靈藥：空心蠱母"
+    }
+  },
+  "instruments": {
+    "1": {
+      "en": "Chrysalis Specimen",
+      "zh": "人蛹標本"
+    },
+    "2": {
+      "en": "Incubation Sac",
+      "zh": "孵化囊"
+    },
+    "3": {
+      "en": "Hyperplastic Frontal Lobe",
+      "zh": "增生前額葉"
+    },
+    "4": {
+      "en": "Hypertrophic Pituitary",
+      "zh": "腫大腦垂體"
+    },
+    "5": {
+      "en": "Adherent Metatarsals",
+      "zh": "黏連跖骨"
+    },
+    "6": {
+      "en": "Contracted Claws",
+      "zh": "攣縮指爪"
+    },
+    "7": {
+      "en": "Aberrant Sprout",
+      "zh": "孽生肉芽"
+    },
+    "8": {
+      "en": "Prismatic Liver",
+      "zh": "斑斕肝臟"
+    },
+    "9": {
+      "en": "Clustered Eggs",
+      "zh": "簇生蟲卵"
+    },
+    "10": {
+      "en": "Sloughed Cortex",
+      "zh": "蛻生腦皮層"
+    },
+    "11": {
+      "en": "Sinew Garrote",
+      "zh": "獸筋絞肉索"
+    },
+    "12": {
+      "en": "Vermicular Spinal Cord",
+      "zh": "蠕動脊髓"
+    },
+    "13": {
+      "en": "Rawhide Restraint",
+      "zh": "生皮革拘束帶"
+    },
+    "14": {
+      "en": "Black Goat Gut Suture",
+      "zh": "黑山羊腸縫線"
+    },
+    "15": {
+      "en": "Pig Iron Bone Saw",
+      "zh": "生鐵骨鋸"
+    },
+    "16": {
+      "en": "Two-Inch Skull Nail",
+      "zh": "二寸顱骨釘"
+    },
+    "17": {
+      "en": "Fouled Scraper",
+      "zh": "髒污刮骨刀"
+    },
+    "18": {
+      "en": "Canine Teeth File",
+      "zh": "犬牙銼刀"
+    },
+    "19": {
+      "en": "Lady of the Plague Quarter",
+      "zh": "疫區聖母像"
+    },
+    "20": {
+      "en": "Aberrant Stinger",
+      "zh": "異形螯針"
+    },
+    "21": {
+      "en": "Tanned Leather Restraint",
+      "zh": "鞣製皮革拘束帶"
+    },
+    "22": {
+      "en": "Eyelid Speculum",
+      "zh": "眼瞼擴張器"
+    },
+    "23": {
+      "en": "Beak of the Twice-Born",
+      "zh": "二度降生者之喙"
+    },
+    "24": {
+      "en": "Nettle Toggle",
+      "zh": "蕁麻繩扣"
+    },
+    "25": {
+      "en": "Egg-Burdened Butterfly",
+      "zh": "抱卵蝶"
+    }
+  },
+  "protocols": {
+    "Anesthesia Analgesia": {
+      "en": "Anesthesia Analgesia",
+      "zh": "麻醉止痛法"
+    },
+    "Aseptic Isolation Protocol": {
+      "en": "Aseptic Isolation Protocol",
+      "zh": "無菌隔離防護法"
+    },
+    "Cyst Rupture Therapy": {
+      "en": "Cyst Rupture Therapy",
+      "zh": "囊腫爆破療法"
+    },
+    "Frontal Lobe Repair": {
+      "en": "Frontal Lobe Repair",
+      "zh": "額葉修復術"
+    },
+    "Holistic Acupuncture Therapy": {
+      "en": "Holistic Acupuncture Therapy",
+      "zh": "全身針灸療法"
+    },
+    "Immunosuppressive Experiment": {
+      "en": "Immunosuppressive Experiment",
+      "zh": "免疫抑制實驗"
+    },
+    "Laparolithotomy": {
+      "en": "Laparolithotomy",
+      "zh": "剖腹取石療法"
+    },
+    "Laser Amputation": {
+      "en": "Laser Amputation",
+      "zh": "雷射截肢手術"
+    },
+    "Live Leech Therapy": {
+      "en": "Live Leech Therapy",
+      "zh": "活蛭吸附療法"
+    },
+    "Muscle Relaxant Injection Experiment": {
+      "en": "Muscle Relaxant Injection Experiment",
+      "zh": "肌肉鬆弛劑注射實驗"
+    },
+    "Spinal Cord Stimulation": {
+      "en": "Spinal Cord Stimulation",
+      "zh": "脊髓神經刺激術"
+    },
+    "Trepanation": {
+      "en": "Trepanation",
+      "zh": "顱骨鑽孔術"
+    },
+    "Yellow Bile Therapy": {
+      "en": "Yellow Bile Therapy",
+      "zh": ""
+    }
+  },
+  "archetypes": {
+    "pest": {
+      "en": "Pest",
+      "zh": "蠱蟲"
+    },
+    "aemberon": {
+      "en": "Aemberon",
+      "zh": "異魔"
+    },
+    "boneSentry": {
+      "en": "Bone Sentry",
+      "zh": "骨衛兵"
+    },
+    "agito": {
+      "en": "Agito",
+      "zh": "覺醒者"
+    }
+  },
+  "rarities": {
+    "normal": {
+      "en": "Normal",
+      "zh": "普通"
+    },
+    "magic": {
+      "en": "Magic",
+      "zh": "魔法"
+    },
+    "rare": {
+      "en": "Rare",
+      "zh": "稀有"
+    },
+    "boss": {
+      "en": "Boss",
+      "zh": "首領"
+    },
+    "supreme": {
+      "en": "Supreme",
+      "zh": ""
+    }
+  },
+  "rarityLabels": {
+    "normalMonster": {
+      "en": "Normal monster",
+      "zh": "普通怪物"
+    },
+    "magicMonster": {
+      "en": "Magic monster",
+      "zh": "魔法怪物"
+    },
+    "rareMonster": {
+      "en": "Rare monster",
+      "zh": "稀有怪物"
+    },
+    "bossMonster": {
+      "en": "Boss monster",
+      "zh": "首領怪物"
+    },
+    "normalPotion": {
+      "en": "Normal potion",
+      "zh": "普通藥劑"
+    },
+    "magicPotion": {
+      "en": "Magic potion",
+      "zh": "魔法藥劑"
+    },
+    "rarePotion": {
+      "en": "Rare potion",
+      "zh": "稀有藥劑"
+    },
+    "normalProtocol": {
+      "en": "Normal protocol",
+      "zh": "普通手術方案"
+    },
+    "magicProtocol": {
+      "en": "Magic protocol",
+      "zh": "魔法手術方案"
+    },
+    "rareProtocol": {
+      "en": "Rare protocol",
+      "zh": "稀有手術方案"
+    },
+    "instrument": {
+      "en": "Instrument",
+      "zh": "手術用具"
+    }
+  },
+  "monsters": {
+    "智者": {
+      "en": "",
+      "zh": "智者",
+      "archetype": "agito"
+    },
+    "學者": {
+      "en": "",
+      "zh": "學者",
+      "archetype": "agito"
+    },
+    "朝聖者": {
+      "en": "",
+      "zh": "朝聖者",
+      "archetype": "agito"
+    },
+    "異端學者": {
+      "en": "",
+      "zh": "異端學者",
+      "archetype": "agito"
+    },
+    "苦行大教宗": {
+      "en": "",
+      "zh": "苦行大教宗",
+      "archetype": "agito"
+    },
+    "禁典學者": {
+      "en": "",
+      "zh": "禁典學者",
+      "archetype": "agito"
+    },
+    "蠍獸": {
+      "en": "",
+      "zh": "蠍獸",
+      "archetype": "aemberon"
+    },
+    "刺蜥獸": {
+      "en": "",
+      "zh": "刺蜥獸",
+      "archetype": "aemberon"
+    },
+    "異獸": {
+      "en": "",
+      "zh": "異獸",
+      "archetype": "aemberon"
+    },
+    "灰蛾": {
+      "en": "",
+      "zh": "灰蛾",
+      "archetype": "pest"
+    },
+    "腐汁蠅": {
+      "en": "",
+      "zh": "腐汁蠅",
+      "archetype": "pest"
+    },
+    "惡蛛": {
+      "en": "",
+      "zh": "惡蛛",
+      "archetype": "pest"
+    },
+    "赤螳螂": {
+      "en": "",
+      "zh": "赤螳螂",
+      "archetype": "pest"
+    },
+    "紅斑花金龜": {
+      "en": "",
+      "zh": "紅斑花金龜",
+      "archetype": "pest"
+    },
+    "空心繭": {
+      "en": "",
+      "zh": "空心繭",
+      "archetype": "pest"
+    },
+    "巡察衛兵": {
+      "en": "",
+      "zh": "巡察衛兵",
+      "archetype": "boneSentry"
+    },
+    "剛盾衛兵": {
+      "en": "",
+      "zh": "剛盾衛兵",
+      "archetype": "boneSentry"
+    },
+    "骸骨典獄官": {
+      "en": "",
+      "zh": "骸骨典獄官",
+      "archetype": "boneSentry"
+    },
+    "銹戟兵": {
+      "en": "",
+      "zh": "銹戟兵",
+      "archetype": "boneSentry"
+    },
+    "弓兵": {
+      "en": "",
+      "zh": "弓兵",
+      "archetype": "boneSentry"
+    },
+    "暴食巨蠕蟲": {
+      "en": "",
+      "zh": "暴食巨蠕蟲",
+      "archetype": "pest"
+    },
+    "裂顎獸": {
+      "en": "",
+      "zh": "裂顎獸",
+      "archetype": "aemberon"
+    },
+    "邪眼翼獸": {
+      "en": "",
+      "zh": "邪眼翼獸",
+      "archetype": "aemberon"
+    },
+    "寄生蝴蝶": {
+      "en": "",
+      "zh": "寄生蝴蝶",
+      "archetype": "pest"
+    },
+    "紅瘟三頭犬": {
+      "en": "",
+      "zh": "紅瘟三頭犬",
+      "archetype": "aemberon"
+    },
+    "墮落者": {
+      "en": "",
+      "zh": "墮落者",
+      "archetype": "agito"
+    },
+    "腐囊異獸": {
+      "en": "",
+      "zh": "腐囊異獸",
+      "archetype": "aemberon"
+    },
+    "輕弩兵": {
+      "en": "",
+      "zh": "輕弩兵",
+      "archetype": "boneSentry"
+    },
+    "士兵": {
+      "en": "",
+      "zh": "士兵",
+      "archetype": "boneSentry"
+    },
+    "飛升之聖徒": {
+      "en": "",
+      "zh": "飛升之聖徒",
+      "archetype": "agito"
+    }
+  },
+  "unmapped": {
+    "蒸骨坩堝": {
+      "en": "",
+      "zh": "蒸骨坩堝",
+      "kind": "instrument",
+      "effect": "初始怪物改為2組〔骨衛兵〕骨衛兵與2組其它怪物",
+      "note": "英文 25 件手術用具（crates/vorax effects.rs）沒有對應。正式局開局頁付費揭示（「揭示手術用具」），進主畫面前就持有，佔右上已持有圖示第 1 格，之後仍有 3 次正常的手術用具選擇；求解器沒有這個機制。見 docs/vorax-實機紀錄2-20261103.md 第 3.2 節（影格 t004.50、t012.80）。"
+    },
+    "水蛭罐": {
+      "en": "",
+      "zh": "水蛭罐",
+      "kind": "instrument",
+      "effect": "初始怪物改為4組普通〔蠱蟲〕蠱蟲",
+      "note": "英文 25 件手術用具（crates/vorax effects.rs）沒有對應。和蒸骨坩堝一樣是正式局開局頁揭示的手術用具，佔右上已持有圖示第 1 格。2026-11-03 20:08 正式局觀察模式存下（home/vorax/2026-11-03_12-08-58 learn-0003、0005、0006 與提示框 learn-0006-crop-2）；圖示模板在 src/vorax/icons.rs 的 OPENING。"
+    }
+  }
+}

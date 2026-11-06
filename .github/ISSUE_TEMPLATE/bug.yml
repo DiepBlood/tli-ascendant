@@ -1,0 +1,76 @@
+name: 問題回報（Bug report）
+description: 讀錯盤面、建議不合理或程式異常（Misread board, bad recommendation or a crash）
+title: "[問題] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感謝回報（Thanks for reporting）。請先在程式的「本局頁」按「匯出回報資料」，選那一局按「準備匯出」，看過列出的內容後按「存檔並開啟資料夾」。zip 存在 `Ascendant.exe` 所在的資料夾（不能寫入時在 `%APPDATA%\Ascendant`），再拖進下方附件欄。
+        Please press "Export report data" on the Run page first, pick the run, press "Prepare", look the list over, then press "Save and open folder". The zip is saved next to `Ascendant.exe` (or in `%APPDATA%\Ascendant` when that folder cannot be written). Drag it into the attachment box below.
+  - type: input
+    id: version
+    attributes:
+      label: 版本（Version）
+      description: Ascendant 的版本號，例如 1.0.0（The Ascendant version, e.g. 1.0.0）
+      placeholder: "1.0.0"
+    validations:
+      required: true
+  - type: dropdown
+    id: mode
+    attributes:
+      label: 玩法（Mode）
+      options:
+        - 塔羅斯（Tartarus）
+        - 渴血手術（Vorax）
+    validations:
+      required: true
+  - type: dropdown
+    id: client_language
+    attributes:
+      label: 遊戲客戶端語言（Game client language）
+      description: 繁中客戶端支援最完整（The Traditional Chinese client is the best supported）
+      options:
+        - 繁體中文（Traditional Chinese）
+        - English
+        - 其他（Other）
+    validations:
+      required: true
+  - type: input
+    id: resolution
+    attributes:
+      label: 解析度（Resolution）
+      description: 遊戲畫面的解析度與模式（Game resolution and window mode）
+      placeholder: "1920x1080，全螢幕（fullscreen）"
+    validations:
+      required: true
+  - type: textarea
+    id: description
+    attributes:
+      label: 問題描述（What happened）
+      description: 發生了什麼事、怎麼重現（What happened and how to reproduce it）
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: 預期結果（Expected result）
+      description: 你原本預期會怎樣（What you expected to happen）
+    validations:
+      required: true
+  - type: textarea
+    id: attachments
+    attributes:
+      label: 附件（Attachments）
+      description: |
+        只接受「匯出回報資料」產生的 zip 與截圖。請不要附 exe 或其他壓縮檔。
+        Only the zip made by "Export report data" and screenshots are accepted. Do not attach an exe or any other archive.
+    validations:
+      required: false
+  - type: checkboxes
+    id: confirm
+    attributes:
+      label: 確認（Confirmation）
+      options:
+        - label: 我確認附件是程式產生的回報 zip 或截圖，沒有放入其他檔案（I confirm the attachments are the report zip made by the app or screenshots, and nothing else）
+          required: true

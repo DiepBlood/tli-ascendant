@@ -1,0 +1,17 @@
+# x86-64-v2 (SSE4.1, SSE4.2, POPCNT), which Windows 11 24H2 itself requires:
+# f32::round in the reader's image resize is one instruction instead of a
+# library call, and a frame read took about 30% less, to the same bits
+# (2026-10-31, measured locally).
+#
+# +crt-static links the C runtime into the exe, so it no longer imports
+# VCRUNTIME140.dll, VCRUNTIME140_1.dll or the api-ms-win-crt-* sets. Those are
+# not KnownDLLs: the loader resolves them before main, from the exe's folder
+# first, so a vcruntime140.dll planted beside an exe started from Downloads
+# would run inside it, before update::restrict_dll_search can act. The other
+# imports are kept to System32 by /DEPENDENTLOADFLAG in build.rs.
+#
+# scripts/export-public.ps1 copies every flag in this list into the release
+# build's extra config, so keep it one `rustflags = [...]` array of plain
+# double-quoted strings.
+[build]
+rustflags = ["-C", "target-cpu=x86-64-v2", "-C", "target-feature=+crt-static"]

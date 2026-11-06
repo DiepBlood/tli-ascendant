@@ -1,0 +1,77 @@
+//! The app window beside the game: a hotkey captures the game, the reader
+//! reads the board and the solver ranks the moves.
+
+pub mod health;
+pub mod latency;
+pub mod runlog;
+pub mod session;
+pub mod settings;
+pub mod settle;
+pub mod vorax_session;
+pub mod vorax_settle;
+pub mod vorax_learn;
+#[cfg(windows)]
+pub mod share;
+#[cfg(windows)]
+pub mod capture;
+#[cfg(windows)]
+pub mod mark;
+#[cfg(windows)]
+pub mod report;
+#[cfg(windows)]
+pub mod gamelog;
+#[cfg(windows)]
+pub mod hotkey;
+#[cfg(windows)]
+pub mod http;
+#[cfg(windows)]
+pub mod install;
+#[cfg(windows)]
+pub mod theme;
+#[cfg(windows)]
+pub mod through;
+#[cfg(windows)]
+pub mod ui;
+#[cfg(windows)]
+pub mod update;
+#[cfg(windows)]
+pub mod vorax_view;
+
+/// Opens the window, with `preload` read first when given.
+#[cfg(windows)]
+pub fn run(preload: Option<&std::path::Path>) -> Result<(), String> {
+    use eframe::egui;
+    update::wait_for_previous();
+    let current = std::env::current_exe().ok();
+    let mut installed = false;
+    if let Some(current) = &current {
+        update::clean_old(current);
+        installed = install::installed_here(current);
+        if installed {
+            let _ = install::register(current);
+        }
+    }
+    let mut settings = settings::Settings::load();
+    // Before any run log is made (the window's RunLog and the Vorax session's are made in AscendantApp::new):
+    // until now every run log is kept.
+    runlog::set_keep_all(settings.keep_all_logs);
+    crate::lang::set(crate::lang::Lang::from_key(&settings.language));
+    if let Some(current) = current.as_ref().filter(|_| installed && !settings.desktop_shortcut) {
+        let _ = install::desktop_shortcut(current);
+        settings.desktop_shortcut = true;
+        let _ = settings.save();
+    }
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_title("Ascendant")
+            .with_icon(eframe::icon_data::from_png_bytes(include_bytes!("../../assets/icon.png")).expect("assets/icon.png is a PNG"))
+            // Default 296×520 when no size was saved: the window no longer auto-grows, and this height fits the whole
+            // Tartarus board page.
+            .with_inner_size(settings.window_size.filter(|&[w, h]| w >= 200.0 && h >= 150.0).unwrap_or([296.0, 520.0]))
+            .with_always_on_top()
+            .with_resizable(true),
+        ..Default::default()
+    };
+    eframe::run_native("Ascendant", options, Box::new(move |cc| Ok(Box::new(ui::AscendantApp::new(cc, settings, preload, current, installed)))))
+        .map_err(|e| e.to_string())
+}

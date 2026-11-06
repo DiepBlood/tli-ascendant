@@ -1,0 +1,513 @@
+//! The game state, shaped like the JS state (js/engine.js newGame) so that
+//! `serde_json::to_value` diffs cleanly against a JS state without its log.
+
+use super::data::{Beast, Card, Gift, LOOT, OBJECTIVE_CACHE, RAINBOW, Tool, VAULT_CAP, data};
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+
+/// The defaults of normalizeParams (DEFAULT_PARAMS); Lab editing is not ported.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Params {
+    pub drill_days: u32,
+    pub destinations: u32,
+    pub fewer_doors_chance: u32,
+    pub swaps_per_day: u32,
+    pub reusable_cells: bool,
+    pub tier_weights: [u32; RAINBOW as usize],
+    pub beast_weights: [u32; 4],
+    pub incident_spawn_chance: u32,
+    pub execution_rerolls: bool,
+    pub ivory_count: u32,
+    pub ivory_includes_swapped: bool,
+    pub prey_rounds: u32,
+    pub scratch_stacks_base: bool,
+    pub nest_days: u32,
+    pub nest_tier: i32,
+    pub rewards: bool,
+    pub start_tools: u32,
+    pub objective: u32,
+    pub theme: i32,
+    /// Chromatics the vault holds; once full, inmates stop at Ultimate. None
+    /// means no cap, as in the JS engine (its traces deserialize to None).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vault_cap: Option<u32>,
+    /// Whether the Severed Iron Maiden's rise applies. The JS engine has no
+    /// such field, so a state that keeps the rise leaves it out.
+    #[serde(default = "rises", skip_serializing_if = "bool::clone")]
+    pub maiden: bool,
+    /// Whether a marker's incident stays unseen until it fires, as in the
+    /// game; the JS engine shows it, and its traces leave the field out.
+    #[serde(default = "rises", skip_serializing_if = "bool::clone")]
+    pub hidden_incidents: bool,
+    /// Whether a new marker stays off the warden's cell, as the run logs
+    /// show; the JS engine allowed it, and its traces leave the field out.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub markers_avoid_warden: bool,
+    /// Whether a Usurpation stage makes every marker the next stage, as the
+    /// game's logs show (see `incidents::usurpation`); the JS engine passed
+    /// on only the stage's weight and markers, and its traces leave the
+    /// field out.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub usurpation_series: bool,
+    /// Whether the beast swapped in is always different from the one swapped out: in the run logs none of 374 swaps
+    /// gave the same kind (2026-11-03); the JS engine allows all four, and its logs have no such field.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub replace_new_beast: bool,
+    /// Weights of the beast swapped in (in `Beast::ALL` order: Mammoth, Lion, Wolf, Rat), drawn after excluding the
+    /// original beast. `ascendant-cli rates` grouped 748 swaps by original beast: each of the other 3 kinds was
+    /// swapped in 26-38%, and an even split fits much better than the earlier 29/35/16/20 (log-likelihood difference
+    /// 14); the earlier estimate looked at the overall share swapped in, which depends on which beast was swapped out
+    /// (2026-11-03). With None, `beast_weights` is used (JS engine).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replace_beast_weights: Option<[u32; 4]>,
+    /// Whether swapping is impossible once a bite has been made that day: in 54 of 55 days in the run logs the "swap"
+    /// card disappeared after a bite, while swapping first and then eating works (2026-11-03); the JS engine allows
+    /// it, and its logs have no such field.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub bite_ends_replace: bool,
+    /// Whether the extra tiers of the skewered rat head are added only when a rat eats a rat: in the run logs all 7
+    /// rat-eats-rat gave +3 tiers and all 10 rat-eats-Mammoth gave only +1 (2026-11-03); in the JS engine a rat adds
+    /// it whatever it eats.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub skewer_rats_only: bool,
+    /// Whether later picks of the same treasure still offer every reward and can repeat: all 34 Opulence pick screens
+    /// showed 4 cards, and the same one was picked twice in a row (2026-11-03); the JS engine removes the one already
+    /// picked.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub gifts_repeat: bool,
+    /// Whether a hunt ends the day: all 39 hunts in the run logs ended the day, and in 37 of them both "eat" and
+    /// "swap" were still there (2026-11-03); in the JS engine you can still act after a hunt.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub hunt_ends_day: bool,
+    /// Whether doors opened by the Ring are unaffected by the Hook: with the Hook held, the Ring opened Normal 13/27
+    /// times and a patrol 0/11 (2026-11-03); the JS engine always applies the Hook.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub ring_ignores_hook: bool,
+    /// Whether rooms opened at the start of the run count toward the "open cells" objective: in 14 runs the start was
+    /// always 4/10 (2026-11-03); the JS engine does not count them.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub start_counts_open: bool,
+    /// Whether the "trigger events" objective counts as soon as an event cell is entered (the instrument pick screen
+    /// appears before the event window, 2026-11-03); the JS engine counts only when the event is confirmed.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub events_count_on_landing: bool,
+    /// The Severed Iron Maiden looks at the current rarity of the swapped-out inmate: when the other inmates on the
+    /// board that are higher and lower than it are equal in number, the one swapped in gets +3 tiers, judged before
+    /// the Scapegoat's Guillotine removes an inmate. The user confirmed that "this inmate" on the card means the
+    /// swapped-out one, and two external sources with 19 and 20 swaps agree (2026-11-03); the JS engine looks at the
+    /// newly swapped-in one.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub maiden_reads_old: bool,
+}
+
+fn rises() -> bool {
+    true
+}
+
+/// Measured weights of the beast swapped in (Mammoth, Lion, Wolf, Rat): the average of the other 3 kinds, see
+/// `Params::replace_beast_weights`.
+pub const REPLACE_BEAST_WEIGHTS: [u32; 4] = [1, 1, 1, 1];
+
+impl Params {
+    /// Weights of the beast swapped in: measured values, or the ordinary beast weights when there are none.
+    pub fn replace_weights(&self) -> [u32; 4] {
+        self.replace_beast_weights.unwrap_or(self.beast_weights)
+    }
+}
+
+pub(crate) fn is_zero(n: &u8) -> bool {
+    *n == 0
+}
+
+impl Default for Params {
+    fn default() -> Self {
+        let d = data();
+        Params {
+            drill_days: d.days,
+            destinations: d.dice_options,
+            fewer_doors_chance: 0,
+            swaps_per_day: 1,
+            reusable_cells: true,
+            tier_weights: d.tier_weights,
+            beast_weights: [25; 4],
+            // The run logs show no morning spawn; the JS engine's 117 came from
+            // the share of day-one doors with a marker.
+            incident_spawn_chance: 0,
+            execution_rerolls: false,
+            ivory_count: 4,
+            ivory_includes_swapped: true,
+            prey_rounds: 3,
+            scratch_stacks_base: true,
+            nest_days: 2,
+            nest_tier: 2,
+            rewards: true,
+            start_tools: 0,
+            objective: 0,
+            theme: 0,
+            vault_cap: Some(VAULT_CAP),
+            maiden: true,
+            hidden_incidents: true,
+            markers_avoid_warden: true,
+            usurpation_series: true,
+            replace_new_beast: true,
+            replace_beast_weights: Some(REPLACE_BEAST_WEIGHTS),
+            bite_ends_replace: true,
+            skewer_rats_only: true,
+            gifts_repeat: true,
+            hunt_ends_day: true,
+            ring_ignores_hook: true,
+            start_counts_open: true,
+            events_count_on_landing: true,
+            maiden_reads_old: true,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Phase {
+    Patrol,
+    Manage,
+    Event,
+    Ended,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Inmate {
+    pub id: u32,
+    pub beast: Beast,
+    pub tier: i32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Nest {
+    pub due: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Cell {
+    pub n: usize,
+    pub sealed: bool,
+    pub inmate: Option<Inmate>,
+    pub hidden: Option<Inmate>,
+    pub known: u8,
+    pub scratch: bool,
+    pub nest: Option<Nest>,
+    pub event: Option<u32>,
+    pub ivory: bool,
+}
+
+impl Cell {
+    /// blankCell: the office is never sealed and never holds anyone.
+    pub fn blank(n: usize) -> Cell {
+        Cell { n, sealed: n != data().room, inmate: None, hidden: None, known: 0, scratch: false, nest: None, event: None, ivory: false }
+    }
+
+    /// An open cell with an inmate in it.
+    pub fn on_board(&self) -> bool {
+        !self.sealed && self.inmate.is_some()
+    }
+}
+
+/// The incident waiting for its confirm.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EventRef {
+    pub id: u32,
+    pub cell: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VaultEntry {
+    pub id: u32,
+    pub beast: Beast,
+    pub day: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ToolReason {
+    Start,
+    Objective,
+}
+
+/// A choice the player makes before anything else.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub enum Pending {
+    Tool { options: Vec<Tool>, reason: ToolReason },
+    Gift { options: Vec<Gift>, picks: u32 },
+    Interrogation { options: Vec<Card> },
+    /// A chain consume: the eater in cell `from` may bite one of `options`.
+    Chain {
+        from: usize,
+        #[serde(rename = "eaterId")]
+        eater_id: u32,
+        options: Vec<usize>,
+    },
+    /// A cell to move to, for the incident `id` (Sewer Ratway).
+    Cell { id: u32, options: Vec<usize> },
+    /// The Hunt's "Select an Objective": the Lion's Consumable targets, one
+    /// to mark as prey. Only a board read on that screen sets it.
+    Prey { options: Vec<usize> },
+}
+
+impl Pending {
+    pub fn is_empty(&self) -> bool {
+        match self {
+            Pending::Tool { options, .. } => options.is_empty(),
+            Pending::Gift { options, .. } => options.is_empty(),
+            Pending::Interrogation { options } => options.is_empty(),
+            Pending::Chain { options, .. } | Pending::Cell { options, .. } | Pending::Prey { options } => options.is_empty(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObjectiveState {
+    pub id: u32,
+    pub progress: u32,
+    pub done: bool,
+}
+
+/// Actions used today (freshDay).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Used {
+    pub swap: u32,
+    pub devour: u32,
+    pub hunt: u32,
+    /// A bite was really made today (set only when eating in a simulation). When `devour` comes from a read board it
+    /// only means the "eat" card is missing, perhaps just because the eater has no target; a present "swap" card on a
+    /// read board means no bite was made.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub bitten: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PreyLink {
+    pub lion: u32,
+    pub prey: u32,
+    pub prey_beast: Beast,
+    pub rounds: i32,
+    pub next: u32,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Stats {
+    pub patrols: u32,
+    pub opened: u32,
+    pub devours: u32,
+    pub chains: u32,
+    pub swaps: u32,
+    pub executions: u32,
+    pub best: i32,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RosterRow {
+    pub beast: Beast,
+    pub tier: i32,
+    #[serde(rename = "where")]
+    pub place: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Roster {
+    pub rows: Vec<RosterRow>,
+    pub by_tier: Vec<u32>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RunResult {
+    pub day: u32,
+    pub early: bool,
+    pub roster: Roster,
+    pub cache: u32,
+    pub best: i32,
+    pub stats: Stats,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct State {
+    pub v: u32,
+    pub scenario: String,
+    pub seed: String,
+    pub rng: u32,
+    pub params: Params,
+    pub day: u32,
+    pub max_days: u32,
+    pub phase: Phase,
+    pub position: usize,
+    pub dice: Vec<u32>,
+    pub destinations: Vec<usize>,
+    pub chain: bool,
+    pub event: Option<EventRef>,
+    /// Markers placed per incident id; JSON keys are the ids as strings.
+    pub incident_counts: BTreeMap<u32, u32>,
+    /// Draw weights the run changed, by incident id (Usurpation stages).
+    pub incident_weights: BTreeMap<u32, u32>,
+    pub cells: Vec<Cell>,
+    pub vault: Vec<VaultEntry>,
+    pub cache: u32,
+    pub tools: Vec<Tool>,
+    /// Instrument rerolls left this run, shared by every instrument pick.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub rerolls: u8,
+    pub pending: Vec<Pending>,
+    pub objective: Option<ObjectiveState>,
+    pub theme: Option<u32>,
+    pub used: Used,
+    pub prey: Vec<PreyLink>,
+    pub next_id: u32,
+    pub stats: Stats,
+    pub result: Option<RunResult>,
+}
+
+impl State {
+    pub fn has(&self, tool: Tool) -> bool {
+        self.tools.contains(&tool)
+    }
+
+    /// The highest tier an inmate can reach: Chromatic while the vault has
+    /// room, Ultimate once it is full.
+    pub fn top_tier(&self) -> i32 {
+        if self.params.vault_cap.is_none_or(|cap| self.vault.len() < cap as usize) { RAINBOW } else { RAINBOW - 1 }
+    }
+
+    /// The Riot loot of this board in Chromatics: each vaulted Chromatic plus
+    /// the cache of each inmate on an open cell, weighted by `LOOT`, and the
+    /// completed objective's cache ([`OBJECTIVE_CACHE`]).
+    pub fn loot(&self) -> f64 {
+        let board: f64 = self.cells.iter().filter(|c| c.on_board()).filter_map(|c| c.inmate).map(|i| LOOT[i.tier as usize]).sum();
+        let goal = if self.params.rewards && self.objective.is_some_and(|o| o.done) { OBJECTIVE_CACHE } else { 0.0 };
+        self.vault.len() as f64 * LOOT[RAINBOW as usize] + board + goal
+    }
+
+    /// Index of the cell holding inmate `id`, sealed or open (cellOf).
+    pub fn cell_of(&self, id: u32) -> Option<usize> {
+        self.cells.iter().position(|c| c.inmate.is_some_and(|i| i.id == id))
+    }
+
+    /// cellOf, only when the cell is open (boardCellOf).
+    pub fn board_cell_of(&self, id: u32) -> Option<usize> {
+        self.cell_of(id).filter(|&n| !self.cells[n].sealed)
+    }
+
+    /// Index in `prey` of the first mark inmate `id` is part of (linkOf).
+    pub fn link_of(&self, id: u32) -> Option<usize> {
+        self.prey.iter().position(|l| l.lion == id || l.prey == id)
+    }
+
+    /// Open cells with an inmate (boardCells), as indices.
+    pub fn board_cells(&self) -> Vec<usize> {
+        self.cells.iter().filter(|c| c.on_board()).map(|c| c.n).collect()
+    }
+
+    pub fn sealed_cells(&self) -> Vec<usize> {
+        self.cells.iter().filter(|c| c.sealed).map(|c| c.n).collect()
+    }
+
+    /// How many cells `board_cells` lists, without the list.
+    pub fn board_count(&self) -> usize {
+        self.cells.iter().filter(|c| c.on_board()).count()
+    }
+
+    /// How many cells `sealed_cells` lists, without the list.
+    pub fn sealed_count(&self) -> usize {
+        self.cells.iter().filter(|c| c.sealed).count()
+    }
+
+    /// Whether swapping is still possible today: swaps are not used up and (under game rules) no bite has been made
+    /// today.
+    pub fn replace_left(&self) -> bool {
+        self.used.swap < self.params.swaps_per_day && !(self.params.bite_ends_replace && self.used.bitten)
+    }
+
+    /// Makes `self` a copy of `src`, reusing the memory `self` has already allocated: the solver tries many steps on
+    /// copies of the same state, and each fresh clone would allocate every list again.
+    pub fn copy_from(&mut self, src: &State) {
+        // List every field one by one, so a field added later makes this fail to compile instead of being missed.
+        let State {
+            v,
+            scenario,
+            seed,
+            rng,
+            params,
+            day,
+            max_days,
+            phase,
+            position,
+            dice,
+            destinations,
+            chain,
+            event,
+            incident_counts,
+            incident_weights,
+            cells,
+            vault,
+            cache,
+            tools,
+            rerolls,
+            pending,
+            objective,
+            theme,
+            used,
+            prey,
+            next_id,
+            stats,
+            result,
+        } = src;
+        self.v = *v;
+        self.scenario.clone_from(scenario);
+        self.seed.clone_from(seed);
+        self.rng = *rng;
+        self.params.clone_from(params);
+        self.day = *day;
+        self.max_days = *max_days;
+        self.phase = *phase;
+        self.position = *position;
+        self.dice.clone_from(dice);
+        self.destinations.clone_from(destinations);
+        self.chain = *chain;
+        self.event = *event;
+        self.incident_counts.clone_from(incident_counts);
+        self.incident_weights.clone_from(incident_weights);
+        self.cells.clone_from(cells);
+        self.vault.clone_from(vault);
+        self.cache = *cache;
+        self.tools.clone_from(tools);
+        self.rerolls = *rerolls;
+        self.pending.clone_from(pending);
+        self.objective = *objective;
+        self.theme = *theme;
+        self.used = *used;
+        self.prey.clone_from(prey);
+        self.next_id = *next_id;
+        self.stats = *stats;
+        self.result.clone_from(result);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::new_game;
+
+    #[test]
+    fn copy_from_matches_a_clone() {
+        let mut src = new_game("copy");
+        src.pending.push(Pending::Gift { options: Gift::ALL.to_vec(), picks: 3 });
+        src.vault.push(VaultEntry { id: 7, beast: Beast::Wolf, day: 2 });
+        src.incident_counts.insert(213, 2);
+        src.event = Some(EventRef { id: 213, cell: 4 });
+        src.objective = Some(ObjectiveState { id: 5, progress: 1, done: false });
+        src.result = Some(RunResult { day: 20, early: false, roster: Roster { rows: vec![RosterRow { beast: Beast::Lion, tier: 3, place: "A1".into() }], by_tier: vec![1] }, cache: 2, best: 4, stats: Stats::default() });
+        let mut dst = new_game("other");
+        dst.prey.push(PreyLink { lion: 1, prey: 2, prey_beast: Beast::Rat, rounds: 3, next: 0 });
+        dst.copy_from(&src);
+        assert_eq!(dst, src);
+    }
+}

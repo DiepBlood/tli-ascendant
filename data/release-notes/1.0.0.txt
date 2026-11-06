@@ -1,0 +1,64 @@
+[[zh-TW]]
+Ascendant 1.0.0：第一個公開版本
+
+《火炬之光：無限》的 Windows 輔助視窗。只讀取遊戲視窗的畫面和遊戲自己寫出的日誌，不碰遊戲的記憶體、檔案或網路，也不會替你點擊或打字。非官方工具，與遊戲的開發商、發行商無關。
+
+主要功能
+- 塔羅斯：讀取監獄盤面，建議下一步要去哪一格、吃掉或替換哪個囚犯、選哪個刑具或典獄長寶藏獎勵，以及要不要重新隨機。
+- 渴血手術：讀取藥劑卡、水箱與手術用具，建議這一手選哪張卡、加到哪個水箱，並顯示每個選項達到 840k 的機率與平均分數；終局戰鬥時顯示波次、活性與加成。支援系列藥劑（只在剩下的回合還來得及湊完時才建議拿）與 4、5 張手牌。
+- 本局頁：一局結束後分析這局主要是運氣還是決策，並列出損失最大的一步。
+- 進度頁：顯示渴血與塔羅斯的累積次數與可玩局數。
+- 匯出回報資料：把一局的文字紀錄與遊戲截圖打包成 zip，先列出內容給你看，按下才存檔；塔羅斯畫面會塗黑 UID 與聊天。
+- 標示要點擊的位置、點擊穿透（F7）、自動讀取（F8）、讀一次（F9）、三種版面與字體大小。
+
+支援範圍
+- Windows 10 或 11；遊戲畫面 16:9 或更寬，1920×1080、2560×1440 等解析度與全螢幕、無邊框、視窗模式都可以。
+- 渴血支援遊戲的「整體介面縮放」（已實測接近最小、推薦、最大三種設定）。
+- 繁中客戶端支援最完整；英文客戶端可以用塔羅斯，渴血只支援繁中客戶端。其他客戶端不支援。
+- Windows 的 OCR 語言要和遊戲客戶端相同，程式裡有「安裝繁中 OCR」「安裝英文 OCR」按鈕（裝完要重新啟動 Windows）。
+
+安全與更新
+- 每個版本都附有 SHA256SUMS.txt 與它的 Ed25519 簽章，Ascendant 內建發行公鑰，下載的更新要通過簽章與雜湊驗證才會安裝。
+- 發行公鑰指紋：924d 51f6 7734 fbb4 dad1 1091 77ee 6bd5（設定頁「關於」可以核對）。
+- 啟動時與開著的期間每小時向 GitHub 查詢新版，有新版只在設定圖示加一個小紅點；只有你按「更新」才會下載。
+- 只從本 repo 的 Releases 頁面下載。exe 沒有程式碼簽章，第一次執行時 Windows SmartScreen 可能會警告。
+
+已知限制
+- 渴血英文客戶端尚未支援。
+- Windows 11 與 150% 以上的顯示縮放測試較少，遇到讀錯請用「匯出回報資料」回報。
+
+授權
+- 改自 arcasti/tli-warden，依 GPL-3.0 授權釋出；渴血求解器改自 vorax-solver-rs（MIT）。
+
+[[en]]
+
+Ascendant 1.0.0: the first public release
+
+A Windows companion app for Torchlight: Infinite. It only reads pixels from the game window and the game's own log; it never touches the game's memory, files or network traffic, and never clicks or types for you. Unofficial and not affiliated with the game's developers or publishers.
+
+Features
+- Tartarus: reads the prison board and recommends which destination to take, which Inmate to consume or replace, which Torture Instrument or Warden's Treasure reward to pick, and when to re-roll.
+- Vorax: reads the potion cards, tanks and instruments, and recommends which card to pick and which tank to add it to, with each option's chance to reach 840k and its average score; shows the endgame battle's wave, activity and bonus. Potion chains are advised only while the remaining rounds can still finish them; 4- and 5-card hands are read.
+- Run page: after a game, whether it came down to luck or decisions, and the most costly step.
+- Progress page: Vorax and Tartarus counts and games left.
+- Export report data: packs one run's text logs and game screenshots into a zip, lists its contents first and saves only when you press the button; Tartarus frames have the UID and chat blacked out.
+- Click markers, click-through (F7), auto read (F8), read once (F9), three layouts and text sizes.
+
+Support
+- Windows 10 or 11; the game at 16:9 or wider (1920x1080, 2560x1440 and more), fullscreen, borderless or windowed.
+- Vorax supports the game's UI scale setting (tested near the smallest, at the recommended and at the largest).
+- The Traditional Chinese client is the best supported; the English client works for Tartarus, while Vorax needs the Traditional Chinese client. Other clients are not supported.
+- The Windows OCR language must match the game client; the app has "Install Traditional Chinese OCR" and "Install English OCR" buttons (restart Windows afterwards).
+
+Security and updates
+- Every release carries SHA256SUMS.txt and its Ed25519 signature. Ascendant has the release public key built in and installs an update only after its signature and hashes verify.
+- Release key fingerprint: 924d 51f6 7734 fbb4 dad1 1091 77ee 6bd5 (compare it in Settings, About).
+- Ascendant asks GitHub for a new version at start and every hour while open; a new version only puts a small red dot on the Settings button, and nothing is downloaded until you press "Update".
+- Download only from this repo's Releases page. The exe is not code-signed, so Windows SmartScreen may warn on first run.
+
+Known limits
+- Vorax on the English client is not supported yet.
+- Windows 11 and display scaling of 150% or more have had less testing; please report misreads with "Export report data".
+
+License
+- Modified from arcasti/tli-warden and released under GPL-3.0; the Vorax solver is based on vorax-solver-rs (MIT).

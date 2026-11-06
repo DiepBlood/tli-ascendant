@@ -1,0 +1,24 @@
+# Source: crates/vorax of vorax-solver-rs v0.2.2 (DinoRaos, MIT, see LICENSE in this directory), with two later
+# vorax-solver-rs 0.3.0 changes taken on 2026-11-06 (the Dissection always-take rule and the measured spawn rarity
+# with use_recorded_odds for the traces; both upstream's own, marked where used).
+# It used to inherit version/edition/license from the upstream workspace; inside Ascendant these are now set explicitly.
+# The edition stays 2021 and does not follow Ascendant's 2024. data/ and fixtures/ were moved from the upstream root into this crate,
+# so the paths used by include_str! and the tests are now relative to this crate (src/data.rs, src/value.rs, tests/*.rs).
+[package]
+name = "vorax"
+description = "Engine, bots and Solver for the Vorax minigame of Torchlight: Infinite (read-only advice; never plays the game)"
+version = "0.2.2"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["float_roundtrip"] }
+rayon = "1"
+# fdlibm's log1p, the same algorithm V8's Math.log1p uses, so board values match the TypeScript ones bit for bit
+libm = "0.2"
+
+# Used when running the tests alone in this directory (upstream workspace's [profile.test]); ignored when this crate is an Ascendant dependency.
+[profile.test]
+opt-level = 3

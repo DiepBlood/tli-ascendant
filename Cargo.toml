@@ -1,0 +1,78 @@
+[package]
+name = "ascendant"
+version = "1.0.0"
+edition = "2024"
+description = "Live advisor for the Tartarus prison board in Torchlight: Infinite"
+license = "GPL-3.0-only"
+publish = false
+
+[dependencies]
+flate2 = "1"
+jpeg-encoder = "0.7.1"
+# The allocator (see src/lib.rs): the playouts clone the State every round,
+# and Windows' heap held 8 threads back; solves took 44% less with it.
+mimalloc = "0.1.52"
+png = "0.18"
+# The playout threads (see src/solver/solve.rs): a pool that lives on keeps
+# each thread's chain memos from one batch of rounds to the next.
+rayon = "1.12.0"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+# Update signatures (src/app/update.rs): Ed25519 from the dalek-cryptography project, pure Rust; only verify_strict,
+# signing and key bytes are used, so the defaults (precomputed tables, std) are off and only zeroize (wipes signing
+# keys on drop) is on.
+ed25519-dalek = { version = "2.2", default-features = false, features = ["zeroize"] }
+# The release signing key's seed (ascendant-cli keygen): the operating system's random source (already in the
+# dependency tree).
+getrandom = "0.4"
+# The encrypted release key file (ascendant-cli keygen / sign): RustCrypto's Argon2id (password-hashes) derives the
+# key from the password and its XChaCha20-Poly1305 (AEADs) seals the Ed25519 seed; both pure Rust, without their
+# password-hash and OS-random defaults (getrandom above gives the salt and nonce). zeroize wipes passwords, keys and
+# seeds held in memory.
+argon2 = { version = "0.5", default-features = false, features = ["alloc", "zeroize"] }
+chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc"] }
+zeroize = "1"
+# The report export (src/app/report.rs): zip (zip-rs/zip2, pure Rust; deflate only, through the flate2
+# already here) and zune-jpeg (a pure Rust JPEG decoder, to shrink and cut the saved frame-*.jpg).
+zip = { version = "9.3", default-features = false, features = ["deflate-flate2"] }
+zune-jpeg = "0.5"
+# The Vorax surgery engine and solver: an MIT-licensed copy of vorax-solver-rs v0.2.2, see crates/vorax/LICENSE
+vorax = { path = "crates/vorax" }
+
+[build-dependencies]
+embed-resource = "3.0"
+
+# Ascendant: the window (windows subsystem); ascendant-cli: the console command line.
+[[bin]]
+name = "Ascendant"
+path = "src/main.rs"
+
+[[bin]]
+name = "ascendant-cli"
+path = "src/bin/ascendant-cli.rs"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+
+# Tests: `cargo test --profile fast-test`. Optimised for speed, with no
+# whole-program pass, so test builds are quick; the release profile above
+# stays for Ascendant.exe.
+[profile.fast-test]
+inherits = "release"
+opt-level = 3
+lto = false
+codegen-units = 16
+panic = "unwind"
+strip = true
+
+[target."cfg(windows)".dependencies]
+# The window (src/app): egui on wgpu with the Direct3D 12 backend only (glow's OpenGL window stays
+# white on screen on an NVIDIA RTX 3070 Ti, driver 616.92); rfd for the file dialog.
+eframe = { version = "0.37.0", default-features = false, features = ["wgpu_no_default_features", "default_fonts"] }
+wgpu = { version = "30", default-features = false, features = ["std", "parking_lot", "dx12", "wgsl"] }
+rfd = { version = "0.17.2", default-features = false }
+windows = { version = "0.62", features = ["Media_Ocr", "Graphics_Imaging", "Storage_Streams", "Foundation", "Foundation_Collections", "Globalization", "Win32_Foundation", "Win32_Graphics_Gdi", "Win32_UI_WindowsAndMessaging", "Win32_UI_Input_KeyboardAndMouse", "Win32_System_Threading", "Win32_System_LibraryLoader","Graphics", "Graphics_Capture", "Graphics_DirectX", "Graphics_DirectX_Direct3D11", "Win32_Graphics_Direct3D", "Win32_Graphics_Direct3D11", "Win32_Graphics_Dxgi", "Win32_Graphics_Dxgi_Common", "Win32_Graphics_Dwm", "Win32_System_WinRT_Direct3D11", "Win32_System_WinRT_Graphics_Capture", "Win32_UI_HiDpi", "Web_Http", "Web_Http_Filters", "Web_Http_Headers", "Win32_System_Com", "Win32_System_Registry", "Win32_Security", "Win32_Security_Authorization", "Win32_System_Console", "Win32_UI_Shell", "Win32_Storage_FileSystem", "Win32_System_SystemInformation"] }
