@@ -19,6 +19,8 @@ pub mod mark;
 #[cfg(windows)]
 pub mod report;
 #[cfg(windows)]
+pub mod run_review;
+#[cfg(windows)]
 pub mod gamelog;
 #[cfg(windows)]
 pub mod hotkey;

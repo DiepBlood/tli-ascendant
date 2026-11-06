@@ -36,7 +36,7 @@
 
 ## 回報一般問題時
 
-只附程式「匯出回報資料」產生的 zip（本局頁按鈕；先列出內容給你看，按「存檔並開啟資料夾」才寫入，存在 `Ascendant.exe` 所在的資料夾，不能寫入時改存到 `%APPDATA%\Ascendant`；附上前請先看過內容，整張畫面可能拍到角色名稱）或截圖。**不要附 exe 或其他壓縮檔**；我們也不會要求你這麼做。
+只附程式「匯出這一局」產生的 zip（本局頁下方的卡片，匯出頂端選單選的那一局；先列出內容給你看，按「存檔並開啟資料夾」才寫入，存在 `Ascendant.exe` 所在的資料夾，不能寫入時改存到 `%APPDATA%\Ascendant`；附上前請先看過內容，整張畫面可能拍到角色名稱）或截圖。**不要附 exe 或其他壓縮檔**；我們也不會要求你這麼做。
 
 ---
 
@@ -55,4 +55,4 @@
 - `ascendant-cli verify` is a developer's tool: a copy built from the repo's source carries the key from that same source, so it is not a basis for trust.
 - **The author's release rules**: never blindly pull the development repo before a release (review every incoming change, above all to the release key in `src/app/update.rs`, the scripts and the build files); on a key change, the release script proves the new private key matches the new built-in key, shows both fingerprints and signs only after `yes` is typed, and they must match the published ones.
 - **Report security issues privately** through GitHub's Private vulnerability reporting (Security tab, "Report a vulnerability"). Do not open a public issue.
-- **When reporting ordinary problems**, attach only the zip made by the app's "Export report data" button, or a screenshot. Never attach an exe or any other archive.
+- **When reporting ordinary problems**, attach only the zip made by the app's "Export this run" card on the Run tab (it exports the run picked in the picker at the top), or a screenshot. Never attach an exe or any other archive.

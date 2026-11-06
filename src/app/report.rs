@@ -35,7 +35,7 @@ use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 
@@ -230,8 +230,18 @@ fn dir_size(dir: &Path) -> u64 {
         .sum()
 }
 
-/// Tartarus and Vorax runs under `app_dir`, newest first; folders with no log.jsonl, or only window lines, are left out.
+/// The finished Tartarus and Vorax runs under `app_dir`, newest first. Only folders holding a finished game count
+/// (the same test as the run log's keep rule, [`super::runlog::finished`]): the folders from opening the app, the
+/// wait before a game and the time after one, and games given up, are left out. Reads every log whole, so it runs
+/// on a background thread ([`ReportUi::refresh`]).
 pub fn list_runs(app_dir: &Path) -> Vec<RunEntry> {
+    list_runs_known(app_dir, &Mutex::new(HashSet::new()))
+}
+
+/// [`list_runs`] with `known`, the folders already found finished: a finished game never changes, so only the
+/// folders not in it have their log read (one listing after each game would otherwise read every log again, hundreds
+/// of MB with "Keep all run logs" on); the folders found finished now are added. Kept in memory only.
+pub fn list_runs_known(app_dir: &Path, known: &Mutex<HashSet<PathBuf>>) -> Vec<RunEntry> {
     let mut runs = Vec::new();
     for (sub, game) in [("runs", Game::Tartarus), ("vorax", Game::Vorax)] {
         let Ok(entries) = std::fs::read_dir(app_dir.join(sub)) else { continue };
@@ -240,10 +250,15 @@ pub fn list_runs(app_dir: &Path) -> Vec<RunEntry> {
             if !e.file_type().is_ok_and(|t| t.is_dir()) || !super::runlog::is_run_folder(&name) {
                 continue;
             }
-            // At least one line that is not a window or view line (a folder from opening and closing the app is not
-            // listed): read only until the first such line.
-            if !has_play(&e.path().join("log.jsonl")) {
-                continue;
+            let dir = e.path();
+            let seen = known.lock().is_ok_and(|k| k.contains(&dir));
+            if !seen {
+                if !super::runlog::finished(&dir, game == Game::Vorax) {
+                    continue;
+                }
+                if let Ok(mut k) = known.lock() {
+                    k.insert(dir.clone());
+                }
             }
             runs.push(RunEntry { bytes: dir_size(&e.path()), dir: e.path(), name, game });
         }
@@ -252,11 +267,24 @@ pub fn list_runs(app_dir: &Path) -> Vec<RunEntry> {
     runs
 }
 
-/// Whether a log has a line other than window and view lines, reading only as far as the first one.
-fn has_play(log: &Path) -> bool {
-    use std::io::BufRead;
-    let Ok(file) = std::fs::File::open(log) else { return false };
-    std::io::BufReader::new(file).lines().map_while(Result::ok).any(|l| !l.trim().is_empty() && !l.contains("\"kind\":\"window\"") && !l.contains("\"kind\":\"view\""))
+impl RunEntry {
+    /// The entry for the run folder `dir`, its game told by the folder it is in (`vorax` or else Tartarus).
+    pub fn of(dir: PathBuf) -> RunEntry {
+        let name = dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let game = if dir.parent().and_then(|p| p.file_name()).is_some_and(|n| n == "vorax") { Game::Vorax } else { Game::Tartarus };
+        RunEntry { bytes: dir_size(&dir), dir, name, game }
+    }
+
+    /// How the run is named in a run list: "2026-11-04 21:15:31 · Tartarus · 12.3 MB".
+    pub fn label(&self) -> String {
+        format!("{} \u{b7} {}", self.title(), size_text(self.bytes))
+    }
+
+    /// The label without the size, "2026-11-04 21:15:31 · Tartarus": the Run tab's closed run picker, which stays one
+    /// line at the narrowest window, as it does with "Latest run".
+    pub fn title(&self) -> String {
+        format!("{} \u{b7} {}", run_time(&self.name), self.game.name())
+    }
 }
 
 /// "12.3 MB", "420 KB".
@@ -1522,6 +1550,9 @@ fn clock(at: &str) -> &str {
 }
 
 /// report.txt's text (in the window's language).
+/// How report.txt and the export card describe the images: the same rule as [`masked`].
+const IMAGES_RULE: &str = "- Images: card-play screens (the Tartarus prison, Vorax picks and results) are kept whole; other screens are cut to the board, or left out when none shows. Tartarus frames have the account UID at the bottom right and the chat and id line at the bottom left blacked out; Vorax pick and result screens are full-screen menus with no UID or chat and are kept as they are";
+
 fn report_text(p: &Prepared, level: &Level, (game_lang, ocr, size): &(String, String, String)) -> String {
     let mut t = String::new();
     let mut line = |s: String| {
@@ -1554,7 +1585,7 @@ fn report_text(p: &Prepared, level: &Level, (game_lang, ocr, size): &(String, St
     line(trf!("- Windows user name: {} replaced with <使用者>", p.removed.users));
     line(trf!("- Install id: {} removed", p.removed.install_ids));
     line(trf!("- Long numbers (ids): {} replaced with <數字>", p.removed.ids));
-    line(tr("- Images: card-play screens (the Tartarus prison, Vorax picks and results) are kept whole; other screens are cut to the board, or left out when none shows. The account UID corner at the bottom right, and the id line at the bottom left, are always blacked out").to_string());
+    line(tr(IMAGES_RULE).to_string());
     for n in &p.notes {
         line(n.clone());
     }
@@ -1723,14 +1754,39 @@ enum Phase {
     Failed(String),
 }
 
-/// The Run tab's "Export report data" card.
+/// What the export card exports: the run the Run tab shows (see [`super::run_review::RunReview::export_target`]).
+#[derive(Clone, Debug, PartialEq)]
+pub enum Target {
+    /// A finished run: the one the Run tab shows.
+    Run(PathBuf, Game),
+    /// "Latest run" before any game ended this session, so the Run tab shows no run: the newest finished run, named on
+    /// the card (its "time · game", [`RunEntry::title`]) since it is not on show above.
+    Newest(PathBuf, Game, String),
+    /// The run on show is not finished (it is not in the list of finished runs): nothing to export.
+    Unfinished,
+    /// Not known yet: the run list is being read, or the run on show is still being settled.
+    Waiting,
+    /// No finished run at all.
+    Nothing,
+}
+
+/// The Run tab's "Export this run" card, and the list of finished runs the Run tab's run picker shows.
 #[derive(Default)]
 pub struct ReportUi {
     runs: Vec<RunEntry>,
-    selected: usize,
     listed: bool,
     /// The run list being read on a background thread.
     listing: Option<Receiver<Vec<RunEntry>>>,
+    /// The run folders found finished by a listing, so the next listing reads only the others' logs (see
+    /// [`list_runs_known`]).
+    known: Arc<Mutex<HashSet<PathBuf>>>,
+    /// The run being prepared ("time · game"), named while it is: the run picker may have moved on meanwhile.
+    exporting: String,
+    /// The folder of the run being prepared or last prepared: a finished export ("Saved") or a failure belongs to
+    /// it, and goes once another run is to be exported (see [`ReportUi::follow`]).
+    exporting_dir: Option<PathBuf>,
+    /// For previews (ASCENDANT_PREVIEW_MEASURE): the top of the Prepare button when last drawn, in window points.
+    pub prepare_top: Option<f32>,
     phase: Phase,
     /// For tests (ASCENDANT_PREVIEW_REPORT_SAVE=1): saves as soon as the report is made.
     pub preview_save: bool,
@@ -1751,8 +1807,9 @@ impl ReportUi {
     /// `notify` repaints when the list is in.
     pub fn refresh(&mut self, notify: impl Fn() + Send + 'static) {
         let (tx, rx) = channel();
+        let known = Arc::clone(&self.known);
         std::thread::spawn(move || {
-            let _ = tx.send(super::settings::app_dir().map(|d| list_runs(&d)).unwrap_or_default());
+            let _ = tx.send(super::settings::app_dir().map(|d| list_runs_known(&d, &known)).unwrap_or_default());
             notify();
         });
         self.listing = Some(rx);
@@ -1765,7 +1822,6 @@ impl ReportUi {
         match rx.try_recv() {
             Ok(runs) => {
                 self.runs = runs;
-                self.selected = 0;
                 self.listing = None;
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => {}
@@ -1773,14 +1829,48 @@ impl ReportUi {
         }
     }
 
-    /// Picks the run `dir` (put first when not listed) and starts its export (the preview entry point).
-    pub fn start_dir(&mut self, dir: PathBuf, settled: Option<Settled>, install_id: &str, notify: impl Fn() + Send + Sync + 'static) {
-        let name = dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-        let game = if dir.parent().and_then(|p| p.file_name()).is_some_and(|n| n == "vorax") { Game::Vorax } else { Game::Tartarus };
-        self.runs = vec![RunEntry { bytes: dir_size(&dir), dir: dir.clone(), name, game }];
-        self.selected = 0;
+    /// The finished runs listed so far (the Run tab's run picker shows them); the first call starts the listing on a
+    /// background thread, and the list is taken once it is in.
+    pub fn runs(&mut self, ctx: &egui::Context) -> &[RunEntry] {
+        if !self.listed {
+            let ctx = ctx.clone();
+            self.refresh(move || ctx.request_repaint());
+        }
+        self.poll_list();
+        &self.runs
+    }
+
+    /// The finished runs as last listed, without reading them again.
+    pub fn listed_runs(&self) -> &[RunEntry] {
+        &self.runs
+    }
+
+    /// Whether the list is being read, or is to be read again before it is next shown.
+    pub fn listing(&self) -> bool {
+        self.listing.is_some() || !self.listed
+    }
+
+    /// Lists the runs again the next time they are asked for (a game just ended, so the list is out of date).
+    pub fn relist(&mut self) {
+        self.listed = false;
+    }
+
+    /// For tests: `runs` comes in as a listing does.
+    #[cfg(test)]
+    pub fn take_list(&mut self, runs: Vec<RunEntry>) {
+        let (tx, rx) = channel();
+        tx.send(runs).unwrap();
+        self.listing = Some(rx);
         self.listed = true;
-        self.listing = None;
+        self.poll_list();
+    }
+
+    /// Starts the export of the run `dir` (the preview entry point).
+    pub fn start_dir(&mut self, dir: PathBuf, settled: Option<Settled>, install_id: &str, notify: impl Fn() + Send + Sync + 'static) {
+        let entry = RunEntry::of(dir.clone());
+        let game = entry.game;
+        self.exporting = entry.title();
+        self.exporting_dir = Some(dir.clone());
         self.phase = Phase::Working(Export::start(Request { dir, game, settled, install_id: install_id.to_string(), app_dir: super::settings::app_dir() }, notify), String::new());
     }
 
@@ -1836,21 +1926,40 @@ impl ReportUi {
         self.phase = Phase::Saving(rx, p, open);
     }
 
+    /// The card follows the run to export: once another run (or an unfinished one, or none) is to be exported, an
+    /// export of the run before goes, whether it is being prepared (cancelled; what its thread still sends is
+    /// dropped with the channel), listed or finished ("Saved", or a failure), and the card offers "Prepare" for
+    /// `target`. Only a zip being written is finished first, so no half-written file is left; once written, the next
+    /// call finds "Saved" for the run before and goes back to "Prepare" too. `Waiting` (the list being read again)
+    /// changes nothing.
+    fn follow(&mut self, target: &Target) {
+        let dir = match target {
+            Target::Run(dir, _) | Target::Newest(dir, _, _) => Some(dir),
+            Target::Unfinished | Target::Nothing => None,
+            Target::Waiting => return,
+        };
+        if dir == self.exporting_dir.as_ref() || matches!(self.phase, Phase::Idle | Phase::Saving(..)) {
+            return;
+        }
+        if let Phase::Working(export, _) = &self.phase {
+            export.cancel();
+        }
+        self.phase = Phase::Idle;
+    }
+
     /// Whether an export or its run review re-solve is running (the window keeps the language as it is meanwhile).
     pub fn busy(&self) -> bool {
         matches!(self.phase, Phase::Working(..)) || settle_running()
     }
 
-    /// Draws the card. `settled` is the review the Run tab has, `exe` is Ascendant.exe.
-    pub fn show(&mut self, ui: &mut egui::Ui, settled: Option<&Settled>, install_id: &str, exe: Option<&Path>) {
-        if !self.listed {
-            let ctx = ui.ctx().clone();
-            self.refresh(move || ctx.request_repaint());
-        }
-        self.poll_list();
+    /// Draws the card, which exports `target`, the run the Run tab shows. `settled` is the review the Run tab has,
+    /// `exe` is Ascendant.exe.
+    pub fn show(&mut self, ui: &mut egui::Ui, target: &Target, settled: Option<&Settled>, install_id: &str, exe: Option<&Path>) {
+        let _ = self.runs(ui.ctx());
         let ctx = ui.ctx().clone();
         self.poll(exe, move || ctx.request_repaint());
-        theme::heading(ui, tr("Export report data"));
+        self.follow(target);
+        theme::heading(ui, tr("Export this run"));
         let mut act = None;
         theme::group_frame().show(ui, |ui| {
             ui.set_width(ui.available_width());
@@ -1860,32 +1969,37 @@ impl ReportUi {
             };
             match &self.phase {
                 Phase::Idle | Phase::Failed(_) => {
-                    small(ui, tr("Packs one run's log and board screenshots into a zip for a bug report. Nothing is sent: you look it over, and only \"Save and open folder\" writes it."), MUTED);
-                    if self.listing.is_some() {
-                        ui.horizontal(|ui| {
-                            ui.add(egui::Spinner::new().size(12.0).color(ACCENT));
-                            ui.label(RichText::new(tr("Loading...")).small().color(MUTED));
-                        });
-                    } else if self.runs.is_empty() {
-                        small(ui, tr("No run logs yet: turn on Keep a run log in Settings."), MUTED);
-                    } else {
-                        let label = |r: &RunEntry| format!("{} \u{b7} {} \u{b7} {}", run_time(&r.name), r.game.name(), size_text(r.bytes));
-                        let mut picked = self.selected.min(self.runs.len() - 1);
-                        egui::ComboBox::from_id_salt("report-run").width(ui.available_width()).selected_text(label(&self.runs[picked])).show_ui(ui, |ui| {
-                            for (k, r) in self.runs.iter().enumerate() {
-                                ui.selectable_value(&mut picked, k, label(r));
+                    small(ui, tr("Packs the log and board screenshots of the run picked above into a zip for a bug report. Nothing is sent: you look it over, and only \"Save and open folder\" writes it."), MUTED);
+                    ui.horizontal(|ui| {
+                        let prepare = ui.button(tr("Prepare")).on_hover_text(tr("Picks the suspicious moments and the screenshots in the background"));
+                        self.prepare_top = Some(prepare.rect.top());
+                        if prepare.clicked() {
+                            act = Some(Act::Start);
+                        }
+                        // Greyed out only while the list is read; it lists the runs of the run picker above again.
+                        if ui.add_enabled(self.listing.is_none(), egui::Button::new(tr("Refresh list")).small()).clicked() {
+                            act = Some(Act::Refresh);
+                        }
+                    });
+                    // Why nothing is exported, or which run when none is on show above: one line of fixed height, empty
+                    // when the run on show is exported, so the buttons and everything below stay where they are.
+                    let (text, colour, hover) = match target {
+                        Target::Run(..) => (String::new(), MUTED, None),
+                        Target::Newest(.., title) => (trf!("Exports: {}", title), MUTED, None),
+                        Target::Unfinished => (tr("This run is not finished: pick one above").to_string(), theme::WARN, None),
+                        Target::Waiting => (tr("Wait a moment: this run is still being read").to_string(), MUTED, None),
+                        Target::Nothing => (tr("No finished runs yet").to_string(), MUTED, Some(tr("No finished runs yet: with Keep a run log on in Settings, each game is listed once it ends."))),
+                    };
+                    let line_h = ui.text_style_height(&egui::TextStyle::Small);
+                    ui.allocate_ui_with_layout(egui::vec2(ui.available_width(), line_h), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                        ui.set_min_size(egui::vec2(ui.available_width(), line_h));
+                        if !text.is_empty() {
+                            let label = ui.add(egui::Label::new(RichText::new(text).small().color(colour)).truncate());
+                            if let Some(hover) = hover {
+                                label.on_hover_text(hover);
                             }
-                        });
-                        self.selected = picked;
-                        ui.horizontal(|ui| {
-                            if ui.button(tr("Prepare")).on_hover_text(tr("Picks the suspicious moments and the screenshots in the background")).clicked() {
-                                act = Some(Act::Start);
-                            }
-                            if ui.small_button(tr("Refresh")).clicked() {
-                                act = Some(Act::Refresh);
-                            }
-                        });
-                    }
+                        }
+                    });
                     if let Phase::Failed(e) = &self.phase {
                         small(ui, &trf!("Export failed: {}", e), theme::ERROR);
                     }
@@ -1899,7 +2013,7 @@ impl ReportUi {
                 Phase::Working(_, status) => {
                     ui.horizontal(|ui| {
                         ui.add(egui::Spinner::new().size(14.0).color(ACCENT));
-                        ui.label(RichText::new(tr("Preparing the report...")).strong());
+                        ui.add(egui::Label::new(RichText::new(trf!("Preparing the report: {}", self.exporting)).strong()).wrap());
                     });
                     small(ui, status, MUTED);
                     if ui.button(tr("Cancel")).clicked() {
@@ -1940,9 +2054,12 @@ impl ReportUi {
         });
         match act {
             Some(Act::Start) => {
-                if let Some(r) = self.runs.get(self.selected) {
+                // Only a finished run is exported; otherwise the line under the buttons already says why.
+                if let Target::Run(dir, game) | Target::Newest(dir, game, _) = target {
+                    self.exporting = self.runs.iter().find(|r| r.dir == *dir).map_or_else(|| RunEntry::of(dir.clone()).title(), RunEntry::title);
+                    self.exporting_dir = Some(dir.clone());
                     let ctx = ui.ctx().clone();
-                    let req = Request { dir: r.dir.clone(), game: r.game, settled: settled.cloned(), install_id: install_id.to_string(), app_dir: super::settings::app_dir() };
+                    let req = Request { dir: dir.clone(), game: *game, settled: settled.cloned(), install_id: install_id.to_string(), app_dir: super::settings::app_dir() };
                     self.phase = Phase::Working(Export::start(req, move || ctx.request_repaint()), String::new());
                 }
             }
@@ -2010,10 +2127,10 @@ fn contents(ui: &mut egui::Ui, p: &Prepared) {
         trf!("- Windows user name: {} replaced with <使用者>", r.users),
         trf!("- Install id: {} removed", r.install_ids),
         trf!("- Long numbers (ids): {} replaced with <數字>", r.ids),
-        tr("- Images: card-play screens (the Tartarus prison, Vorax picks and results) are kept whole; other screens are cut to the board, or left out when none shows. The account UID corner at the bottom right, and the id line at the bottom left, are always blacked out").to_string(),
+        tr(IMAGES_RULE).to_string(),
     ];
     detail.extend(p.notes.iter().cloned());
-    let summary = tr("Removed: window titles, local paths, user name, install id; ID corners blacked out");
+    let summary = tr("Removed: window titles, local paths, user name, install id; Tartarus UID corners blacked out");
     one_line(ui, summary, &format!("{summary}\n{}", detail.join("\n")), MUTED);
 }
 
@@ -2098,6 +2215,56 @@ mod tests {
         let p = |s: &str| m.iter().find(|x| x.reason.contains(s)).unwrap().priority;
         assert_eq!((p("Manual"), p("Read failed"), p("Read warning"), p("differs"), p("Largest"), p("Run check"), p("crash")), (1, 2, 3, 2, 1, 1, 1));
         assert!(m.windows(2).all(|w| w[0].ms <= w[1].ms));
+    }
+
+    /// An export belongs to its run: once another run (or an unfinished one, or none) is to be exported, an export
+    /// being prepared (cancelled), listed, saved or failed goes and the card is back to "Prepare"; the same run, or
+    /// the list being read again, keeps it; only a zip being written is finished first.
+    #[test]
+    fn a_finished_export_goes_when_another_run_is_picked() {
+        let (a, b) = (PathBuf::from("C:/app/vorax/2026-11-06_16-24-14"), PathBuf::from("C:/app/runs/2026-11-06_16-19-57"));
+        let saved = || Phase::Saved(PathBuf::from("C:/out/a.zip"), Box::default());
+        let mut ui = ReportUi { exporting_dir: Some(a.clone()), phase: saved(), ..ReportUi::default() };
+        ui.follow(&Target::Run(a.clone(), Game::Vorax));
+        ui.follow(&Target::Waiting);
+        assert!(matches!(ui.phase, Phase::Saved(..)), "the same run, or the list read again: kept");
+        ui.follow(&Target::Run(b.clone(), Game::Tartarus));
+        assert!(matches!(ui.phase, Phase::Idle), "another run: Prepare again");
+
+        for target in [Target::Newest(b.clone(), Game::Tartarus, String::new()), Target::Unfinished, Target::Nothing] {
+            for phase in [Phase::Failed("x".into()), Phase::Ready(Box::default())] {
+                let mut ui = ReportUi { exporting_dir: Some(a.clone()), phase, ..ReportUi::default() };
+                ui.follow(&target);
+                assert!(matches!(ui.phase, Phase::Idle), "{target:?}");
+            }
+        }
+        let listed = |phase| ReportUi { exporting_dir: Some(a.clone()), phase, ..ReportUi::default() };
+        let mut ui = listed(Phase::Ready(Box::default()));
+        ui.follow(&Target::Run(a.clone(), Game::Vorax));
+        assert!(matches!(ui.phase, Phase::Ready(..)), "listed, the same run: kept");
+        ui.follow(&Target::Run(b.clone(), Game::Tartarus));
+        assert!(matches!(ui.phase, Phase::Idle), "listed, another run: Prepare again");
+
+        // Being prepared: cancelled and gone; the thread's later messages go nowhere.
+        let (tx, rx) = channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut ui = listed(Phase::Working(Export { rx, cancel: cancel.clone() }, String::new()));
+        ui.follow(&Target::Waiting);
+        assert!(matches!(ui.phase, Phase::Working(..)) && !cancel.load(Ordering::Relaxed), "the list read again: carries on");
+        ui.follow(&Target::Unfinished);
+        assert!(matches!(ui.phase, Phase::Idle) && cancel.load(Ordering::Relaxed), "another run: cancelled");
+        assert!(tx.send(Msg::Status(String::new())).is_err(), "nobody listens any more");
+
+        // Being written: finished first, then back to Prepare once saved.
+        let (save_tx, save_rx) = channel();
+        let mut ui = listed(Phase::Saving(save_rx, Box::default(), false));
+        ui.follow(&Target::Unfinished);
+        assert!(matches!(ui.phase, Phase::Saving(..)), "being saved: carries on");
+        save_tx.send(Ok(PathBuf::from("C:/out/a.zip"))).unwrap();
+        ui.poll(None, || {});
+        assert!(matches!(ui.phase, Phase::Saved(..)));
+        ui.follow(&Target::Unfinished);
+        assert!(matches!(ui.phase, Phase::Idle), "saved, the run changed meanwhile: Prepare");
     }
 
     #[test]
@@ -2637,6 +2804,15 @@ mod tests {
             assert_eq!(tartarus.rgb(r.x + r.w / 2, r.y + r.h / 2), [0, 0, 0]);
         }
         assert!(masked(Treat::Crop(Game::Vorax)) && masked(Treat::Crop(Game::Tartarus)) && !masked(Treat::AsIs));
+        // report.txt says the same, in both languages: Tartarus blacked out, Vorax pick and result screens kept.
+        let text = report_text(&Prepared::default(), &LEVELS[0], &(String::new(), String::new(), String::new()));
+        assert!(text.contains(tr(IMAGES_RULE)), "{text}");
+        let zh = crate::lang::tr_in(crate::lang::Lang::ZhTw, IMAGES_RULE);
+        assert_ne!(zh, IMAGES_RULE, "translated");
+        for rule in [IMAGES_RULE, zh] {
+            assert!(!rule.contains("always") && !rule.contains("一律"), "no corner is blacked out on every image: {rule}");
+            assert!((rule.contains("Tartarus") || rule.contains("塔羅斯")) && (rule.contains("kept as they are") || rule.contains("保留原樣")), "{rule}");
+        }
     }
 
     #[test]

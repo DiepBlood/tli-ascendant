@@ -38,7 +38,8 @@ use super::settle::{self, Cause, Outcome, RunKind, Settled};
 use super::share::{self, Uploader};
 use super::update::{self, Release};
 use super::install::{self, OcrInstall, OcrLang};
-use super::report::ReportUi;
+use super::report::{Game, RunEntry};
+use super::run_review::RunReview;
 use crate::board::{CellModel, EventMark, Model};
 use crate::engine::data::{Beast, RAINBOW, Tool, data};
 use crate::engine::text::{beast_name, cell_label, incident_term, inmate_name, instrument, instrument_term, objective_name, theme_name, tier_name};
@@ -297,21 +298,12 @@ pub struct AscendantApp {
     editing_key: Option<Which>,
     /// "Change" was just pressed: the next time the input box is drawn it should take focus.
     key_focus: bool,
-    /// Background thread settling this run (see [`settle::spawn`]) and the folder it is computing; Some until
-    /// it finishes.
-    settling: Option<(PathBuf, Receiver<Outcome>)>,
-    /// Folder and result of the latest settlement, shown on the Run tab.
-    settled: Option<(PathBuf, Outcome)>,
-    /// The same two for the last Vorax game (see [`super::vorax_settle::spawn`]), kept apart from Tartarus's: each
-    /// is triggered by its own game's end.
-    vorax_settling: Option<(PathBuf, Receiver<Outcome>)>,
-    vorax_settled: Option<(PathBuf, Outcome)>,
+    /// The Run tab's review: the automatic settlements of the last Tartarus run and Vorax game (see
+    /// [`settle::spawn`], [`super::vorax_settle::spawn`]), the run picked to review instead, and the export card.
+    review: RunReview,
     /// The `ended_at` of the last Vorax game a settlement was started for (or skipped, with no log folder).
     vorax_ended: Option<i64>,
-    /// When (UTC ms) the Tartarus and the Vorax game under review ended: the Run tab shows the one that ended last.
-    tartarus_review_at: i64,
-    vorax_review_at: i64,
-    /// When (UTC ms) the Tartarus run on show was first seen over, for `tartarus_review_at`; taken by the settlement.
+    /// When (UTC ms) the Tartarus run on show was first seen over, for the review's time; taken by the settlement.
     run_over_at: Option<i64>,
     /// Whether the run was over last frame (to see it become over).
     was_over: bool,
@@ -351,8 +343,12 @@ pub struct AscendantApp {
     /// For testing (only when the environment variable ASCENDANT_PREVIEW_CHARGES is set, for example
     /// vorax:48,tartarus:46): use these fake values instead of the accumulated progress read from the game log.
     preview_charges: Option<gamelog::Charges>,
-    /// The Run tab's "Export report data" card (see [`super::report`]).
-    report: ReportUi,
+    /// For previews (ASCENDANT_PREVIEW_PICK with ASCENDANT_PREVIEW_PICK_AT=<seconds>): the run picked that many
+    /// seconds after start, as a pick in the run picker would (to capture before, while and after it settles).
+    preview_pick: Option<(Instant, PathBuf)>,
+    /// For previews (ASCENDANT_PREVIEW_SWITCH=<page>@<seconds>): the page switched to that many seconds after start,
+    /// as a press on its rail button would (to capture the windows closing with the page).
+    preview_switch: Option<(Instant, Tab)>,
     /// The OCR language being installed and its thread (see [`install::install_ocr`]).
     ocr_installing: Option<(OcrLang, Receiver<OcrInstall>)>,
     /// How the last OCR install ended.
@@ -453,13 +449,8 @@ impl AscendantApp {
             vorax,
             editing_key: None,
             key_focus: false,
-            settling: None,
-            settled: None,
-            vorax_settling: None,
-            vorax_settled: None,
+            review: RunReview::default(),
             vorax_ended: None,
-            tartarus_review_at: 0,
-            vorax_review_at: 0,
             run_over_at: None,
             was_over: false,
             over_reviewed: false,
@@ -475,7 +466,8 @@ impl AscendantApp {
             preview_tooltip_card: false,
             preview_run_over: false,
             preview_charges: None,
-            report: ReportUi::default(),
+            preview_pick: None,
+            preview_switch: None,
             ocr_installing: None,
             ocr_result: None,
             preview_no_ocr: false,
@@ -1228,8 +1220,10 @@ impl AscendantApp {
         let over = self.session.run_over.is_some();
         if over && !self.was_over {
             self.run_over_at = Some(super::vorax_session::now_ms());
-            // The run ended (the session wrote its `run_end`): a game was played since "Updated to" appeared.
+            // The run ended (the session wrote its `run_end`): a game was played since "Updated to" appeared, and
+            // the Run tab follows the latest run again.
             self.seen_updated();
+            self.review.game_ended();
         }
         self.was_over = over;
         if self.session.log.as_ref().map(|l| l.dir()) != self.log_dir.as_deref() {
@@ -1245,7 +1239,6 @@ impl AscendantApp {
         if let Some(result) = self.uploader.as_ref().and_then(Uploader::poll) {
             self.upload_error = result.err();
         }
-        self.poll_settle();
     }
 
     /// Settle the run in folder `dir` in the background; `written` is the notification that the log is fully
@@ -1253,14 +1246,20 @@ impl AscendantApp {
     /// When the previous run is still being computed, switch to computing this one (the previous result is
     /// discarded).
     fn start_settle(&mut self, dir: PathBuf, written: Option<Receiver<()>>) {
-        let ctx = self.ctx.clone();
-        let rx = settle::spawn(dir.clone(), written, move || ctx.request_repaint());
-        self.settling = Some((dir, rx));
-        self.tartarus_review_at = self.run_over_at.take().unwrap_or_else(super::vorax_session::now_ms);
+        let rx = spawn_settle(&self.ctx, dir.clone(), Game::Tartarus, written);
+        let at = self.run_over_at.take().unwrap_or_else(super::vorax_session::now_ms);
+        self.review.start_tartarus(dir, rx, at);
+    }
+
+    /// Settle the Vorax game in folder `dir` in the background, once `written` says its log is written (see
+    /// [`VoraxView::log_flushed`]); `at` is when it ended (None: the same game again, the time kept).
+    fn start_vorax_settle(&mut self, dir: PathBuf, written: Option<Receiver<()>>, at: Option<i64>) {
+        let rx = spawn_settle(&self.ctx, dir.clone(), Game::Vorax, written);
+        self.review.start_vorax(dir, rx, at);
     }
 
     /// A Vorax game ended with a log folder (a new `ended_at` in [`VoraxView::last_game`]): settle it in the
-    /// background, once its log is written; then take the result. Kept apart from Tartarus's settlement.
+    /// background, once its log is written. Kept apart from Tartarus's settlement.
     fn poll_vorax_settle(&mut self) {
         if let Some(g) = self.vorax.last_game()
             && self.vorax_ended != Some(g.ended_at)
@@ -1271,53 +1270,39 @@ impl AscendantApp {
             // appeared.
             self.seen_updated();
             if let Some(dir) = dir {
-                let ctx = self.ctx.clone();
-                let rx = super::vorax_settle::spawn(dir.clone(), self.vorax.log_flushed(), move || ctx.request_repaint());
-                self.vorax_settling = Some((dir, rx));
-                self.vorax_review_at = ended;
+                let written = self.vorax.log_flushed();
+                self.start_vorax_settle(dir, written, Some(ended));
             }
         }
-        let Some((dir, rx)) = &self.vorax_settling else { return };
-        let out = match rx.try_recv() {
-            Ok(out) => out,
-            Err(TryRecvError::Empty) => return,
-            Err(TryRecvError::Disconnected) => Outcome::Failed(tr("the review stopped unexpectedly").to_string()),
-        };
-        self.vorax_settled = Some((dir.clone(), out));
-        self.vorax_settling = None;
     }
 
-    /// Which game the Run tab reviews: the one that ended last of the Tartarus run and the Vorax game under review.
-    fn review_kind(&self) -> RunKind {
-        let vorax = self.vorax_settling.is_some() || self.vorax_settled.is_some();
-        let tartarus = self.settling.is_some() || self.settled.is_some();
-        if vorax && (!tartarus || self.vorax_review_at > self.tartarus_review_at) { RunKind::Vorax } else { RunKind::Tartarus }
+    /// Takes the settlements' results and starts the picked run's (see [`RunReview::poll`]).
+    fn poll_review(&mut self) {
+        let ctx = self.ctx.clone();
+        self.review.poll(&mut |dir, game| spawn_settle(&ctx, dir, game, None));
     }
 
-    /// Collect the settlement result; if the background thread died (channel disconnected), record a failure so
-    /// the spinner does not spin forever.
-    fn poll_settle(&mut self) {
-        let Some((dir, rx)) = &self.settling else { return };
-        let out = match rx.try_recv() {
-            Ok(out) => out,
-            Err(TryRecvError::Empty) => return,
-            Err(TryRecvError::Disconnected) => Outcome::Failed(tr("the review stopped unexpectedly").to_string()),
-        };
-        // Abandoning a run midway and restarting (no run_end) also changes the log folder: that run was not
-        // finished, so it must not overwrite the settlement already held from the previous run.
-        if matches!(out, Outcome::Unfinished) && self.settled.is_some() {
-            self.settling = None;
-            return;
+    /// Switches the page; every switch goes through here (the preview entry only sets the first page). The floating
+    /// windows that sit over a page close as it is left: "What's new" (opened from the notice or Settings), the
+    /// instruments and theme window and the cell correction window (both opened from the board), and the "Restore
+    /// defaults" confirmation (Settings). They share the spot under the title bar, so one left open would cover the
+    /// next page.
+    fn set_tab(&mut self, tab: Tab) {
+        if self.tab != tab {
+            self.whats_new = None;
+            self.tools_open = false;
+            self.editing = None;
+            self.restoring = false;
         }
-        self.settled = Some((dir.clone(), out));
-        self.settling = None;
+        self.tab = tab;
     }
 
-    /// Open the Run tab and settle the run in folder `dir` in the background (for offline preview and for
-    /// reviewing a particular run; normally [`AscendantApp::poll_upload`] triggers it when a run ends).
-    pub fn review(&mut self, dir: PathBuf) {
-        self.tab = Tab::Run;
-        self.start_settle(dir, None);
+    /// Open the Run tab and review the finished run `entry` instead of the latest (the run picker, and the
+    /// ASCENDANT_PREVIEW_PICK preview); the export card picks the same run.
+    fn review_run(&mut self, entry: RunEntry) {
+        self.set_tab(Tab::Run);
+        self.review.pick(entry);
+        self.poll_review();
     }
 
     /// Notice (one at a time): asks whether to install when the program is not in the install location, asks
@@ -1466,7 +1451,7 @@ impl AscendantApp {
             Some(NoticeAct::Share(on)) => self.set_sharing(on),
             Some(NoticeAct::Update) => self.start_update(),
             Some(NoticeAct::WhatsNew(pending)) => self.whats_new = Some(WhatsNew::new(pending)),
-            Some(NoticeAct::Settings) => self.tab = Tab::Settings,
+            Some(NoticeAct::Settings) => self.set_tab(Tab::Settings),
             Some(NoticeAct::Dismiss) => self.seen_updated(),
             None => {}
         }
@@ -1589,6 +1574,17 @@ fn notice_choices(kind: &NoticeKind) -> Vec<(String, bool, NoticeAct)> {
     }
 }
 
+/// The background settlement of the `game` run in folder `dir` ([`settle::spawn`] or [`super::vorax_settle::spawn`]),
+/// once `written` says its log is written; it repaints the window when done.
+fn spawn_settle(ctx: &egui::Context, dir: PathBuf, game: Game, written: Option<Receiver<()>>) -> Receiver<Outcome> {
+    let ctx = ctx.clone();
+    let notify = move || ctx.request_repaint();
+    match game {
+        Game::Tartarus => settle::spawn(dir, written, notify),
+        Game::Vorax => super::vorax_settle::spawn(dir, written, notify),
+    }
+}
+
 /// The "What's new" window while it is open: the newer release on offer (not installed yet) with its verified notes,
 /// listed above the built-in ones, when the window was opened from it; and a number of its own, so the folding of
 /// each version starts afresh every time the window opens.
@@ -1610,7 +1606,8 @@ impl WhatsNew {
 /// `[[en]]`, see [`notes_in`]). They are built into the exe, which the release's signature and SHA-256
 /// cover, so they are as trusted as the program and a fresh install sees the whole history. A new version adds its
 /// file here.
-const RELEASE_NOTES: &[(&str, &str)] = &[("1.0.0", include_str!("../../data/release-notes/1.0.0.txt"))];
+const RELEASE_NOTES: &[(&str, &str)] =
+    &[("1.0.1", include_str!("../../data/release-notes/1.0.1.txt")), ("1.0.0", include_str!("../../data/release-notes/1.0.0.txt"))];
 
 /// Which of the versions "What's new" lists (in its order, each with whether it is a release not installed yet) starts
 /// unfolded: the release not installed yet when there is one, else the `running` version, else the newest.
@@ -2038,6 +2035,28 @@ impl eframe::App for AscendantApp {
             }
         }
         self.poll_vorax_settle();
+        // For previews (ASCENDANT_PREVIEW_SWITCH): the page switched once its time comes.
+        if let Some((at, tab)) = self.preview_switch {
+            let now = Instant::now();
+            if now >= at {
+                self.preview_switch = None;
+                self.set_tab(tab);
+            } else {
+                ctx.request_repaint_after(at - now);
+            }
+        }
+        // For previews (ASCENDANT_PREVIEW_PICK_AT): the run picked once its time comes.
+        if let Some((at, _)) = &self.preview_pick {
+            let now = Instant::now();
+            if now >= *at {
+                if let Some((_, dir)) = self.preview_pick.take() {
+                    self.review_run(RunEntry::of(dir));
+                }
+            } else {
+                ctx.request_repaint_after(*at - now);
+            }
+        }
+        self.poll_review();
         if self.vorax.active() {
             // Vorax mode: Tartarus polling, marking, tooltips and the view log are all skipped; only the Vorax
             // box is drawn.
@@ -2088,7 +2107,7 @@ impl eframe::App for AscendantApp {
         self.poll_upload();
         let warned = self.session.reading.as_ref().map_or(0, |r| r.warnings.iter().filter(|w| w.kind != WarningKind::Note).count());
         if self.warned == 0 && warned > 0 {
-            self.tab = Tab::Board;
+            self.set_tab(Tab::Board);
         }
         self.warned = warned;
         // The count goes with the held instruments and the theme, so a
@@ -2163,7 +2182,8 @@ impl eframe::App for AscendantApp {
             // For testing (ASCENDANT_PREVIEW_MEASURE=<file>): write the content height and visible height, to
             // prove the content fits and there is no scrollbar.
             if let Some(path) = &self.preview_measure {
-                let text = format!("compact={compact} content_h={:.1} view_h={:.1} page_h={page_h:.1}\n", scrolled.content_size.y, scrolled.inner_rect.height());
+                let prepare = self.review.report.prepare_top.map_or_else(|| "none".to_string(), |y| format!("{y:.1}"));
+                let text = format!("compact={compact} content_h={:.1} view_h={:.1} page_h={page_h:.1} prepare_y={prepare}\n", scrolled.content_size.y, scrolled.inner_rect.height());
                 let _ = std::fs::write(path, text);
             }
         });
@@ -2200,7 +2220,7 @@ impl AscendantApp {
             for (tab, name, icon) in [(Tab::Board, tr("Board"), Icon::Board), (Tab::Run, tr("Run"), Icon::Run)] {
                 let badge = if tab == Tab::Board { self.warned } else { 0 };
                 if rail_button(ui, size, icon, self.tab == tab, badge).on_hover_text(name).clicked() {
-                    self.tab = tab;
+                    self.set_tab(tab);
                 }
             }
             // Progress: yellow background when nearly full, red background plus a red dot when full; the hover
@@ -2211,7 +2231,7 @@ impl AscendantApp {
                 egui::Tooltip::for_widget(&progress).show(|ui| ui.label(progress_hover(&charges)));
             }
             if progress.clicked() {
-                self.tab = Tab::Progress;
+                self.set_tab(Tab::Progress);
             }
             // A newer release the hourly check found: only a red dot drawn over the button, which takes no room.
             let dot = self.update_dot();
@@ -2224,7 +2244,7 @@ impl AscendantApp {
                 ui.painter().circle_filled(settings.rect.right_top() + Vec2::new(-3.0, 4.0), 4.0, theme::ERROR);
             }
             if settings.on_hover_text(hover).clicked() {
-                self.tab = Tab::Settings;
+                self.set_tab(Tab::Settings);
             }
         });
         ui.with_layout(Layout::bottom_up(Align::Center), |ui| {
@@ -2244,7 +2264,7 @@ impl AscendantApp {
             // The game log light: green, yellow, red, grey without a watcher; a click opens Settings.
             let status = self.log_status();
             if log_button(ui, Vec2::new(size.x, 30.0), log_lamp(status.as_ref())).on_hover_text(log_hover(status.as_ref())).clicked() {
-                self.tab = Tab::Settings;
+                self.set_tab(Tab::Settings);
             }
             // The spinner's slot is always reserved, so the buttons do not jump when reading starts or ends.
             let (rect, _) = ui.allocate_exact_size(Vec2::splat(14.0), Sense::hover());
@@ -2328,7 +2348,7 @@ impl AscendantApp {
                     // card is clickable and the tooltip says "Click to open the Run tab"), so it does not wrap
                     // and leave a single word.
                     let luck = (tr("Mostly luck this run: see the Run tab"), tr("Mostly luck \u{203a}"));
-                    let note = match (&self.settling, &self.settled) {
+                    let note = match (&self.review.settling, &self.review.settled) {
                         _ if self.preview_run_over => Some(luck),
                         _ if !self.over_reviewed => None,
                         (Some(_), _) => Some((tr("Reviewing the run: see the Run tab"), tr("Reviewing \u{203a}"))),
@@ -2395,7 +2415,7 @@ impl AscendantApp {
                 self.ocr_install_ui(ui, &[OcrLang::of(lang::lang())]);
             }
             if go_run {
-                self.tab = Tab::Run;
+                self.set_tab(Tab::Run);
             }
             return;
         };
@@ -2692,15 +2712,37 @@ impl AscendantApp {
     /// "Vaulted" and "Expected", the settlement card (mostly luck or decisions, decision loss, how many standard
     /// deviations off; the status when there is no result yet), and the "Largest step". All are display only
     /// (hover) and click-through is not affected; the only button is "Review again" when the language does not
-    /// match.
+    /// match. Above them the run picker: "Latest run", or a finished run to review instead (see [`RunReview`]).
+    /// While a run settles, the block of cards keeps the height of what was on show before ([`RunReview::block_min`]):
+    /// the largest step is gone meanwhile, and the export card below must not jump up and back.
     fn review_section(&mut self, ui: &mut egui::Ui) {
         theme::heading(ui, tr("Run review"));
-        // The game that ended last: Tartarus and Vorax keep their own settlements.
-        let kind = self.review_kind();
-        let (settling, settled_out) = match kind {
-            RunKind::Tartarus => (self.settling.is_some(), &self.settled),
-            RunKind::Vorax => (self.vorax_settling.is_some(), &self.vorax_settled),
-        };
+        self.run_picker(ui);
+        let width = ui.available_width();
+        let min_h = self.review.block_min(width);
+        let block = ui.vertical(|ui| {
+            ui.set_min_height(min_h);
+            self.review_block(ui)
+        });
+        self.review.block_drawn(width, block.response.rect.height());
+        if let Some(dir) = block.inner {
+            // Settled again the way it was: the picked run as a pick, else the game's own automatic settlement.
+            if !self.review.again() {
+                match self.review.kind() {
+                    RunKind::Tartarus => self.start_settle(dir, None),
+                    RunKind::Vorax => self.start_vorax_settle(dir, None, None),
+                }
+            }
+        }
+        // Borrowed, not cloned: the review and the install id are copied only when an export starts.
+        self.review.show_export(ui, &self.settings.install_id, self.current.as_deref());
+    }
+
+    /// The number cards, the settlement card and the largest step of the run on show; Some(folder) when "Review
+    /// again" was pressed.
+    fn review_block(&self, ui: &mut egui::Ui) -> Option<PathBuf> {
+        let kind = self.review.kind();
+        let (settling, settled_out) = self.review.shown();
         let settled = match (settling, settled_out) {
             (false, Some((_, Outcome::Settled(s)))) => Some(s.as_ref()),
             _ => None,
@@ -2755,11 +2797,44 @@ impl AscendantApp {
         if let Some(s) = settled {
             largest_step(ui, s);
         }
-        if let Some(dir) = again {
-            self.start_settle(dir, None);
+        again
+    }
+
+    /// The Run tab's run picker, for the review and the export card below: "Latest run" (the game that ended last) and
+    /// the finished runs (read in the background; until the list is in, only "Latest run").
+    fn run_picker(&mut self, ui: &mut egui::Ui) {
+        let latest = tr("Latest run");
+        let was = self.review.picked().map(|e| e.dir.clone());
+        // The closed picker shows the picked run without its size, so it stays one line at the narrowest window like
+        // "Latest run" (no jump); the open list shows each run with its size.
+        // Should it still not fit (a larger text size), it is cut short with "..." rather than wrapped: never a jump.
+        let shown = self.review.picked().map_or_else(|| latest.to_string(), RunEntry::title);
+        let hover = match self.review.picked() {
+            Some(e) => format!("{}\n{}", e.label(), tr("Which run to review and export: Latest run follows each game as it ends, or pick a finished run")),
+            None => tr("Which run to review and export: Latest run follows each game as it ends, or pick a finished run").to_string(),
+        };
+        let mut chosen = was.clone();
+        let runs = self.review.report.runs(ui.ctx());
+        egui::ComboBox::from_id_salt("review-run")
+            .width(ui.available_width())
+            .selected_text(shown)
+            .truncate()
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut chosen, None, latest);
+                for r in runs {
+                    ui.selectable_value(&mut chosen, Some(r.dir.clone()), r.label());
+                }
+            })
+            .response
+            .on_hover_text(hover);
+        if chosen == was {
+            return;
         }
-        // Borrowed, not cloned: the review and the install id are copied only when an export starts.
-        self.report.show(ui, super::report::settled_of(self.settled.as_ref()), &self.settings.install_id, self.current.as_deref());
+        let entry = chosen.and_then(|d| runs.iter().find(|r| r.dir == d).cloned());
+        match entry {
+            Some(entry) => self.review_run(entry),
+            None => self.review.latest(),
+        }
     }
 
     /// Takes the OCR install thread's outcome; once installed the OCR is checked again (it mostly needs a restart).
@@ -2908,7 +2983,7 @@ impl AscendantApp {
                 // it temporarily changes the global language and then changes it back, and a switch in the
                 // middle would be overwritten.
                 // An export's run review re-solve counts too (see report::settle_running).
-                let settling = self.settling.is_some() || self.vorax_settling.is_some() || self.report.busy();
+                let settling = self.review.busy();
                 ui.add_enabled_ui(!settling, |ui| {
                     let _ = egui::ComboBox::from_id_salt("language")
                         .width(ui.available_width().min(110.0))
@@ -3119,8 +3194,8 @@ impl AscendantApp {
                 if !self.path.is_empty() {
                     ui.add(egui::Label::new(RichText::new(&self.path).small().color(MUTED)).wrap());
                 }
-                if ui.button(tr("Export report data...")).on_hover_text(tr("Opens the Run tab, where a run's log and screenshots are packed into a zip for a bug report")).clicked() {
-                    self.tab = Tab::Run;
+                if ui.button(tr("Export a run...")).on_hover_text(tr("Opens the Run tab: pick a run at the top, then pack its log and screenshots into a zip for a bug report")).clicked() {
+                    self.set_tab(Tab::Run);
                 }
                 if ui.button(tr("Restore defaults")).on_hover_text(tr("Asks first. The language and the install are kept; saved run logs are not deleted")).clicked() {
                     self.restoring = true;
@@ -3478,10 +3553,30 @@ impl AscendantApp {
         }
         // ASCENDANT_PREVIEW_VORAX_REVIEW=<vorax game folder>: the Run tab settles that Vorax game (as one just ended).
         if let Some(dir) = std::env::var_os("ASCENDANT_PREVIEW_VORAX_REVIEW").map(PathBuf::from) {
-            let ctx = self.ctx.clone();
-            self.vorax_settling = Some((dir.clone(), super::vorax_settle::spawn(dir, None, move || ctx.request_repaint())));
-            self.vorax_review_at = super::vorax_session::now_ms();
+            self.start_vorax_settle(dir, None, Some(super::vorax_session::now_ms()));
             self.tab = Tab::Run;
+        }
+        // ASCENDANT_PREVIEW_PICK=<run folder>: the Run tab's run picker has that run picked (Tartarus, or Vorax for a
+        // folder under vorax\), settling it as a pick from the list does; with ASCENDANT_PREVIEW_PICK_AT=<seconds>,
+        // picked that long after start.
+        if let Some(dir) = std::env::var_os("ASCENDANT_PREVIEW_PICK").map(PathBuf::from).filter(|d| d.join("log.jsonl").is_file()) {
+            match std::env::var("ASCENDANT_PREVIEW_PICK_AT").ok().and_then(|v| v.parse::<f32>().ok()) {
+                Some(secs) => self.preview_pick = Some((Instant::now() + Duration::from_secs_f32(secs.max(0.0)), dir)),
+                None => self.review_run(RunEntry::of(dir)),
+            }
+        }
+        // ASCENDANT_PREVIEW_SWITCH=<board|run|progress|settings>@<seconds>: that page that long after start.
+        if let Some((page, secs)) = std::env::var("ASCENDANT_PREVIEW_SWITCH").ok().and_then(|v| v.split_once('@').map(|(p, s)| (p.to_string(), s.to_string()))) {
+            let tab = match page.as_str() {
+                "board" => Some(Tab::Board),
+                "run" => Some(Tab::Run),
+                "progress" => Some(Tab::Progress),
+                "settings" => Some(Tab::Settings),
+                _ => None,
+            };
+            if let (Some(tab), Ok(secs)) = (tab, secs.parse::<f32>()) {
+                self.preview_switch = Some((Instant::now() + Duration::from_secs_f32(secs.max(0.0)), tab));
+            }
         }
         // For testing (ASCENDANT_PREVIEW_TOOLTIP=card): always show the advice card tooltip, see board_tab.
         self.preview_tooltip_card = std::env::var("ASCENDANT_PREVIEW_TOOLTIP").is_ok_and(|v| v == "card");
@@ -3614,9 +3709,9 @@ impl AscendantApp {
         // saves it once made (for the saved screen).
         if let Some(dir) = super::report::preview_dir() {
             // Saving by itself only in debug or preview builds (see report::preview_save_allowed).
-            self.report.preview_save = super::report::preview_save_allowed() && std::env::var("ASCENDANT_PREVIEW_REPORT_SAVE").is_ok_and(|v| v == "1");
+            self.review.report.preview_save = super::report::preview_save_allowed() && std::env::var("ASCENDANT_PREVIEW_REPORT_SAVE").is_ok_and(|v| v == "1");
             let ctx = self.ctx.clone();
-            self.report.start_dir(dir, None, &self.settings.install_id, move || ctx.request_repaint());
+            self.review.report.start_dir(dir, None, &self.settings.install_id, move || ctx.request_repaint());
             self.tab = Tab::Run;
         }
     }

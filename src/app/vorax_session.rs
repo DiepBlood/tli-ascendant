@@ -739,6 +739,10 @@ struct PendingPick {
     /// The solver id of the chosen card: only available when the card name itself was read (not inferred from the effect text). Used to
     /// record it into `game.held` when the new icon is not recognized.
     id: Option<u8>,
+    /// The solver id of the card the tooltip last named in this hand before the confirm (`Game::hovered`, kept
+    /// through reads with no tooltip), or else the one at the last card click (`Game::click_at`): when the new icon
+    /// disagrees with the raised card but agrees with this one, the icon is taken.
+    hovered: Option<u8>,
 }
 
 /// A game whose board or result page was closed before it ended (its `vorax_end` is not written yet). The game
@@ -907,7 +911,7 @@ fn pause_fields(g: &Game, last_round: i32, why: &str) -> Value {
         "pending": g.round_row,
         "kit": g.kit,
         // An instrument confirmed in the last round, not seen on the screen yet: taken into `held` after the resume.
-        "pendingPick": g.pending_pick.as_ref().map(|p| json!({ "before": p.before, "round": p.round, "card": p.card, "id": p.id })),
+        "pendingPick": g.pending_pick.as_ref().map(|p| json!({ "before": p.before, "round": p.round, "card": p.card, "id": p.id, "hovered": p.hovered })),
         // Play seen without a round read, and the picks made: what keeps a game whose board is never read paused
         // and lets its battle take it back ([`by_picks`]).
         "played": g.played,
@@ -937,6 +941,7 @@ fn paused_from_row(r: &Value) -> Option<Paused> {
                 round: i32::try_from(p.get("round")?.as_i64()?).ok()?,
                 card: p.get("card").cloned().unwrap_or(Value::Null),
                 id: p.get("id").and_then(Value::as_u64).and_then(|n| u8::try_from(n).ok()),
+                hovered: p.get("hovered").and_then(Value::as_u64).and_then(|n| u8::try_from(n).ok()),
             })
         }),
         played: r["played"].as_bool().unwrap_or(false),
@@ -1020,6 +1025,15 @@ struct Game {
     /// shown tooltip naming no card or a read of another hand drops it ([`hovered_kept`]), and the confirm or
     /// reroll takes it.
     hovered: Option<Seen>,
+    /// The cards the left tooltip named in this hand, with the time of the frame each was read on (at most
+    /// [`HOVER_LOG`]): a card click takes the one under the mouse from it ([`Game::click_at`]).
+    hover_log: Vec<(i64, Seen)>,
+    /// Time of the last card click of this hand: at the confirm the card the tooltip named on the last frame taken
+    /// at or before it ([`Game::hover_log`]) is the pick when nothing else names it. It is looked up then, not when
+    /// the click's line comes in, since frames taken before the click may still be in OCR. Moving the mouse on to
+    /// a tank shows a monster's tooltip, which drops `hovered` (2026-11-06_20-03-09 round 10: `孿生激素-蠱蟲`
+    /// hovered and clicked, then `暴食巨蠕蟲`, and the row's card was null).
+    click_at: Option<i64>,
     /// The last final activity read on a board with no pending `+N` after the last round's pick (the fallback when
     /// the result screen is not read); see `final_picked`.
     last_ultimate: Option<i64>,
@@ -1127,6 +1141,9 @@ fn hovered_kept(old: Option<Seen>, r: &Reading) -> Option<Seen> {
 /// on a card pushes its neighbours about 47 aside (see `FAN_STEP` in `crate::vorax::read`).
 const CARRY_SHIFT: i32 = 60;
 
+/// How many tooltip sightings of a hand [`Game::hover_log`] keeps (reads come about every 0.15 s).
+const HOVER_LOG: usize = 64;
+
 /// One card of a selection screen read unread, the hand otherwise the same as on `named` (the read just before with
 /// every name read, `Game::prev_named`, or the last steady read of this hand with every name read,
 /// `Game::named_hand`): the same kind, round, reroll count (unread on one of
@@ -1188,10 +1205,13 @@ fn sig_tanks(sig: Option<&str>) -> Option<Vec<&str>> {
 /// was made for (2026-11-06_12-23-50 round 6, `Spinal Solution - Aemberon` takes no target but tank 1 was clicked
 /// twice; 2026-11-06_13-46-25 round 3, `Pure Leech Solution` takes one but two
 /// tanks were clicked and both changed) were the suggested other card.
-fn pick_fits(en: Option<&str>, cues: &[String], tanks: &[Option<u8>], before: Option<&str>, after: Option<&str>) -> bool {
+///
+/// `Some(true)` fits, `Some(false)` does not, None cannot be told: more tanks were clicked than the potion takes
+/// and a board before or after it is missing, so a changed mind cannot be told from another card.
+fn pick_fit(en: Option<&str>, cues: &[String], tanks: &[Option<u8>], before: Option<&str>, after: Option<&str>) -> Option<bool> {
     use vorax::data::Targeting;
-    let Some(en) = en else { return true };
-    let Some(targeting) = potion_targeting(en) else { return true };
+    let Some(en) = en else { return Some(true) };
+    let Some(targeting) = potion_targeting(en) else { return Some(true) };
     // No card click among the cues: the game log's clicks were not seen (a pick always clicks its card), so only
     // the boards can tell.
     let clicks_seen = cues.iter().any(|c| c == "CardClick");
@@ -1202,35 +1222,37 @@ fn pick_fits(en: Option<&str>, cues: &[String], tanks: &[Option<u8>], before: Op
         Targeting::Select1To2 => 2,
     };
     if clicks_seen && most == 0 && !clicked.is_empty() {
-        return false;
+        return Some(false);
+    }
+    // A potion kit is confirmed without a potion used (it opens the kit's hand); any other potion is used.
+    if cues.iter().any(|c| c == "Confirm") && matches!(targeting, Targeting::Box(_)) == cues.iter().any(|c| c == "PotionUsed") {
+        return Some(false);
     }
     if clicks_seen && most > 0 {
         if clicked.is_empty() {
-            return false;
+            return Some(false);
         }
         let mut set: Vec<u8> = clicked.iter().flatten().copied().collect();
         set.sort_unstable();
         set.dedup();
         if set.len() > most {
-            let (Some(b), Some(a)) = (sig_tanks(before), sig_tanks(after)) else { return false };
+            let (Some(b), Some(a)) = (sig_tanks(before), sig_tanks(after)) else { return None };
             let changed = set.iter().filter(|&&t| b.get(t as usize) != a.get(t as usize)).count();
             if changed > most {
-                return false;
+                return Some(false);
             }
         }
     }
-    // A potion kit is confirmed without a potion used (it opens the kit's hand); any other potion is used.
-    if cues.iter().any(|c| c == "Confirm") && matches!(targeting, Targeting::Box(_)) == cues.iter().any(|c| c == "PotionUsed") {
-        return false;
-    }
-    true
+    Some(true)
 }
 
 /// Settle the card of a potion pick in its `vorax_round` row once the board after it is known (`after`, None when
-/// none was read): the candidates kept at the confirm (`_pick`, the card raised earlier and then the tooltip's,
-/// never one raised on the last read, which needs no check) are tried in that order, and the first that fits
-/// ([`pick_fits`]) is the card; when none fits the card is null and `missing` says so. Better no card than a
-/// wrong one.
+/// none was read): the candidates kept at the confirm (`_pick`: the card raised on the last read, the one raised
+/// earlier, then the tooltip's) are tried in that order, and the first that fits
+/// ([`pick_fit`]) is the card; when none fits the card is null and `missing` says so. Better no card than a
+/// wrong one. The card raised on the last read also stays when it cannot be told ([`pick_fit`] None: more tanks
+/// clicked than it takes and no board after it), as it did before it was checked: a changed mind is likelier
+/// then than another card that happens to fit.
 fn settle_pick(row: &mut Value, after: Option<&str>) {
     let Some(pick) = row.as_object_mut().and_then(|o| o.remove("_pick")) else { return };
     let cues: Vec<String> = row["cues"].as_array().map(|a| a.iter().filter_map(|c| c.as_str().map(str::to_string)).collect()).unwrap_or_default();
@@ -1240,7 +1262,8 @@ fn settle_pick(row: &mut Value, after: Option<&str>) {
     let found = pick.as_array().into_iter().flatten().find_map(|c| {
         let (k, how) = (c.get(0)?.as_u64()? as usize, c.get(1)?.as_str()?);
         let en = hand.get(k).and_then(Value::as_str);
-        pick_fits(en, &cues, &tanks, before.as_deref(), after).then(|| (k, how.to_string()))
+        let fit = pick_fit(en, &cues, &tanks, before.as_deref(), after);
+        (fit == Some(true) || (fit.is_none() && how == "raised")).then(|| (k, how.to_string()))
     });
     let (card, how) = found.map_or((Value::Null, Value::Null), |(k, h)| (json!(k), json!(h)));
     row["chosen"]["card"] = card.clone();
@@ -2043,6 +2066,10 @@ impl VoraxSession {
         if cue == Cue::Tool && self.game.final_picked {
             self.game.final_tool = Some(at);
         }
+        // The card under the mouse at a card click is looked up at the confirm ([`Game::click_at`]).
+        if cue == Cue::CardClick {
+            self.game.click_at = Some(at);
+        }
         // A new deal, a reroll or a confirm: the next hand's names are never carried from this one's.
         if matches!(cue, Cue::Shuffle | Cue::Dealt | Cue::Synced | Cue::Reroll { .. } | Cue::Confirm | Cue::Picked | Cue::PotionUsed) {
             (self.game.named_hand, self.game.prev_named) = (None, None);
@@ -2079,6 +2106,11 @@ impl VoraxSession {
         // after it (see `Game::choice`).
         let choice = self.game.choice.take();
         let (raised_seen, hovered_seen) = (self.game.raised_seen.take(), self.game.hovered.take());
+        // The card under the mouse at the last card click: the last one the tooltip named on a frame taken at or
+        // before it (frame and cue times share the UTC clock).
+        let click_at = self.game.click_at.take();
+        let clicked_seen = click_at.and_then(|c| self.game.hover_log.iter().rev().find(|(t, _)| *t <= c).map(|(_, s)| s.clone()));
+        self.game.hover_log.clear();
         if let Some((sig, r)) = &choice {
             if r.round == Some(LAST_ROUND) && !rerolled {
                 self.game.final_picked = true;
@@ -2095,14 +2127,17 @@ impl VoraxSession {
             // the share of protocols whose pick could be recorded went from 54% to 86%, and tooltip vs known picks was wrong 1 time in 52.
             let earlier = seen_in(&raised_seen, r);
             let hovered = seen_in(&hovered_seen, r);
+            // Last: the card the tooltip named at the last card click (see `Game::click_at`).
+            let clicked = seen_in(&clicked_seen, r);
             // A reroll picks no card: the card raised or pointed at before it is not the move (2026-11-06_13-46-25
             // round 3, the reroll row had the card hovered before it).
-            let (card, how) = match (raised, earlier, hovered) {
+            let (card, how) = match (raised, earlier, hovered, clicked) {
                 _ if rerolled => (None, None),
                 (Some(k), ..) => (Some(k), Some("raised")),
-                (None, Some(k), _) => (Some(k), Some("raisedEarlier")),
-                (None, None, Some(k)) => (Some(k), Some("tooltip")),
-                (None, None, None) => (None, None),
+                (None, Some(k), ..) => (Some(k), Some("raisedEarlier")),
+                (None, None, Some(k), _) => (Some(k), Some("tooltip")),
+                (None, None, None, Some(k)) => (Some(k), Some("clicked")),
+                (None, None, None, None) => (None, None),
             };
             // What the row lacks: a pick (not a reroll) whose card could not be told.
             let missing: Vec<&str> = if card.is_none() && !rerolled { vec!["card"] } else { vec![] };
@@ -2114,10 +2149,13 @@ impl VoraxSession {
                 "cues": cue_names,
                 "missing": missing,
             });
-            // A potion's card not seen raised on the last read is checked against the tank clicks and the board after
-            // it before the row is written ([`settle_pick`]): the card raised earlier, then the tooltip's.
-            if r.kind == Kind::Potion && !rerolled && raised.is_none() {
-                let candidates: Vec<Value> = [(earlier, "raisedEarlier"), (hovered, "tooltip")].into_iter().filter_map(|(k, how)| k.map(|k| json!([k, how]))).collect();
+            // A potion's card is checked against the tank clicks and the board after it before the row is written
+            // ([`settle_pick`]): the card raised on the last read, then the one raised earlier, then the tooltip's.
+            // The last read's raised card is checked too: of the 73 saved potion rows logged as raised, one broke
+            // the rules (2026-11-06_04-43-15 round 6, log line 271: `Leptomeningeal Solution`, one target, raised
+            // in a fanned hand of five, yet no tank was clicked).
+            if r.kind == Kind::Potion && !rerolled {
+                let candidates: Vec<Value> = [(raised, "raised"), (earlier, "raisedEarlier"), (hovered, "tooltip"), (clicked, "clicked")].into_iter().filter_map(|(k, how)| k.map(|k| json!([k, how]))).collect();
                 if !candidates.is_empty() {
                     row["_pick"] = json!(candidates);
                 }
@@ -2133,8 +2171,10 @@ impl VoraxSession {
                 let before = held_ids(r).len();
                 let picked = raised.and_then(|k| r.cards.get(k));
                 let card = picked.map_or(Value::Null, |c| json!({ "en": c.en, "zh": c.zh, "rawName": c.raw_name }));
-                let id = picked.filter(|c| matches!(c.how, Some(read::How::Name | read::How::Partial | read::How::Tooltip))).and_then(|c| c.id);
-                self.game.pending_pick = Some(PendingPick { before, round: shown + i32::from(before > 0), card, id });
+                let named_id = |c: &read::Card| matches!(c.how, Some(read::How::Name | read::How::Partial | read::How::Tooltip)).then_some(c.id).flatten();
+                let id = picked.and_then(named_id);
+                let hovered = hovered.or(clicked).and_then(|k| r.cards.get(k)).and_then(named_id);
+                self.game.pending_pick = Some(PendingPick { before, round: shown + i32::from(before > 0), card, id, hovered });
             }
         } else {
             // No selection screen of this hand was read steady (a confirm right after the board reopened, or two
@@ -2579,6 +2619,14 @@ impl VoraxSession {
                 self.game.raised_seen = Some(s);
             }
             self.game.hovered = hovered_kept(self.game.hovered.take(), &r);
+            if read::norm(&r.tooltip).chars().count() >= 2
+                && let Some(s) = seen_card(&r, true)
+            {
+                if self.game.hover_log.len() >= HOVER_LOG {
+                    self.game.hover_log.remove(0);
+                }
+                self.game.hover_log.push((d.at, s));
+            }
             if steady && d.at >= self.game.hand_from && r.cards.iter().all(|c| c.index.is_some()) {
                 self.game.named_hand = Some(r.clone());
             }
@@ -2805,6 +2853,8 @@ impl VoraxSession {
             self.gate = None;
             self.view.gated = false;
         }
+        // Before the pick's row is written: when the new icon is taken over the raised card, the row names it too.
+        self.check_pick(&r, at);
         if r.kind.is_choice() || r.kind == Kind::Result {
             self.finish_round(Some(&sig), at);
         }
@@ -2833,31 +2883,6 @@ impl VoraxSession {
                 self.game.instrument_rerolls = r.rerolls.or(self.game.instrument_rerolls)
             }
             _ => {}
-        }
-        if r.kind.is_choice()
-            && let Some(p) = &self.game.pending_pick
-        {
-            // A newly acquired icon is added at the far right.
-            let now = held_ids(&r);
-            if now.len() == p.before + 1 {
-                match (now.last(), p.id) {
-                    // The card and the new icon do not match: the card wins (tonight 39 agreed and 1 disagreed, the wrong one being the VSR fallback recognizing `疫區聖母像`
-                    // as `獸筋絞肉索` at 0.97); one entry goes in the log.
-                    (Some(Some(icon)), Some(card)) if *icon != card => {
-                        self.log_event("vorax_pick_mismatch", at, json!({ "card": card, "icon": icon, "picked": p.card }));
-                        self.game.from_card.insert(self.game.held.len());
-                        self.game.held.push((card, p.round));
-                    }
-                    (Some(Some(id)), _) => self.game.held.push((*id, p.round)),
-                    // The new icon has no template yet (`異形螯針`, 2026-11-03 21:44 ranked game): use the card that was raised at confirm time.
-                    (Some(None), Some(id)) => {
-                        self.game.from_card.insert(self.game.held.len());
-                        self.game.held.push((id, p.round));
-                    }
-                    _ => {}
-                }
-                self.game.pending_pick = None;
-            }
         }
         (self.view.potion_rerolls, self.view.instrument_rerolls) = (self.game.potion_rerolls, self.game.instrument_rerolls);
         self.view.in_kit = self.game.kit && r.kind == Kind::Potion;
@@ -2923,6 +2948,67 @@ impl VoraxSession {
         self.screen_state_with(r, &self.game.held, &self.game.from_card)
     }
 
+    /// A pending instrument pick ([`PendingPick`]) recorded into `game.held` once the new icon shows on a selection
+    /// screen `r`.
+    fn check_pick(&mut self, r: &Reading, at: i64) {
+        if !r.kind.is_choice() {
+            return;
+        }
+        let Some(p) = &self.game.pending_pick else { return };
+        // A newly acquired icon is added at the far right.
+        let now = held_ids(r);
+        if now.len() == p.before + 1 {
+            match (now.last(), p.id) {
+                // The card and the new icon do not match: the card wins (tonight 39 agreed and 1 disagreed, the wrong one being the VSR fallback recognizing `疫區聖母像`
+                // as `獸筋絞肉索` at 0.97); one entry goes in the log.
+                // Unless the card the tooltip named at confirm is the icon's: two witnesses against a raised flag
+                // the hover put on a neighbouring card (2026-11-06_20-03-09 round 4: `髒污刮骨刀` hovered, the
+                // suggested card, and its icon came; `鞣製皮革拘束帶` beside it read raised, and the solver held
+                // the wrong instrument for the rest of the game).
+                (Some(Some(icon)), Some(card)) if *icon != card => {
+                    let icon_wins = p.hovered == Some(*icon);
+                    self.log_event("vorax_pick_mismatch", at, json!({ "card": card, "icon": icon, "picked": p.card, "hovered": p.hovered, "kept": if icon_wins { "icon" } else { "card" } }));
+                    if icon_wins {
+                        self.game.held.push((*icon, p.round));
+                        // The pick's row, not written yet and of this pick's round (the row's round is the screen's,
+                        // see `PendingPick::round`), names the icon's card (`how` "icon"); with no card of the hand
+                        // read as that name, the card is null rather than the raised one both the icon and the
+                        // hover deny.
+                        let name = vorax::data().instrument(*icon).map(|i| i.name.clone());
+                        if let Some(row) = &mut self.game.round_row
+                            && row["phase"] == "instrument"
+                            && row["round"] == json!(p.round - i32::from(p.before > 0))
+                        {
+                            let k = row.pointer("/chosen/hand").and_then(Value::as_array).and_then(|h| h.iter().position(|c| c.as_str().is_some() && c.as_str().map(str::to_string) == name));
+                            match k {
+                                Some(k) => {
+                                    row["chosen"]["card"] = json!(k);
+                                    row["chosen"]["how"] = json!("icon");
+                                }
+                                None => {
+                                    row["chosen"]["card"] = Value::Null;
+                                    row["chosen"]["how"] = Value::Null;
+                                    row["missing"] = json!(["card"]);
+                                }
+                            }
+                        }
+                    } else {
+                        self.game.from_card.insert(self.game.held.len());
+                        self.game.held.push((card, p.round));
+                    }
+                }
+                (Some(Some(id)), _) => self.game.held.push((*id, p.round)),
+                // The new icon has no template yet (`異形螯針`, 2026-11-03 21:44 ranked game): use the card that was raised at confirm time.
+                (Some(None), Some(id)) => {
+                    self.game.from_card.insert(self.game.held.len());
+                    self.game.held.push((id, p.round));
+                }
+                _ => {}
+            }
+            self.game.pending_pick = None;
+        }
+    }
+
     /// The solver input for a not-yet-steady read (early solve): an instrument just confirmed is recorded into `game.held` only on the steady read
     /// (steady); here it is counted in by the same rules, so the check after it becomes steady does not mismatch.
     fn screen_state_ahead(&self, r: &Reading) -> Result<(ScreenState, bool), Vec<String>> {
@@ -2934,7 +3020,8 @@ impl VoraxSession {
             let now = held_ids(r);
             if now.len() == p.before + 1 {
                 match (now.last(), p.id) {
-                    (Some(Some(icon)), Some(card)) if *icon != card => {
+                    // The same rule as when it becomes steady: the icon when the hovered card agrees with it.
+                    (Some(Some(icon)), Some(card)) if *icon != card && p.hovered != Some(*icon) => {
                         from_card.insert(tracked.len());
                         tracked.push((card, p.round));
                     }
@@ -4153,7 +4240,7 @@ mod tests {
             s.note_cue(page(Page::Main, PageState::Run), Some(1_000));
             s.game.held.push((6, 1));
             steady_held(&mut s, 4, 1, 2_000);
-            s.game.pending_pick = Some(PendingPick { before: 1, round: 5, card: json!({"en": "Clustered Eggs"}), id: None });
+            s.game.pending_pick = Some(PendingPick { before: 1, round: 5, card: json!({"en": "Clustered Eggs"}), id: None, hovered: None });
             s.game.kit = true;
             s.note_cue(page(Page::Main, PageState::Destory), Some(3_000));
         }
@@ -4424,7 +4511,7 @@ mod tests {
         let with = |held: Vec<read::Held>| Reading { round: Some(5), held, ..potion_board(false, Some(600), 12) };
         let mut s = session();
         s.game.held.push((6, 1));
-        let pick = |id: Option<u8>| PendingPick { before: 1, round: 5, card: Value::Null, id };
+        let pick = |id: Option<u8>| PendingPick { before: 1, round: 5, card: Value::Null, id, hovered: None };
         // Early solve: after the confirm a new icon appears and cannot be recognized.
         s.game.pending_pick = Some(pick(None));
         assert!(s.screen_state_ahead(&with(vec![known(6), unknown()])).is_err());
@@ -4444,9 +4531,32 @@ mod tests {
         assert_eq!(x.instruments[1], vorax::data().instrument(20).unwrap().name);
         // The card and the new icon do not match (`疫區聖母像` recognized as `獸筋絞肉索`): the early solve also goes by the card.
         let mut s = session();
-        s.game.pending_pick = Some(PendingPick { before: 0, round: 1, card: Value::Null, id: Some(19) });
+        s.game.pending_pick = Some(PendingPick { before: 0, round: 1, card: Value::Null, id: Some(19), hovered: None });
         let (x, _) = s.screen_state_ahead(&with(vec![known(11)])).unwrap();
         assert_eq!(x.instruments, [vorax::data().instrument(19).unwrap().name.clone()]);
+        // Unless the card the tooltip named at confirm is the icon's (2026-11-06_20-03-09 round 4: `髒污刮骨刀`, 17,
+        // hovered and its icon came; its neighbour `鞣製皮革拘束帶`, 21, read raised): the icon, early and steady.
+        let mut s = session();
+        s.game.pending_pick = Some(PendingPick { before: 0, round: 5, card: Value::Null, id: Some(21), hovered: Some(17) });
+        let (x, _) = s.screen_state_ahead(&with(vec![known(17)])).unwrap();
+        assert_eq!(x.instruments, [vorax::data().instrument(17).unwrap().name.clone()]);
+        // The pick's row, not written yet, names the icon's card too.
+        let row = |hand: Value, round: i32| json!({ "round": round, "phase": "instrument", "missing": [], "chosen": { "card": 2, "how": "raised", "hand": hand } });
+        let hand = json!(["Rawhide Restraint", "Fouled Scraper", "Tanned Leather Restraint"]);
+        s.game.round_row = Some(row(hand.clone(), 5));
+        s.check_pick(&with(vec![known(17)]), 1_000);
+        assert_eq!((s.game.held.clone(), s.game.from_card.is_empty()), (vec![(17, 5)], true));
+        let r = s.game.round_row.clone().unwrap();
+        assert_eq!((&r["chosen"]["card"], &r["chosen"]["how"]), (&json!(1), &json!("icon")));
+        // The icon's card not read in the hand: null, not the raised card. Another round's row is left alone.
+        for (hand, round, want) in [(json!(["Rawhide Restraint", null, "Tanned Leather Restraint"]), 5, (Value::Null, Value::Null, json!(["card"]))), (hand.clone(), 4, (json!(2), json!("raised"), json!([])))] {
+            let mut s = session();
+            s.game.pending_pick = Some(PendingPick { before: 0, round: 5, card: Value::Null, id: Some(21), hovered: Some(17) });
+            s.game.round_row = Some(row(hand, round));
+            s.check_pick(&with(vec![known(17)]), 1_000);
+            let r = s.game.round_row.clone().unwrap();
+            assert_eq!((r["chosen"]["card"].clone(), r["chosen"]["how"].clone(), r["missing"].clone()), want, "round {round}");
+        }
     }
 
     /// A garbled read as the mouse slides over the cards (different card count, two unreadable): with no log line it is not a new hand, and the boxes stay;
@@ -5199,7 +5309,7 @@ mod tests {
         feed(&mut s, board.clone(), 2_000);
         feed(&mut s, board.clone(), 2_140);
         // The tooltip names the third card, a potion that takes a target (the first, `骨軟膏`, takes none, so a tank
-        // click would not fit it, see pick_fits).
+        // click would not fit it, see pick_fit).
         feed(&mut s, named_board(8, "消 化 酶 溶 液"), 2_700);
         s.note_cue(Cue::CardClick, Some(2_800));
         feed(&mut s, resolving_of(8, "消 化 酶 溶 液"), 2_920);
@@ -5267,6 +5377,101 @@ mod tests {
         assert_eq!((&row["chosen"]["card"], &row["chosen"]["how"]), (&json!(2), &json!("tooltip")));
         assert_eq!(row["chosen"]["tanks"], json!([0]));
         assert_eq!(row["missing"], json!([]));
+    }
+
+    /// 2026-11-06_20-03-09 round 4 through the reads (`steady`): `髒污刮骨刀` (17) hovered, its neighbour
+    /// `鞣製皮革拘束帶` (21) read raised, and the icon 17 shows on the next board. The icon is held and the pick's
+    /// row, written on that same read, names the hovered card: the icon is checked before the row is written.
+    #[test]
+    fn an_icon_agreeing_with_the_hover_names_the_instrument_pick() {
+        let (mut s, root) = logged("pick-icon");
+        let held = |ids: &[u8]| ids.iter().map(|&id| read::Held { id: Some(id), en: None, zh: None, opening: false, score: 1.0 }).collect::<Vec<_>>();
+        let screen = |tooltip: &str, raised: Option<usize>| {
+            let mut r = Reading { kind: Kind::Instrument, round: Some(4), rerolls: Some(0), tooltip: tooltip.to_string(), held: held(&[2, 14]), ..potion_board(false, Some(600), 12) };
+            for (k, (c, (en, zh, id))) in r.cards.iter_mut().zip([("Rawhide Restraint", "生皮革拘束帶", 13), ("Fouled Scraper", "髒污刮骨刀", 17), ("Tanned Leather Restraint", "鞣製皮革拘束帶", 21)]).enumerate() {
+                (c.en, c.zh, c.id, c.how, c.category) = (Some(en.into()), Some(zh.into()), Some(id), Some(read::How::Name), crate::vorax::names::Category::Instrument);
+                c.raised = raised == Some(k);
+            }
+            r
+        };
+        s.game.held = vec![(2, 1), (14, 3)];
+        feed(&mut s, screen("", None), 2_000);
+        feed(&mut s, screen("", None), 2_100);
+        feed(&mut s, screen("髒 污 刮 骨 刀", None), 2_600);
+        feed(&mut s, screen("髒 污 刮 骨 刀", Some(2)), 2_700);
+        feed(&mut s, screen("髒 污 刮 骨 刀", Some(2)), 2_800);
+        for (cue, at) in [(Cue::CardClick, 2_850), (Cue::Confirm, 2_900), (Cue::Picked, 2_910), (Cue::Synced, 2_920)] {
+            s.note_cue(cue, Some(at));
+        }
+        let next = Reading { round: Some(5), held: held(&[2, 14, 17]), ..potion_board(false, Some(700), 12) };
+        feed(&mut s, next.clone(), 3_300);
+        feed(&mut s, next, 3_400);
+        assert_eq!(s.game.held, vec![(2, 1), (14, 3), (17, 5)]);
+        let rows = rows_of(s, &root);
+        let picks = kinds(&rows, "vorax_round");
+        assert_eq!(picks.len(), 1);
+        assert_eq!((&picks[0]["phase"], &picks[0]["chosen"]["card"], &picks[0]["chosen"]["how"], &picks[0]["missing"]), (&json!("instrument"), &json!(1), &json!("icon"), &json!([])));
+        let mismatch = kinds(&rows, "vorax_pick_mismatch");
+        assert_eq!((&mismatch[0]["card"], &mismatch[0]["icon"], &mismatch[0]["kept"]), (&json!(21), &json!(17), &json!("icon")));
+    }
+
+    /// The card the tooltip named at the card click names the pick when the mouse then goes to a tank and a monster's
+    /// tooltip drops the hover (2026-11-06_20-03-09 round 10, log lines 415 to 432: `孿生激素-蠱蟲` hovered and
+    /// clicked, then `暴食巨蠕蟲`, and the row's card was null). It is looked up at the confirm: a frame taken before
+    /// the click may come out of OCR after the click's line, and a card hovered only after the click is not it.
+    #[test]
+    fn the_card_hovered_at_the_click_names_the_pick() {
+        let (mut s, root) = logged("pick-clicked");
+        let full = named_board(2, "");
+        let monster = || Reading { panel_covered: true, ..named_board(2, "暴 食 巨 蠕 蟲") };
+        feed(&mut s, full.clone(), 2_000);
+        feed(&mut s, full.clone(), 2_100);
+        feed(&mut s, named_board(2, "骨 軟 膏"), 2_600);
+        s.note_cue(Cue::CardClick, Some(2_800));
+        // Taken at 2.79 s, before the click, read after its line came in.
+        feed(&mut s, named_board(2, "消 化 酶 溶 液"), 2_790);
+        // On the way to the tank the mouse crosses the first card, then rests on a monster.
+        feed(&mut s, named_board(2, "骨 軟 膏"), 2_900);
+        feed(&mut s, monster(), 3_050);
+        feed(&mut s, monster(), 3_200);
+        assert!(s.game.hovered.is_none(), "the monster's tooltip drops the hover");
+        s.note_cue(Cue::TankClick { tank: Some(0) }, Some(3_300));
+        s.note_cue(Cue::Confirm, Some(3_400));
+        s.note_cue(Cue::PotionUsed, Some(3_410));
+        s.note_cue(Cue::Synced, Some(3_420));
+        skip_to(&mut s, 3, 4_300);
+        let rows = rows_of(s, &root);
+        let picks = kinds(&rows, "vorax_round");
+        assert_eq!(picks.len(), 1);
+        assert_eq!((&picks[0]["chosen"]["card"], &picks[0]["chosen"]["how"], &picks[0]["missing"]), (&json!(2), &json!("clicked"), &json!([])));
+    }
+
+    /// The card raised on the last read is checked like the others (2026-11-06_04-43-15 round 6, log line 271): the
+    /// first card, `骨軟膏` (no target), is raised on the last read, yet a tank was clicked; the tooltip's third card
+    /// (`消化酶溶液`, one target) fits and is the pick.
+    #[test]
+    fn a_card_raised_on_the_last_read_must_fit_the_pick() {
+        let (mut s, root) = logged("pick-raised-checked");
+        let full = named_board(2, "");
+        feed(&mut s, full.clone(), 2_000);
+        feed(&mut s, full.clone(), 2_100);
+        feed(&mut s, named_board(2, "消 化 酶 溶 液"), 2_600);
+        let mut raised = named_board(2, "消 化 酶 溶 液");
+        raised.cards[0].raised = true;
+        feed(&mut s, raised.clone(), 2_800);
+        feed(&mut s, raised, 2_940);
+        s.note_cue(Cue::CardClick, Some(3_000));
+        s.note_cue(Cue::TankClick { tank: Some(0) }, Some(3_100));
+        s.note_cue(Cue::Confirm, Some(3_200));
+        s.note_cue(Cue::PotionUsed, Some(3_210));
+        s.note_cue(Cue::Synced, Some(3_220));
+        skip_to(&mut s, 3, 4_300);
+        let rows = rows_of(s, &root);
+        let picks = kinds(&rows, "vorax_round");
+        assert_eq!(picks.len(), 1);
+        let row = picks[0];
+        assert_eq!(row["after"].as_str(), Some(signature(&named_board(3, "")).as_str()));
+        assert_eq!((&row["chosen"]["card"], &row["chosen"]["how"], &row["missing"]), (&json!(2), &json!("tooltip"), &json!([])));
     }
 
     /// The 2026-11-06_13-46-25 game, round 1 (log lines 16 to 27): the tooltip named the card, then three reads of
@@ -5338,7 +5543,12 @@ mod tests {
         assert_eq!((&picks[0]["chosen"]["card"], &picks[0]["chosen"]["how"], &picks[0]["missing"]), (&Value::Null, &Value::Null, &json!([])));
     }
 
-    /// The tank clicks and the board after a potion pick against its card ([`pick_fits`], [`settle_pick`]), on the
+    /// [`pick_fit`] says the card fits ("cannot tell" and "does not fit" are both no).
+    fn pick_fits(en: Option<&str>, cues: &[String], tanks: &[Option<u8>], before: Option<&str>, after: Option<&str>) -> bool {
+        pick_fit(en, cues, tanks, before, after) == Some(true)
+    }
+
+    /// The tank clicks and the board after a potion pick against its card ([`pick_fit`], [`settle_pick`]), on the
     /// two picks that were recorded wrong.
     #[test]
     fn a_potion_pick_must_fit_its_tank_clicks_and_board() {
@@ -5398,6 +5608,24 @@ mod tests {
         r.as_object_mut().unwrap().remove("_pick");
         settle_pick(&mut r, Some(a3));
         assert_eq!((&r["chosen"]["card"], &r["chosen"]["how"]), (&json!(0), &json!("raised")));
+        // The card raised on the last read is checked like the others: when it does not fit, the next candidate is
+        // tried; when it fits, it stays.
+        let mut r = row(0, "raised", json!([[0, "raised"], [2, "tooltip"]]));
+        settle_pick(&mut r, Some(a3));
+        assert_eq!((&r["chosen"]["card"], &r["chosen"]["how"], &r["missing"]), (&json!(2), &json!("tooltip"), &json!([])));
+        let mut r = row(2, "raised", json!([[2, "raised"], [0, "raisedEarlier"]]));
+        settle_pick(&mut r, Some(a3));
+        assert_eq!((&r["chosen"]["card"], &r["chosen"]["how"]), (&json!(2), &json!("raised")));
+        // Two tanks for a one-target potion and no board after: cannot be told. The card raised on the last read
+        // stays; one raised earlier gives way to a card that fits.
+        assert_eq!(pick_fit(Some("Pure Leech Solution"), &c3, &t3, Some(b3), None), None);
+        assert_eq!(pick_fit(Some("Pure Leech Solution"), &c3, &t3, Some(b3), Some(a3)), Some(false));
+        let mut r = row(0, "raised", json!([[0, "raised"], [2, "tooltip"]]));
+        settle_pick(&mut r, None);
+        assert_eq!((&r["chosen"]["card"], &r["chosen"]["how"]), (&json!(0), &json!("raised")));
+        let mut r = row(0, "raisedEarlier", json!([[0, "raisedEarlier"], [2, "tooltip"]]));
+        settle_pick(&mut r, None);
+        assert_eq!((&r["chosen"]["card"], &r["chosen"]["how"]), (&json!(2), &json!("tooltip")));
     }
 
     /// A minimal selection screen read rebuilt from a logged `vorax_read` row: kind, round, rerolls, the cards' names,
@@ -5430,8 +5658,9 @@ mod tests {
 
     /// Every `vorax_round` row of the game log in `dir`, its card re-derived from the logged reads with the rules
     /// before 2026-11-06 (`old`: hover wiped by any text, reroll rows with a card, no potion check) and after (`new`:
-    /// [`hovered_kept`], no card on a reroll, [`settle_pick`]): (log line, logged, old, new). A row whose card was
-    /// raised on its last read keeps it in both (the replay cannot see that read). Rows from logs before
+    /// [`hovered_kept`], no card on a reroll, [`settle_pick`]): (log line, logged, old, new). A row logged as raised
+    /// on its last read (the replay cannot see that read) keeps its card in `old`; in `new` a potion row's raised
+    /// card is the first candidate of [`settle_pick`], like the session's, and other rows keep it. Rows from logs before
     /// `chosen.tanks` get one unknown tank per tank click.
     fn replayed(dir: &std::path::Path) -> Vec<(usize, Pick, Pick, Pick)> {
         replayed_with(dir, false)
@@ -5522,8 +5751,9 @@ mod tests {
             };
             let old = if rerolled { logged.clone() } else { pick(old_h) };
             let mut new = if rerolled { (None, None) } else { pick(new_h) };
-            if phase == "potion" && !raised && !rerolled {
-                let candidates: Vec<Value> = [(earlier, "raisedEarlier"), (new_h, "tooltip")].into_iter().filter_map(|(k, how)| k.map(|k| json!([k, how]))).collect();
+            if phase == "potion" && !rerolled {
+                let last = if raised { logged.0 } else { None };
+                let candidates: Vec<Value> = [(last, "raised"), (earlier, "raisedEarlier"), (new_h, "tooltip")].into_iter().filter_map(|(k, how)| k.map(|k| json!([k, how]))).collect();
                 if !candidates.is_empty() {
                     let mut r = row.clone();
                     if r.pointer("/chosen/tanks").is_none_or(Value::is_null) {

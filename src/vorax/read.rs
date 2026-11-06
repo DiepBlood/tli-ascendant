@@ -1585,6 +1585,14 @@ fn fan_slots(merged: &[Slot]) -> Option<(Vec<Slot>, Vec<usize>)> {
     if merged.len() == 5 && fan_spaced(merged) {
         return Some((merged.to_vec(), vec![]));
     }
+    // A card under the mouse pushes those on either side of it 47 aside, which inferring from the middle card
+    // misses when the card is at an end or next to it (2026-11-06_20-03-09 round 2: with the mouse on the second
+    // card the first was put at 966, not 873, and with the mouse on the first, 1178/1390/1610/1816 put it at 966,
+    // not 920; its name could not be read and the advice went away). The fan's layouts with a card under the mouse
+    // are tried first ([`fan_grid_fit`]).
+    if let Some((Some(_), five, guessed)) = fan_grid_fit(merged) {
+        return Some((five, guessed));
+    }
     if !(merged.len() == 3 && !fan_closer(merged))
         && let Some(f) = fan_fill(merged)
     {
@@ -1626,11 +1634,22 @@ fn fan_layout(hover: Option<usize>) -> [i32; 5] {
 /// 1157 and 1370: error 43 against the fan and 94 against CARD_X, and a factor of two does not separate them)
 /// they are not pushed into five. A real fan's error is always within 10, and over 130 against CARD_X.
 fn fan_grid(found: &[Slot]) -> Option<(Vec<Slot>, Vec<usize>)> {
+    fan_grid_fit(found).map(|(_, five, guessed)| (five, guessed))
+}
+
+/// What [`fan_grid_fit`] gives: the card under the mouse in the layout that fitted (None when none is), the five
+/// cards, and the indices of those filled in.
+type FanFit = (Option<usize>, Vec<Slot>, Vec<usize>);
+
+/// [`fan_grid`], with the layout that fitted ([`FanFit`]).
+fn fan_grid_fit(found: &[Slot]) -> Option<FanFit> {
     if !(2..=4).contains(&found.len()) {
         return None;
     }
     let card_err: i32 = found.iter().map(|s| CARD_X.iter().map(|x| (s.0 - x).abs()).min().unwrap_or(0)).sum();
-    let mut best: Option<(i32, [i32; 5], Vec<usize>)> = None;
+    // (total error, card under the mouse, the layout, the slot of each card found)
+    type Fit = (i32, Option<usize>, [i32; 5], Vec<usize>);
+    let mut best: Option<Fit> = None;
     for hover in [None, Some(0), Some(1), Some(2), Some(3), Some(4)] {
         let pos = fan_layout(hover);
         let ks: Vec<usize> = found.iter().map(|s| (0..5).min_by_key(|&k| (s.0 - pos[k]).abs()).unwrap_or(0)).collect();
@@ -1639,10 +1658,10 @@ fn fan_grid(found: &[Slot]) -> Option<(Vec<Slot>, Vec<usize>)> {
         }
         let err: i32 = found.iter().zip(&ks).map(|(s, &k)| (s.0 - pos[k]).abs()).sum();
         if best.as_ref().is_none_or(|b| err < b.0) {
-            best = Some((err, pos, ks));
+            best = Some((err, hover, pos, ks));
         }
     }
-    let (err, pos, ks) = best?;
+    let (err, hover, pos, ks) = best?;
     if err * 3 >= card_err {
         return None;
     }
@@ -1656,7 +1675,7 @@ fn fan_grid(found: &[Slot]) -> Option<(Vec<Slot>, Vec<usize>)> {
             }
         }
     }
-    Some((five, guessed))
+    Some((hover, five, guessed))
 }
 
 /// Tolerance of [`fan_grid`] (pixels): when only part of the type text is read, the center shifts by a dozen or
@@ -1752,6 +1771,22 @@ fn fan_fill(found: &[Slot]) -> Option<(Vec<Slot>, Vec<usize>)> {
 /// are filled in at default positions.
 fn read_cards(text: &Text, category: Category, anchors: &[(i32, i32, String)], tooltip: &str) -> Vec<Card> {
     let mut slots: Vec<(i32, i32, String)> = anchors.to_vec();
+    // One type text read: the band is read again (about 40 ms), and when that finds the usual three cards it is
+    // taken. With the mouse on a raised card, the first read can merge its raised type text with its neighbour's
+    // into one line placed on the neighbour (2026-11-06_04-43-15 frame-0025: the middle card raised, read as one
+    // `普通藥劑` at 1630 and 37 high, so the third card read raised; 2026-11-06_20-03-09 rounds 4 and 8 read one
+    // raised type text beside the hovered pick, recorded the neighbour and, in round 4, held the wrong
+    // instrument). Not with two: the names are read in one batch, and moving the third crop to where the band put
+    // it changed how the second name read (frames2 t065.50: `蛻生皮溶液` read as `蛻、支溶液`).
+    // The band read again, kept for the fan check below so it is not read a third time.
+    let mut band_read: Option<Vec<Slot>> = None;
+    if slots.len() == 1 {
+        let band = card_anchors(&fan_band_lines(text));
+        if band.len() == 3 && band.iter().zip(CARD_X).all(|(s, x)| (s.0 - x).abs() <= FAN_OFF) {
+            slots = band.clone();
+        }
+        band_read = Some(band);
+    }
     if slots.len() == 2 {
         // Type text was read for two cards: the third is the slot, among the default positions, farthest from
         // them.
@@ -1779,8 +1814,11 @@ fn read_cards(text: &Text, category: Category, anchors: &[(i32, i32, String)], t
     // nor five: three positions off the usual three ([`maybe_fan`]), or four, or six or more. Every four-card hand
     // falls in there (read as three, slot 0 is at most 1104, 101 from 1205, and slots 1 to 3 are at least 1259,
     // 1485 and 1692 against 1205, 1416 and 1629), so the usual three cards and the full fan read as before.
-    let three = maybe_fan(&slots);
-    let merged = ((slots.len() >= 4 && slots.len() != 5) || three).then(|| merge_reads(&slots, &card_anchors(&fan_band_lines(text))));
+    // Also three that fit the fan with the mouse on a card better than the usual three ([`fan_grid_fit`]): with the
+    // mouse on the first fanned card, the middle three are pushed to 1178/1390/1610, within 27 of the usual three
+    // (2026-11-06_20-03-09 learn-0017: the hand read as three unknown cards and the advice went away).
+    let three = maybe_fan(&slots) || (slots.len() == 3 && fan_grid_fit(&slots).is_some_and(|f| f.0.is_some()));
+    let merged = ((slots.len() >= 4 && slots.len() != 5) || three).then(|| merge_reads(&slots, &band_read.take().unwrap_or_else(|| card_anchors(&fan_band_lines(text)))));
     // The four-card hand of a chain step goes first: its positions also fit the fan with the mouse on its last card.
     let four = merged.as_deref().and_then(hand4_merged);
     if let Some((hand, guess)) = four {
@@ -2109,6 +2147,15 @@ mod tests {
             &texts(&["( + 1 5 % )", "( + 15 % )", "( + 1 5 % )", "( + 1 5 % )", "( + 1 5 % )"]),
         );
         assert_eq!((b.activity, b.bonus, b.next, b.percent), (Some(1_000_000.0), Some(482_100.0), Some(999_900_000.0), Some(15)));
+        // A "1" read as "t" (2026-11-06_03-05-30 vorax_battle_end, log.jsonl line 499): three of the five ways read
+        // "31t5K", whose "5K" won the bonus vote as 5,000; the panel said 311.5K + 118.4K.
+        assert_eq!(battle_numbers("31t5K + 118 · 4K"), (Some(311_500.0), Some(118_400.0), None));
+        let b = battle_from_texts(
+            &texts(&["/ 3", "", "/ 3", "/ 3", "/ 3"]),
+            &texts(&["311 · 5K + 118 · 4K", "31t5K + 118 · 4K / 512 · OK", "311 · 5K + 118.4K / 51 2 ℃ K", "31t5K + 118 · 4K", "31t5K + 118 · 4K"]),
+            &texts(&["", "", "", "", ""]),
+        );
+        assert_eq!((b.activity, b.bonus), (Some(311_500.0), Some(118_400.0)));
         assert_eq!(battle_wave("3/33"), Some((3, 3)));
         assert_eq!(battle_wave("3/9"), Some((3, 3)));
         assert_eq!(vote(&[Some(1), None, Some(2), Some(2), Some(1), Some(2)]), Some(2));
@@ -2611,10 +2658,12 @@ fn battle_numbers(text: &str) -> Numbers3 {
     // A "1" inside a number is often read as I, l, | or i ("482 · IK" for 482.1K, 2026-11-06 12:23 game): it is a 1
     // when a digit or decimal point is before it and a digit, decimal point or unit after it. Left alone, the
     // number ended at the letter, lost its unit and its last digit, and the one way of reading that dropped the
-    // letter entirely ("482 K") won the vote as 48.2K.
+    // letter entirely ("482 K") won the vote as 48.2K. A "t" there is a 1 too: three of the five ways of reading
+    // the 2026-11-06 03:05 game's last panel read 311.5K as "31t5K", which split into a unitless 31 and a 5K that
+    // won the vote for the bonus (5,000 recorded, the panel said 118.4K).
     for k in 1..chars.len().saturating_sub(1) {
         let (before, after) = (chars[k - 1], chars[k + 1]);
-        if matches!(chars[k], 'I' | 'l' | '|' | 'i')
+        if matches!(chars[k], 'I' | 'l' | '|' | 'i' | 't')
             && (before.is_ascii_digit() || before == '.')
             && (after.is_ascii_digit() || matches!(after, '.' | 'K' | 'k' | 'M' | 'm'))
         {

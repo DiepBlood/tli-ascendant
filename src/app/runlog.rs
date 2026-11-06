@@ -359,7 +359,7 @@ pub(super) fn is_run_folder(name: &str) -> bool {
 /// `vorax_battle_end` row, or a `vorax_end` row whose `roundsSeen` holds round 13 or whose `ultimateFrom` is the
 /// result screen (`vorax_end` alone is also written for a game given up or a fragment of one); for a Tartarus log
 /// root a `run_end` row.
-fn finished(dir: &Path, vorax: bool) -> bool {
+pub(super) fn finished(dir: &Path, vorax: bool) -> bool {
     let Ok(text) = std::fs::read_to_string(dir.join("log.jsonl")) else { return false };
     if !vorax {
         return text.lines().any(|l| l.contains("\"kind\":\"run_end\""));
@@ -817,6 +817,47 @@ mod tests {
         std::fs::remove_dir_all(&root).unwrap();
     }
 
+    /// The report's run list holds finished games only ([`finished`]): a folder from opening the app, one played
+    /// but not finished (Tartarus without `run_end`, Vorax with only a given-up `vorax_end`) is left out; a
+    /// Tartarus run with `run_end`, a Vorax game with `vorax_battle_end` or with round 13 seen is listed, newest
+    /// first, each with its game.
+    #[test]
+    fn report_lists_finished_games_only() {
+        use super::super::report::{Game, list_runs};
+        let app = temp("report-list");
+        let played = r#"{"at":"2026-11-01T00:00:01.000Z","kind":"read","screen":"Manage"}"#;
+        let given_up = r#"{"at":"2026-11-03T12:20:19.675Z","held":[],"kind":"vorax_end","roundsSeen":[1],"ultimate":null}"#;
+        let last_round = r#"{"at":"2026-11-03T12:36:50.982Z","held":[[9,5]],"kind":"vorax_end","roundsSeen":[1,2,3,4,5,6,7,8,9,10,11,12,13],"ultimate":null}"#;
+        let battle = r#"{"activity":914900.0,"at":"2026-11-05T13:28:54.409Z","kind":"vorax_battle_end"}"#;
+        let window = r#"{"kind":"window"}"#;
+        // Played but not finished: nothing listed.
+        fill(&app.join("runs").join("2026-11-01_00-00-00"), &[window]);
+        fill(&app.join("runs").join("2026-11-01_00-00-01"), &[window, played]);
+        fill(&app.join("vorax").join("2026-11-01_00-00-02"), &[window, given_up]);
+        assert!(list_runs(&app).is_empty(), "played but not finished: not listed");
+        // Finished: listed, newest first.
+        fill(&app.join("runs").join("2026-11-01_00-00-03"), &[window, played, RUN_END]);
+        fill(&app.join("vorax").join("2026-11-01_00-00-04"), &[window, battle]);
+        fill(&app.join("vorax").join("2026-11-01_00-00-05"), &[window, last_round]);
+        let listed: Vec<(String, Game)> = list_runs(&app).into_iter().map(|r| (r.name, r.game)).collect();
+        assert_eq!(
+            listed,
+            [("2026-11-01_00-00-05".to_string(), Game::Vorax), ("2026-11-01_00-00-04".to_string(), Game::Vorax), ("2026-11-01_00-00-03".to_string(), Game::Tartarus)]
+        );
+
+        // The folders found finished are kept in memory: the next listing does not read their logs again (a
+        // finished game never changes), only the others'.
+        let known = std::sync::Mutex::new(std::collections::HashSet::new());
+        assert_eq!(super::super::report::list_runs_known(&app, &known).len(), 3);
+        assert_eq!(known.lock().unwrap().len(), 3, "only the finished folders are remembered");
+        std::fs::write(app.join("runs").join("2026-11-01_00-00-03").join("log.jsonl"), "").unwrap();
+        fill(&app.join("runs").join("2026-11-01_00-00-01"), &[window, played, RUN_END]);
+        let names: Vec<String> = super::super::report::list_runs_known(&app, &known).into_iter().map(|r| r.name).collect();
+        assert_eq!(names, ["2026-11-01_00-00-05", "2026-11-01_00-00-04", "2026-11-01_00-00-03", "2026-11-01_00-00-01"], "a known one not read again; one finished since read");
+        assert_eq!(list_runs(&app).len(), 3, "without the memory the emptied log is read: not finished");
+        std::fs::remove_dir_all(&app).unwrap();
+    }
+
     /// The capture's queued rows wait for a line that is neither a window nor a view line: a folder from opening and
     /// closing the app (window and view lines only) is still left out of the report's run list, and once a played
     /// line comes they go in before it, at the time they were asked for. The rows come from a stand-in queue here,
@@ -842,7 +883,7 @@ mod tests {
         assert_eq!(kinds, ["window", "view", "capture_geometry", "read"]);
         let row: Value = serde_json::from_str(text.lines().nth(2).unwrap()).unwrap();
         assert_eq!(row["at"], timestamp(asked), "the time it was asked for");
-        assert_eq!(super::super::report::list_runs(&app).len(), 1, "played: listed");
+        assert!(super::super::report::list_runs(&app).is_empty(), "played but not finished: not listed");
 
         // A new run's folder still starts with the window line.
         log.new_run();

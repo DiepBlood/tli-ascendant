@@ -1,0 +1,20 @@
+[[zh-TW]]
+Ascendant 1.0.1：本局頁可以選以前打完的局，匯出也是同一局
+
+- 選局清單只列出打完的對局。開啟程式、開局前、結束後留下的資料夾，以及中途放棄的局，都不再列出。
+- 本局頁：頂端多了選局選單，可以挑一局已完成的對局來看結算；選「最近一局」或有新的一局結束時，回到自動顯示最近一局。
+- 本局頁和匯出用同一個選單：本局頁正在看哪一局，「匯出這一局」就匯出哪一局；沒打完的局不會匯出，卡片會提示從上面選一局。
+- 開著「更新內容」時切換分頁，視窗會自動關閉。
+- 渴血：修正戰鬥面板數字誤讀（例如 311.5K 被記成 5,000），選卡紀錄也更準確。
+- 渴血：5 張手牌時，滑鼠停在卡上不再讀錯、建議不再消失；選到的器械也不會再記錯成隔壁那張。
+
+[[en]]
+
+Ascendant 1.0.1: review and export any finished run from the Run tab
+
+- The run list shows finished games only. The folders left by opening the app, the wait before a game and the time after one, and games given up, are no longer listed.
+- Run tab: a run picker at the top reviews any finished run; pick "Latest run", or finish a new game, to go back to following the latest run.
+- One picker for the review and the export: "Export this run" exports the run the Run tab shows. An unfinished run is not exported, and the card asks you to pick one above.
+- Switching pages now closes the "What's new" window.
+- Vorax: fixes a battle panel misread (such as 311.5K kept as 5,000) and makes the pick record more accurate.
+- Vorax: with a hand of five, hovering a card no longer misreads the hand or hides the advice, and the picked instrument is no longer recorded as the card next to it.

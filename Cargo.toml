@@ -1,6 +1,6 @@
 [package]
 name = "ascendant"
-version = "1.0.0"
+version = "1.0.1"
 edition = "2024"
 description = "Live advisor for the Tartarus prison board in Torchlight: Infinite"
 license = "GPL-3.0-only"

@@ -92,7 +92,7 @@ pub struct Settings {
     pub vorax_rollouts: u32,
     /// Vorax observe mode: saves frames when an unknown card, icon or tooltip is read, so the name table and
     /// templates can be filled in later. On by default: it writes only when something unknown is read, and those
-    /// crops are what "Export report data" sends, so a player can report a name the table does not know yet.
+    /// crops are what "Export this run" packs, so a player can report a name the table does not know yet.
     pub vorax_learn: bool,
     /// Saves the tank label strip after the Vorax resolve sound, to study the rules. Off by default (a developer aid;
     /// existing settings files keep their value).
