@@ -22,6 +22,13 @@ const BITE_SLOW: f64 = 1.2;
 /// A result this many spreads below the prediction counts: results run
 /// above it, as the playouts play worse than the advice (2026-10-30).
 const BELOW: f64 = 2.5;
+/// A door clicked again within this long of the last, on the same day with
+/// nothing in between, is the same move: the game logs every click on a door
+/// card still on show (its click sound and `RouteCell` click), but moves the
+/// Warden once. Five runs to 2026-11-07 had such a second click 0.15 s to
+/// 0.52 s after the first, each listed as a click with no advice; a move's
+/// own decision cards come up 0.22 s to 0.77 s on and end the window.
+const DOOR_AGAIN: f64 = 1.0;
 
 /// What the check found in one run.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -41,6 +48,24 @@ impl Report {
             (0, Some(s)) => trf!("Run check: all clear ({} decisions, advice {} s after the cards).", self.decisions, format!("{s:.2}")),
             (0, None) => trf!("Run check: all clear ({} decisions).", self.decisions),
             (n, _) => trf!("Run check: {} to look at, listed in the Ascendant window.", n),
+        }
+    }
+
+    /// The status bar's line: [`Report::summary`], except that with issues it says a click opens them (the run
+    /// check window, see `ui.rs`), which health.txt cannot.
+    pub fn status_line(&self) -> String {
+        match self.issues.len() {
+            0 => self.summary(),
+            n => trf!("Run check: {} to look at, click here to see them.", n),
+        }
+    }
+
+    /// The run check window's first line: [`Report::summary`], except that with issues it names no other place to
+    /// look, the issues being listed under it.
+    pub fn window_summary(&self) -> String {
+        match self.issues.len() {
+            0 => self.summary(),
+            n => trf!("Run check: {} to look at.", n),
         }
     }
 
@@ -99,6 +124,10 @@ pub fn check(dir: &Path, crash_log: Option<&Path>) -> Option<Report> {
     let (mut last_advice, mut clicked): (Option<String>, Option<String>) = (None, None);
     let mut cards_up: Option<f64> = None;
     let mut bite_at: Option<f64> = None;
+    // The last door click (day and log time) while nothing has happened since, and whether the click logged now
+    // repeats it (see DOOR_AGAIN): its Decision is then not counted.
+    let mut door: Option<(i64, f64)> = None;
+    let mut door_again = false;
     let (mut cards, mut slow_cards, mut slow_bites) = (Vec::new(), Vec::new(), Vec::new());
     for r in &rows {
         let Some(at) = r["at"].as_str().and_then(secs) else { continue };
@@ -112,6 +141,17 @@ pub fn check(dir: &Path, crash_log: Option<&Path>) -> Option<Report> {
                 let signal = r["signal"].as_str().unwrap_or("");
                 let stamp = at - r["late_ms"].as_f64().unwrap_or(0.0) / 1000.0;
                 let name = signal.split('(').next().unwrap_or("");
+                match name {
+                    "Moved" => {
+                        door_again = door.is_some_and(|(d, t)| d == day && stamp - t <= DOOR_AGAIN);
+                        door = Some((day, stamp));
+                    }
+                    // The door click's own RouteCell click, logged with its sound.
+                    "Decision" if std::mem::take(&mut door_again) => continue,
+                    "Decision" => {}
+                    // Anything else the game does ends the move.
+                    _ => (door, door_again) = (None, false),
+                }
                 if matches!(name, "Decision" | "Bite") {
                     report.decisions += 1;
                     if !advised && !(name == "Bite" && chain_on) {
@@ -155,7 +195,10 @@ pub fn check(dir: &Path, crash_log: Option<&Path>) -> Option<Report> {
                 if mark || clicked.as_deref() != Some(advice) {
                     advised = true;
                 }
-                if mark {
+                // The advice was ready even where its mark was held back only because the game was
+                // behind another window: an English run's day 9 (2026-11-07) had its advice 0.33 s
+                // after the cards but its mark 11.4 s on, once the game was back in front.
+                if mark || r["hidden"] == "behind" {
                     if let Some(up) = cards_up.filter(|_| matches!(screen.as_str(), "Manage" | "Interrogation")) {
                         let wait = at - up;
                         cards.push(wait);
@@ -200,11 +243,17 @@ pub fn check(dir: &Path, crash_log: Option<&Path>) -> Option<Report> {
     }
     if !slow_cards.is_empty() {
         let worst = slow_cards.iter().copied().fold(0.0, f64::max);
-        report.issues.push(trf!("{} times the advice came over {} s after the decision cards (slowest {} s).", slow_cards.len(), CARDS_SLOW, format!("{worst:.2}")));
+        report.issues.push(match slow_cards.len() {
+            1 => trf!("Once the advice came over {} s after the decision cards ({} s).", CARDS_SLOW, format!("{worst:.2}")),
+            n => trf!("{} times the advice came over {} s after the decision cards (slowest {} s).", n, CARDS_SLOW, format!("{worst:.2}")),
+        });
     }
     if !slow_bites.is_empty() {
         let worst = slow_bites.iter().copied().fold(0.0, f64::max);
-        report.issues.push(trf!("{} times the advice came over {} s after a bite (slowest {} s).", slow_bites.len(), BITE_SLOW, format!("{worst:.2}")));
+        report.issues.push(match slow_bites.len() {
+            1 => trf!("Once the advice came over {} s after a bite ({} s).", BITE_SLOW, format!("{worst:.2}")),
+            n => trf!("{} times the advice came over {} s after a bite (slowest {} s).", n, BITE_SLOW, format!("{worst:.2}")),
+        });
     }
     cards.sort_by(f64::total_cmp);
     report.cards_median = cards.get(cards.len() / 2).copied();
@@ -284,6 +333,63 @@ mod tests {
         ]);
         assert_eq!(r.issues.len(), 2, "{:?}", r.issues);
         assert_eq!(r.cards_median, Some(1.5));
+    }
+
+    /// Run 2026-11-07_13-46-05 day 9: the advice came 0.33 s after the cards while the game was behind another
+    /// window, so its mark showed only 11.4 s on, once the game was back in front. That is not slow advice; one
+    /// slow time reads "Once", not "1 times".
+    #[test]
+    fn advice_ready_behind_another_window_is_not_slow() {
+        let r = run("behind", &[
+            r#"{"at":"2026-11-07T13:49:30.933Z","kind":"game","signal":"CardsUp(2, 0)","late_ms":15}"#,
+            r#"{"at":"2026-11-07T13:49:31.181Z","kind":"view","advice":null,"mark":false,"screen":"Manage"}"#,
+            r#"{"at":"2026-11-07T13:49:31.265Z","kind":"view","advice":"End the day","hidden":"behind","mark":false,"screen":"Manage"}"#,
+            r#"{"at":"2026-11-07T13:49:42.657Z","kind":"view","advice":"End the day","mark":true,"screen":"Manage"}"#,
+            r#"{"at":"2026-11-07T13:49:43.000Z","kind":"game","signal":"Decision","late_ms":30}"#,
+            END,
+        ]);
+        assert!(r.issues.is_empty(), "{:?}", r.issues);
+        assert!(r.cards_median.is_some_and(|s| s < 0.5), "{:?}", r.cards_median);
+        // Hidden for another reason (no game rect, clicked) still waits for the mark.
+        let r = run("clicked", &[
+            r#"{"at":"2026-11-07T13:49:30.933Z","kind":"game","signal":"CardsUp(2, 0)","late_ms":15}"#,
+            r#"{"at":"2026-11-07T13:49:31.265Z","kind":"view","advice":"End the day","hidden":"rect","mark":false,"screen":"Manage"}"#,
+            r#"{"at":"2026-11-07T13:49:42.657Z","kind":"view","advice":"End the day","mark":true,"screen":"Manage"}"#,
+            r#"{"at":"2026-11-07T13:49:43.000Z","kind":"game","signal":"Decision","late_ms":30}"#,
+            END,
+        ]);
+        assert_eq!(r.issues.len(), 1, "{:?}", r.issues);
+        assert!(r.issues[0].starts_with("Once ") && r.issues[0].contains("11.74"), "{:?}", r.issues);
+    }
+
+    /// Run 2026-11-07_11-25-08 day 15: the door card was clicked again 0.52 s after the first click, the Warden moved
+    /// once, and the game logged both clicks. The second is the same move, not a click with no advice; a door
+    /// clicked after the window, or on another day, still counts.
+    #[test]
+    fn a_door_clicked_twice_is_one_move() {
+        let read = |at: &str, day: u32| format!(r#"{{"at":"{at}","kind":"read","screen":"Patrol","model":{{"day":{day},"cells":[]}}}}"#);
+        let game = |at: &str, signal: &str| format!(r#"{{"at":"{at}","kind":"game","signal":"{signal}","late_ms":40}}"#);
+        let advice = |at: &str| format!(r#"{{"at":"{at}","kind":"view","advice":"Go to cell 15 (a locked door)","mark":true,"screen":"Patrol"}}"#);
+        let lines = [
+            read("2026-11-07T11:33:49.223Z", 15),
+            advice("2026-11-07T11:33:49.253Z"),
+            game("2026-11-07T11:33:49.724Z", "Moved"),
+            game("2026-11-07T11:33:49.724Z", "Decision"),
+            game("2026-11-07T11:33:50.241Z", "Moved"),
+            game("2026-11-07T11:33:50.241Z", "Decision"),
+            game("2026-11-07T11:33:50.342Z", "CardsUp(2, 1794051230316)"),
+            // Day 16: a door clicked with no advice, then again 1.5 s on: both listed.
+            read("2026-11-07T11:34:00.000Z", 16),
+            game("2026-11-07T11:34:01.000Z", "Moved"),
+            game("2026-11-07T11:34:01.000Z", "Decision"),
+            game("2026-11-07T11:34:02.500Z", "Moved"),
+            game("2026-11-07T11:34:02.500Z", "Decision"),
+            END.to_string(),
+        ];
+        let r = run("door-twice", &lines.iter().map(String::as_str).collect::<Vec<_>>());
+        assert_eq!(r.issues.len(), 2, "day 15's second click is the same move: {:?}", r.issues);
+        assert!(r.issues.iter().all(|i| i.contains("16")), "{:?}", r.issues);
+        assert_eq!(r.decisions, 3);
     }
 
     #[test]

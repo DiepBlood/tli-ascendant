@@ -55,6 +55,9 @@ enum Job {
     /// Later writes go into this existing folder, which is taken as made: switching to it never thins the run
     /// folders ([`RunLog::continue_in`]).
     Adopt(PathBuf),
+    /// One line appended to the log.jsonl of an earlier folder that exists ([`RunLog::event_in`]): it neither makes
+    /// a folder nor changes the one being written, and the lines held for that one stay held.
+    Append(PathBuf, String),
 }
 
 enum Item {
@@ -113,6 +116,12 @@ impl RunLog {
                         held = None;
                         continue;
                     }
+                    Job::Append(dir, line) => {
+                        if dir.join("log.jsonl").is_file() {
+                            let _ = append(&dir.join("log.jsonl"), &line);
+                        }
+                        continue;
+                    }
                 };
                 if made.as_ref() != Some(&dir) {
                     if let Item::Held(line) = item {
@@ -165,6 +174,18 @@ impl RunLog {
         self.event("window", SystemTime::now(), (self.geometry)(fields));
     }
 
+    /// The OCR language changed (the window language was switched): writes the window line again with `ocr`, and
+    /// later run folders start with it. Nothing when no window line was written yet or it already says `ocr`.
+    pub fn set_ocr(&mut self, ocr: Option<String>) {
+        let Some(mut fields) = self.window.clone() else { return };
+        let ocr = Value::from(ocr);
+        if fields["ocr"] == ocr {
+            return;
+        }
+        fields["ocr"] = ocr;
+        self.window(fields);
+    }
+
     /// Starts a new run's folder, named from now; a second one in the same
     /// second gets a suffix. It starts with the last window line.
     pub fn new_run(&mut self) {
@@ -215,15 +236,16 @@ impl RunLog {
         self.line(kind, at, fields);
     }
 
+    /// Writes one line into `dir`, an earlier run's folder (one this log wrote before [`RunLog::new_run`]), as
+    /// [`RunLog::event`] writes it into the folder on show; nothing when that folder has no log.jsonl (it was never
+    /// made, or was deleted since). The capture's rows are not taken: they belong to the folder on show.
+    pub fn event_in(&self, dir: &Path, kind: &str, at: SystemTime, fields: Value) {
+        self.send(Job::Append(dir.to_path_buf(), line_text(kind, at, fields)));
+    }
+
     /// Writes one line as [`RunLog::event`] does, without taking the capture's rows.
     fn line(&self, kind: &str, at: SystemTime, fields: Value) {
-        let mut line = Map::new();
-        line.insert("at".into(), Value::String(timestamp(at)));
-        line.insert("kind".into(), Value::String(kind.into()));
-        if let Value::Object(fields) = fields {
-            line.extend(fields);
-        }
-        let line = Value::Object(line).to_string();
+        let line = line_text(kind, at, fields);
         let item = if kind == "window" || kind == "view" { Item::Held(line) } else { Item::Line(line) };
         self.send(Job::Write(self.dir.clone(), item));
     }
@@ -302,6 +324,17 @@ impl Drop for RunLog {
             let _ = w.join();
         }
     }
+}
+
+/// One log.jsonl line: `at`, `kind`, then `fields` (a JSON object).
+fn line_text(kind: &str, at: SystemTime, fields: Value) -> String {
+    let mut line = Map::new();
+    line.insert("at".into(), Value::String(timestamp(at)));
+    line.insert("kind".into(), Value::String(kind.into()));
+    if let Value::Object(fields) = fields {
+        line.extend(fields);
+    }
+    Value::Object(line).to_string()
 }
 
 fn append(path: &Path, line: &str) -> Result<(), String> {
@@ -916,6 +949,38 @@ mod tests {
         std::fs::remove_dir_all(&root).unwrap();
     }
 
+    /// Switching the window language mid-run writes the window line again with the new OCR language, and the next
+    /// run's folder starts with it (on 2026-11-07 both folders of an English run still said "zh-Hant-TW").
+    #[test]
+    fn a_language_switch_rewrites_the_window_line() {
+        let root = temp("language-switch");
+        let mut log = RunLog::new(root.clone());
+        log.geometry = stand_in_geometry;
+        log.set_ocr(Some("en-US".into()));
+        assert!(log.window.is_none(), "no window line yet: nothing to rewrite");
+        log.window(serde_json::json!({ "window": "w", "ocr": "zh-Hant-TW" }));
+        log.event_with("read", SystemTime::now(), serde_json::json!({}), Vec::new);
+        log.set_ocr(Some("en-US".into()));
+        log.set_ocr(Some("en-US".into()));
+        log.event_with("read", SystemTime::now(), serde_json::json!({}), Vec::new);
+        log.wait();
+        let first_dir = log.dir().to_path_buf();
+        let windows = |dir: &Path| -> Vec<Value> {
+            let text = std::fs::read_to_string(dir.join("log.jsonl")).unwrap();
+            text.lines().map(|l| serde_json::from_str::<Value>(l).unwrap()).filter(|l| l["kind"] == "window").collect()
+        };
+        let first = windows(&first_dir);
+        assert_eq!(first.iter().map(|l| l["ocr"].clone()).collect::<Vec<_>>(), [serde_json::json!("zh-Hant-TW"), serde_json::json!("en-US")], "written again once");
+        assert_eq!(first[1]["window"], "w", "the rest of the line kept");
+        log.new_run();
+        log.event_with("read", SystemTime::now(), serde_json::json!({}), Vec::new);
+        log.wait();
+        let next = windows(log.dir());
+        assert_eq!((next.len(), &next[0]["ocr"]), (1, &serde_json::json!("en-US")), "the next folder starts with the new language");
+        drop(log);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
     /// The report's run list holds finished games only ([`finished`]): a folder from opening the app, one played
     /// but not finished (Tartarus without `run_end`, Vorax with only a given-up `vorax_end`) is left out; a
     /// Tartarus run with `run_end`, a Vorax game with `vorax_battle_end` or with round 13 seen is listed, newest
@@ -1045,6 +1110,29 @@ mod tests {
         log.wait();
         assert_eq!(kinds(log.dir()), ["window"], "the next folder, made by an observe frame, starts with its window line");
         assert!(log.dir().join("observe").is_dir());
+        drop(log);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A line for an earlier run's folder goes into its log.jsonl after the lines it has, while the folder on show
+    /// keeps its held lines and makes no folder of its own for it; a folder never made (or deleted) gets nothing.
+    #[test]
+    fn a_line_into_an_earlier_folder() {
+        let root = temp("event-in");
+        let mut log = RunLog::new(root.clone());
+        log.event_with("run_end", SystemTime::now(), serde_json::json!({}), Vec::new);
+        let ended = log.dir().to_path_buf();
+        log.new_run();
+        log.event_with("view", SystemTime::now(), serde_json::json!({}), Vec::new);
+        log.event_in(&ended, "riot_boss", SystemTime::now(), serde_json::json!({ "spawned": 1 }));
+        log.wait();
+        assert_eq!(kinds(&ended), ["run_end", "riot_boss"]);
+        assert!(!log.dir().exists(), "the folder on show is still not made");
+        log.event_with("read", SystemTime::now(), serde_json::json!({}), Vec::new);
+        log.event_in(&root.join("2026-01-01_00-00-00"), "riot_boss", SystemTime::now(), serde_json::json!({}));
+        log.wait();
+        assert_eq!(kinds(log.dir()), ["view", "read"], "its held line kept");
+        assert!(!root.join("2026-01-01_00-00-00").exists());
         drop(log);
         std::fs::remove_dir_all(&root).unwrap();
     }

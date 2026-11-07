@@ -43,7 +43,7 @@ use super::report::{Game, RunEntry};
 use super::run_review::RunReview;
 use crate::board::{CellModel, EventMark, Model};
 use crate::engine::data::{Beast, RAINBOW, Tool, data};
-use crate::engine::text::{beast_name, cell_label, incident_term, inmate_name, instrument, instrument_term, objective_name, theme_name, tier_name};
+use crate::engine::text::{beast_name, cell_label, hunt_name, incident_term, inmate_name, instrument, instrument_term, objective_name, theme_name, tier_name};
 use crate::engine::{Action, ChoiceId};
 use crate::lang::{self, Lang, tr, trf};
 use crate::reader::load_png;
@@ -111,7 +111,7 @@ enum Tab {
 }
 
 /// Which global hotkey: read now, or turn auto read on or off. Click-through has no hotkey since 1.0.2: the
-/// navigation rail's "Through" light turns it on and off (its clicks stay in the window, see [`widget_rects`]).
+/// navigation rail's "Thru" light turns it on and off (its clicks stay in the window, see [`widget_rects`]).
 #[derive(Clone, Copy, PartialEq)]
 enum Which {
     Read,
@@ -194,7 +194,7 @@ pub struct AscendantApp {
     /// The read and auto read hotkeys, indexed by [`Which`].
     keys: [Key; 2],
     /// Clicks on the window's empty parts pass to the one under it. Saved (`Settings::click_through`) and restored at
-    /// start: the rail's "Through" light, which always takes clicks, turns it off.
+    /// start: the rail's "Thru" light, which always takes clicks, turns it off.
     click_through: bool,
     /// The thread that lets those clicks through, while `click_through` is on.
     through: Option<ClickThrough>,
@@ -331,6 +331,13 @@ pub struct AscendantApp {
     /// after: no mark until a reading changes one of them, so the re-reads of
     /// the same screen as the game moves on after the click leave it hidden.
     clicked: Option<(Screen, Model, Action)>,
+    /// When `clicked` was set, and when the reading on show then was read: with no move in the game's log since, the
+    /// mark comes back (see [`click_unconfirmed`]).
+    clicked_at: Option<(Instant, Instant)>,
+    /// When the game's log last said a move was played (see [`confirms_click`]).
+    move_seen: Option<Instant>,
+    /// The left button's clicks on the game, from press to release (see [`mark::Clicks`]), for `mark_spot`.
+    clicks: mark::Clicks,
     /// Live advice for Vorax surgery: while the mode is on, frames and game log hints go to it and the Tartarus
     /// Session is paused.
     vorax: VoraxView,
@@ -381,6 +388,9 @@ pub struct AscendantApp {
     /// For testing (only when the environment variable ASCENDANT_PREVIEW_TOOLTIP=progress is set): always show
     /// the progress button tooltip.
     preview_tooltip_progress: bool,
+    /// For testing (ASCENDANT_PREVIEW_TOOLTIP=icon, cell or row): always show that tooltip of the first top-three
+    /// row (the action icon's meaning, the small cell's contents, or the move's full label).
+    preview_tooltip_move: Option<MoveTip>,
     /// For testing (only when the environment variable ASCENDANT_PREVIEW_NOT_FIRST=1 is set): replace the
     /// advice with the 2nd ranked move on screen.
     preview_not_first: bool,
@@ -515,6 +525,9 @@ impl AscendantApp {
             badges: Vec::new(),
             value: None,
             clicked: None,
+            clicked_at: None,
+            move_seen: None,
+            clicks: mark::Clicks::default(),
             vorax,
             recording: None,
             esc_busy: false,
@@ -533,6 +546,7 @@ impl AscendantApp {
             preview_measure: None,
             preview_tooltip: false,
             preview_tooltip_progress: false,
+            preview_tooltip_move: None,
             preview_not_first: false,
             preview_tooltip_card: false,
             preview_run_over: false,
@@ -776,25 +790,43 @@ impl AscendantApp {
     fn mark_spot(&mut self, (x, y, half_w, half_h): (f32, f32, f32, f32)) -> MarkSpot {
         let r = self.session.reading.as_ref().ok_or("unread")?;
         let shown = (r.screen, r.model.clone(), self.session.advice().ok_or("no_advice")?.action);
+        // When the reading on show was read, on the clock of `move_seen`.
+        let read_at = Instant::now().checked_sub(SystemTime::now().duration_since(r.at).unwrap_or_default()).unwrap_or_else(Instant::now);
         let title = &self.settings.window_title;
         if self.clicked.as_ref() == Some(&shown) {
-            return Err("clicked");
+            // A click the game did not play (a way to cancel it that `mark::Clicks` does not know) logs no move: the
+            // mark comes back.
+            // Only while the game's log is followed (its light green): with auto read off there is no log follower, and
+            // with the light red no line comes, so every click would bring its mark back as 1.0.3 never did.
+            let log_live = matches!(self.log_status(), Some(gamelog::LogStatus::Following { .. }));
+            if !self.clicked_at.is_some_and(|at| click_unconfirmed(shown.0, at, self.move_seen, Instant::now(), log_live)) {
+                return Err("clicked");
+            }
+            (self.clicked, self.clicked_at) = (None, None);
         }
         if !game_in_front(title) {
             return Err("behind");
         }
         let rect @ [left, top, _, height] = game_rect(title).map_err(|_| "rect")?;
+        let read = [left as f32 + x, top as f32 + y, half_w, half_h, height as f32 / 1080.0];
         // Clicks while no mark (nor value) showed are not clicks on it.
         if !self.mark.as_ref().is_some_and(Mark::shown) && !self.value.as_ref().is_some_and(Notice::shown) {
-            mark::forget_clicks();
+            self.clicks.forget();
         }
+        // Only a click on the target or its box hides the mark (see `on_mark`). A click anywhere in the game did: on
+        // 2026-11-07 the box went 5 times in a run on a click that played nothing, the game logging no move for 1.4 to
+        // 74 s after (a Hunt's target pick twice, the manage screen twice, a patrol once). A click on the card but off
+        // the box still hides it once the game logs the move (`played`, 0.02 to 0.12 s after the click in 156 hides of
+        // three runs). As a button takes it, the press and the release both count (2026-11-08: pressed on the box and
+        // let go elsewhere, the game played nothing and the box went).
         // A click on an instrument or treasure card only selects it; the mark stays until "Confirm" takes the cards away
         // (the screen changes or the target is gone). The click is still read, so it is not counted later.
-        if mark::clicked_in(rect) && click_hides(shown.0, &shown.2) {
-            self.clicked = Some(shown);
+        let drawn = self.mark.as_ref().and_then(Mark::spot);
+        if self.clicks.next(mark::look()).is_some_and(|click| on_mark(click, rect, read, drawn)) && click_hides(shown.0, &shown.2) {
+            (self.clicked, self.clicked_at) = (Some(shown), Some((Instant::now(), read_at)));
             return Err("clicked");
         }
-        Ok((left as f32 + x, top as f32 + y, half_w, half_h, height as f32 / 1080.0, rect))
+        Ok((read[0], read[1], half_w, half_h, read[4], rect))
     }
 
     /// Reads the watcher's newest frame, else a fresh capture.
@@ -1167,6 +1199,9 @@ impl AscendantApp {
         lang::set(language);
         self.settings.language = language.key().to_string();
         self.ocr_problem = if self.preview_no_ocr { ocr::problem_with(None) } else { ocr::problem() };
+        // OCR is made again for the new language: the run log's window line says so from here on.
+        self.session.log_language();
+        self.vorax.log_language();
         // The runs the Run tab kept were settled in the language before: settled again when picked.
         self.review.language_changed();
         self.session.solve();
@@ -1588,7 +1623,7 @@ impl AscendantApp {
     }
 
     /// All status bar states, in priority order: error, game log light red, the game run as administrator, notice,
-    /// progress full, auto read waiting, run check. Click-through is not one: the rail's "Through" light shows it.
+    /// progress full, auto read waiting, run check. Click-through is not one: the rail's "Thru" light shows it.
     fn status_items(&self) -> Vec<StatusItem<'_>> {
         let mut items = Vec::new();
         if let Some(e) = &self.error {
@@ -1618,7 +1653,7 @@ impl AscendantApp {
             items.push(StatusItem::Auto(trf!("Auto read waiting: {}", s)));
         }
         if let Some(h) = &self.session.health {
-            items.push(StatusItem::Health { summary: h.summary(), issues: h.issues.clone() });
+            items.push(StatusItem::Health { summary: h.status_line(), issues: h.issues.clone() });
         }
         items
     }
@@ -1675,8 +1710,14 @@ impl AscendantApp {
                 // When the run check has details, the tooltip carries the full text plus the details (only this
                 // one is attached, so it does not stack with the automatic tooltip shown on truncation).
                 match first {
-                    StatusItem::Health { issues, .. } if !issues.is_empty() => {
-                        theme::line_tip(ui, &text, &format!("{}\n{}", first.text(), issues.join("\n")), first.colour(), head.is_some());
+                    // The run check: its details in the tooltip as before, and a click opens them in a window, all clear
+                    // too (2026-11-08, the user).
+                    StatusItem::Health { issues, .. } => {
+                        let details = if issues.is_empty() { String::new() } else { format!("\n{}", issues.join("\n")) };
+                        let tip = format!("{}{details}\n{}", first.text(), tr("Click to see the run check"));
+                        if theme::line_tip(ui, &text, &tip, first.colour(), head.is_some()).clicked() {
+                            act = Some(NoticeAct::RunCheck);
+                        }
                     }
                     // A new version, or the version just installed: the release notes in full in the tooltip.
                     StatusItem::Notice(NoticeKind::Update { notes, .. } | NoticeKind::Updated { notes, .. }) if !notes.is_empty() => {
@@ -1723,6 +1764,7 @@ impl AscendantApp {
                 self.start_relaunch(ui.ctx());
             }
             Some(NoticeAct::DismissElevated) => self.elevated_dismissed = true,
+            Some(NoticeAct::RunCheck) => self.floats.open_health(),
             None => {}
         }
     }
@@ -1764,6 +1806,8 @@ enum NoticeAct {
     RelaunchAlways,
     /// The "x" of the administrator notice: not shown again while Ascendant stays open.
     DismissElevated,
+    /// Open the run check window (see [`AscendantApp::health_window`]).
+    RunCheck,
 }
 
 /// One item of the status bar (see [`AscendantApp::status_items`]).
@@ -1973,28 +2017,51 @@ impl WhatsNew {
     }
 }
 
-/// The two floating windows anchored at the same spot under the title bar: "What's new" (see
-/// [`AscendantApp::whats_new_window`]) and the instruments and theme window (see [`AscendantApp::tools_window`]). Only
-/// one is open at a time, so neither covers the other: opening one closes the other.
+/// The floating windows anchored at the same spot under the title bar: "What's new" (see
+/// [`AscendantApp::whats_new_window`]), the instruments and theme window (see [`AscendantApp::tools_window`]) and the
+/// run check (see [`AscendantApp::health_window`]). Only one is open at a time, so none covers another: opening one
+/// closes the others.
 #[derive(Default)]
 struct Floats {
     whats_new: Option<WhatsNew>,
     tools: bool,
+    health: bool,
 }
 
 impl Floats {
     fn open_whats_new(&mut self, w: WhatsNew) {
         self.whats_new = Some(w);
-        self.tools = false;
+        (self.tools, self.health) = (false, false);
     }
 
-    /// A click on the instruments line: opens the window (closing "What's new") or closes it.
+    /// A click on the instruments line: opens the window (closing the others) or closes it.
     fn toggle_tools(&mut self) {
         self.tools = !self.tools;
         if self.tools {
-            self.whats_new = None;
+            (self.whats_new, self.health) = (None, false);
         }
     }
+
+    /// A click on the run check's line: opens its window, closing the others.
+    fn open_health(&mut self) {
+        self.health = true;
+        (self.whats_new, self.tools) = (None, false);
+    }
+}
+
+/// A made-up run check for previews (ASCENDANT_PREVIEW_HEALTH): with `issues`, three of the run check's own sentences,
+/// else all clear.
+fn preview_health(issues: bool) -> super::health::Report {
+    let issues = if issues {
+        vec![
+            trf!("Day {}: clicked with no advice on show.", 15),
+            trf!("Day {}: clicked with no advice on show.", 18),
+            trf!("The result, {} Chromatics' worth, fell far below the {} predicted on day 1.", "4.0", "8.2"),
+        ]
+    } else {
+        Vec::new()
+    };
+    super::health::Report { decisions: 312, cards_median: Some(0.42), issues }
 }
 
 /// Whether Esc (`pressed` this frame) closes "What's new": not while a text box has the keyboard or a hotkey is
@@ -2010,7 +2077,7 @@ fn esc_closes(pressed: bool, busy: bool) -> bool {
 /// cover, so they are as trusted as the program and a fresh install sees the whole history. A new version adds its
 /// file here.
 const RELEASE_NOTES: &[(&str, &str)] =
-    &[("1.0.3", include_str!("../../data/release-notes/1.0.3.txt")), ("1.0.2", include_str!("../../data/release-notes/1.0.2.txt")), ("1.0.1", include_str!("../../data/release-notes/1.0.1.txt")), ("1.0.0", include_str!("../../data/release-notes/1.0.0.txt"))];
+    &[("1.0.4", include_str!("../../data/release-notes/1.0.4.txt")), ("1.0.3", include_str!("../../data/release-notes/1.0.3.txt")), ("1.0.2", include_str!("../../data/release-notes/1.0.2.txt")), ("1.0.1", include_str!("../../data/release-notes/1.0.1.txt")), ("1.0.0", include_str!("../../data/release-notes/1.0.0.txt"))];
 
 /// Which of the versions "What's new" lists (in its order, each with whether it is a release not installed yet) starts
 /// unfolded: the release not installed yet when there is one, else the `running` version, else the newest.
@@ -2137,7 +2204,7 @@ fn status_detail(ui: &mut egui::Ui, item: &StatusItem) -> Option<NoticeAct> {
             for issue in issues {
                 ui.add(egui::Label::new(RichText::new(issue).small()).wrap());
             }
-            None
+            ui.small_button(tr("See")).on_hover_text(tr("Click to see the run check")).clicked().then_some(NoticeAct::RunCheck)
         }
         StatusItem::Log(_) => {
             ui.add(egui::Label::new(RichText::new(tr(LOG_NOTE)).small().color(MUTED)).wrap());
@@ -2445,6 +2512,9 @@ impl eframe::App for AscendantApp {
                     if let Some(log) = &self.session.log {
                         log.event("game", read, game_row(signal, stamp, read));
                     }
+                    if confirms_click(signal) {
+                        self.move_seen = Some(Instant::now());
+                    }
                     self.session.note_game(signal);
                 }
                 Event::Observe(frame, at) => {
@@ -2452,6 +2522,7 @@ impl eframe::App for AscendantApp {
                         log.observed(frame, at);
                     }
                 }
+                Event::RiotBoss(boss) => self.session.log_riot_boss(boss),
             }
         }
         self.poll_vorax_settle();
@@ -2622,6 +2693,7 @@ impl eframe::App for AscendantApp {
         self.restore_dialog(&ui.ctx().clone());
         self.tools_window(&ui.ctx().clone());
         self.whats_new_window(&ui.ctx().clone());
+        self.health_window(&ui.ctx().clone());
         if std::mem::take(&mut self.pick_log) {
             self.pick_game_log(frame);
         }
@@ -3012,14 +3084,16 @@ impl AscendantApp {
     }
 
     /// Instruments and theme (Tartarus board page, in both the full and the compact layout): a fixed line
-    /// `Instruments: A · B   Theme: None`, truncated when too long with the full text in the hover tooltip. The
+    /// `Theme: None   Instruments: A · B`, truncated when too long with the full text in the hover tooltip. The
     /// line is clickable (Sense::click); a click toggles the edit window (see [`AscendantApp::tools_window`]),
     /// which floats on top and does not push the layout.
     fn tools_row(&mut self, ui: &mut egui::Ui) {
         let names: Vec<String> = self.session.tools.iter().map(|t| instrument(*t).to_string()).collect();
         let list = if names.is_empty() { tr("None").to_string() } else { names.join(" \u{b7} ") };
         let theme_text = theme_name(self.session.theme).unwrap_or(tr("None"));
-        let text = trf!("{}s: {}   Theme: {}", instrument_term(), list, theme_text);
+        // The theme goes first: it is one short name, while a long instrument list (English names run to 30
+        // characters) pushed it past the edge, where only the tooltip showed it.
+        let text = trf!("Theme: {}   {}s: {}", theme_text, instrument_term(), list);
         if theme::click_line(ui, &text, MUTED).clicked() {
             self.floats.toggle_tools();
         }
@@ -3055,6 +3129,8 @@ impl AscendantApp {
     /// see [`within_error`]) is grey, meaning about the same; beyond it the normal text colour is used.
     /// The advised row uses the primary colour; when the advice ranks below 3rd it goes in the 3rd row. With
     /// fewer than 3 rows, blank rows fill the space so the layout does not jump.
+    /// Since 1.0.4 (user, both languages) a row names its move by an action icon plus the cell number and a small
+    /// copy of the board's tile, or the icon plus a short text (see [`move_row`]), each part with its own tooltip.
     fn moves(&self, ui: &mut egui::Ui, advised: Option<usize>, rated: bool) {
         const ROWS: usize = 3;
         let s = &self.session;
@@ -3077,8 +3153,23 @@ impl AscendantApp {
         let width_of = |text: &str, style: egui::TextStyle| ui.painter().layout_no_wrap(text.to_string(), style.resolve(ui.style()), Color32::WHITE).size().x;
         let num_w = shown.iter().map(|&k| width_of(&loot_text(s, Some(k)).unwrap_or_default(), egui::TextStyle::Body)).fold(width_of("0.00", egui::TextStyle::Body), f32::max);
         let gap_w = shown.iter().map(|&k| width_of(&format!("\u{2212}{:.2}", (s.ranking[k].mean - top).abs()), egui::TextStyle::Small)).fold(width_of(tr("Gap"), egui::TextStyle::Small), f32::max);
-        let head_w = width_of(tr("Expected loot"), egui::TextStyle::Small) + spacing + width_of(tr("Gap"), egui::TextStyle::Small);
-        let cols = Cols::fit(ui.available_width(), spacing, num_w + 2.0, gap_w + 2.0, head_w);
+        let loot_head_w = width_of(tr("Expected loot"), egui::TextStyle::Small);
+        let head_w = loot_head_w + spacing + width_of(tr("Gap"), egui::TextStyle::Small);
+        // The cell number column of a row (see below): as wide as two digits, so the small tiles line up.
+        let cell_no_w = width_of("00", egui::TextStyle::Body) + 2.0;
+        // Fixed widths, so the number and the small tile line up in every row and nothing moves between frames.
+        let icon_w = (h * 0.85).round();
+        let tile = Vec2::new(((h - 2.0) * 1.4).round(), h - 2.0);
+        // Within the window: in the compact layout the courtyard runs past its right edge when the window is too
+        // narrow for the ring (font size "Extra large" at a width of 200).
+        let width = ui.available_width().min(ui.clip_rect().right() - ui.cursor().min.x).max(0.0);
+        let cols = Cols::fit(width, spacing, Need { num: num_w + 2.0, gap: gap_w + 2.0, head: head_w, loot: loot_head_w, cell: icon_w + 3.0 + cell_no_w, icon: icon_w });
+        // What of the move fits the name column, the same in every row so the rows look alike: the small tile goes
+        // first, then the cell number; the icon always stays. A dropped part's tooltip is the row's.
+        let show_no = cols.label >= icon_w + 3.0 + cell_no_w;
+        let show_tile = cols.label >= icon_w + 3.0 + cell_no_w + 3.0 + tile.x;
+        // A text move (no cell) writes its text only when at least a letter and the ellipsis fit.
+        let text_min = width_of("0\u{2026}", egui::TextStyle::Body);
         let loot_tip = tr("Playing this move, the Chromatics vaulted by the end on average over thousands of simulated runs (an Ultimate counts 0.2, a Legendary 0.05)");
         let gap_tip = tr("How far behind the first; grey means within the simulation error, so either is about the same");
         // Column headings: `前三名` ("Top moves") on the left, and "Expected loot" and "Gap" on the right (each
@@ -3087,11 +3178,15 @@ impl AscendantApp {
             let head = |text: &str| RichText::new(text).small().color(MUTED);
             ui.allocate_ui_with_layout(Vec2::new(cols.rank + spacing + cols.label, h * 0.8), Layout::left_to_right(Align::Center), |ui| {
                 ui.set_min_width(cols.rank + spacing + cols.label);
-                ui.label(head(tr("Top moves")));
+                ui.add(egui::Label::new(head(tr("Top moves"))).truncate());
             });
-            ui.allocate_ui_with_layout(Vec2::new(cols.num + spacing + cols.gap, h * 0.8), Layout::right_to_left(Align::Center), |ui| {
-                ui.label(head(tr("Gap"))).on_hover_text(gap_tip);
-                let loot = ui.label(head(tr("Expected loot"))).on_hover_text(loot_tip);
+            let right = if cols.gap > 0.0 { cols.num + spacing + cols.gap } else { cols.num };
+            ui.allocate_ui_with_layout(Vec2::new(right, h * 0.8), Layout::right_to_left(Align::Center), |ui| {
+                if cols.gap > 0.0 {
+                    ui.label(head(tr("Gap"))).on_hover_text(gap_tip);
+                }
+                // Elided only when the window is too narrow for it (see `Cols::fit`).
+                let loot = ui.add(egui::Label::new(head(tr("Expected loot"))).truncate()).on_hover_text(loot_tip);
                 // For testing (ASCENDANT_PREVIEW_TOOLTIP=1): always show this long tooltip, to capture how it
                 // wraps and where it sits.
                 if self.preview_tooltip {
@@ -3100,14 +3195,20 @@ impl AscendantApp {
             });
         });
         let blanks = shown.len()..ROWS;
-        // Strip the leading word shared by all row names ("Take ", "Go to "...), so the name column is left for
-        // the part that really differs; the advice card and tooltips keep the full wording as before.
-        let names = strip_common_prefix(&shown.iter().map(|&k| move_name(&s.ranking[k].action, short(&s.ranking[k].label))).collect::<Vec<_>>());
+        // Each row names its move as an action icon and the cell it acts on (number and a small copy of the board's
+        // tile), or the icon and a short text for a move without a cell (see [`move_row`]): "Go to cell 11 (Magic
+        // Mammoth)" was cut to "Go to cell..." in English at a width of 421, hiding the number.
+        let model = s.reading.as_ref().map(|r| &r.model);
+        let warden = model.map_or(-1, |m| m.warden);
         for (row, k) in shown.into_iter().enumerate() {
             let o = &s.ranking[k];
             let chosen = advised == Some(k);
             let gap = o.mean - top;
-            let label = RichText::new(&names[row]);
+            let (icon, tail) = move_row(&o.action, &o.label, warden);
+            let label = RichText::new(match &tail {
+                MoveTail::Cell(n) => cell_label(*n),
+                MoveTail::Text(text) => text.clone(),
+            });
             let number = RichText::new(loot_text(s, Some(k)).unwrap_or_else(|| "\u{2014}".to_string()));
             // The first row (the first rank itself) writes no gap. The gap is written with its sign: the order
             // is "candidates still running first, then by mean" (solve.rs), so an eliminated row or one ranked
@@ -3132,16 +3233,58 @@ impl AscendantApp {
                 ui.add_sized([cols.rank, h], egui::Label::new(RichText::new((k + 1).to_string()).color(MUTED)));
                 ui.allocate_ui_with_layout(Vec2::new(cols.label, h), Layout::left_to_right(Align::Center), |ui| {
                     ui.set_min_width(cols.label);
-                    ui.add(egui::Label::new(label).truncate().show_tooltip_when_elided(false)).on_hover_text(&o.label);
+                    ui.spacing_mut().item_spacing.x = 3.0;
+                    let colour = if chosen { ACCENT } else { theme::TEXT };
+                    // Three hover areas side by side, none overlapping: the icon says what the action is, the
+                    // small tile what the cell holds, and the rest of the column the full move as before.
+                    let (rect, icon_r) = ui.allocate_exact_size(Vec2::new(icon_w, h), Sense::hover());
+                    paint_move_icon(ui.painter(), rect, icon, colour);
+                    let icon_tip = icon.meaning();
+                    if row == 0 && self.preview_tooltip_move == Some(MoveTip::Icon) {
+                        egui::Tooltip::for_widget(&icon_r).show(|ui| ui.label(&icon_tip));
+                    }
+                    icon_r.on_hover_text(icon_tip);
+                    let text_r = match tail {
+                        MoveTail::Cell(_) if !show_no => None,
+                        MoveTail::Cell(n) => {
+                            let r = ui.add_sized([cell_no_w, h], egui::Label::new(label).truncate().show_tooltip_when_elided(false));
+                            if let Some(cell) = model.and_then(|m| m.cells.get(n)).filter(|_| show_tile) {
+                                let (rect, cell_r) = ui.allocate_exact_size(Vec2::new(tile.x, h), Sense::hover());
+                                let at = Rect::from_center_size(rect.center(), tile);
+                                tile_shape(ui.painter(), at, 3.0, cell, n, cell_r.hovered());
+                                let cell_tip = cell_tip(n, cell);
+                                if row == 0 && self.preview_tooltip_move == Some(MoveTip::Cell) {
+                                    egui::Tooltip::for_widget(&cell_r).show(|ui| ui.label(&cell_tip));
+                                }
+                                cell_r.on_hover_text(cell_tip);
+                            }
+                            Some(r)
+                        }
+                        MoveTail::Text(_) if ui.available_width() < text_min => None,
+                        MoveTail::Text(_) => Some(ui.add(egui::Label::new(label).truncate().show_tooltip_when_elided(false))),
+                    };
+                    if let Some(text_r) = text_r {
+                        if row == 0 && self.preview_tooltip_move == Some(MoveTip::Row) {
+                            egui::Tooltip::for_widget(&text_r).show(|ui| ui.label(&o.label));
+                        }
+                        text_r.on_hover_text(&o.label);
+                    }
+                    // The rest of the column, up to the expected loot.
+                    let rest = ui.available_width();
+                    if rest > 0.0 {
+                        ui.allocate_exact_size(Vec2::new(rest, h), Sense::hover()).1.on_hover_text(&o.label);
+                    }
                 });
                 ui.allocate_ui_with_layout(Vec2::new(cols.num, h), Layout::right_to_left(Align::Center), |ui| {
                     ui.label(number).on_hover_text(loot_tip);
                 });
-                ui.allocate_ui_with_layout(Vec2::new(cols.gap, h), Layout::right_to_left(Align::Center), |ui| {
-                    if let Some(diff) = diff {
-                        ui.label(diff).on_hover_text(gap_tip);
-                    }
-                });
+                if cols.gap > 0.0 {
+                    ui.allocate_ui_with_layout(Vec2::new(cols.gap, h), Layout::right_to_left(Align::Center), |ui| {
+                        if let Some(diff) = diff {
+                            ui.label(diff).on_hover_text(gap_tip);
+                        }
+                    });
+                }
             });
         }
         for _ in blanks {
@@ -3912,6 +4055,50 @@ impl AscendantApp {
         }
     }
 
+    /// The run check window (2026-11-08, the user: the status bar's line showed the issues only on hover): the run's
+    /// folder name (its start, UTC), the summary and every issue, as health.txt has them, in text that wraps and can be
+    /// selected and copied. Anchored with the other floating windows, one at a time (see [`Floats`]); it scrolls when
+    /// taller than the window allows, and its "x" or Esc closes it (not while a text box or a hotkey recording has the
+    /// keys, see [`esc_closes`]). Closed when there is no run check to show.
+    fn health_window(&mut self, ctx: &egui::Context) {
+        if !self.floats.health {
+            return;
+        }
+        let Some(report) = &self.session.health else {
+            self.floats.health = false;
+            return;
+        };
+        let folder = self.session.health_dir.as_ref().and_then(|d| d.file_name()).map(|n| n.to_string_lossy().into_owned());
+        let mut open = true;
+        let (max_w, max_h) = popup_limits(ctx);
+        egui::Window::new(tr("Run check"))
+            .id(egui::Id::unique("ascendant-run-check"))
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .min_width(max_w)
+            .max_width(max_w)
+            .max_height(max_h)
+            .vscroll(true)
+            .constrain(true)
+            .anchor(Align2::CENTER_TOP, [RAIL / 2.0, 30.0])
+            .show(ctx, |ui| {
+                ui.set_width(ui.available_width());
+                if let Some(folder) = &folder {
+                    theme::fine_print(ui, &trf!("Run {}", folder), MUTED);
+                    ui.add_space(2.0);
+                }
+                let colour = if report.issues.is_empty() { theme::GOOD } else { theme::WARN };
+                ui.add(egui::Label::new(RichText::new(report.window_summary()).color(colour)).wrap().selectable(true));
+                for issue in &report.issues {
+                    ui.add(egui::Label::new(RichText::new(format!("- {issue}")).small()).wrap().selectable(true));
+                }
+            });
+        if !open || esc_closes(ctx.input(|i| i.key_pressed(egui::Key::Escape)), self.esc_busy) {
+            self.floats.health = false;
+        }
+    }
+
     /// The correction window of the cell clicked on the board.
     fn edit_window(&mut self, ctx: &egui::Context) {
         let Some(cell) = self.editing else { return };
@@ -4002,6 +4189,21 @@ impl AscendantApp {
         self.preview_measure = std::env::var_os("ASCENDANT_PREVIEW_MEASURE").map(PathBuf::from);
         self.preview_tooltip = std::env::var("ASCENDANT_PREVIEW_TOOLTIP").is_ok_and(|v| v == "1");
         self.preview_tooltip_progress = std::env::var("ASCENDANT_PREVIEW_TOOLTIP").is_ok_and(|v| v == "progress");
+        self.preview_tooltip_move = match std::env::var("ASCENDANT_PREVIEW_TOOLTIP").as_deref() {
+            Ok("icon") => Some(MoveTip::Icon),
+            Ok("cell") => Some(MoveTip::Cell),
+            Ok("row") => Some(MoveTip::Row),
+            _ => None,
+        };
+        // ASCENDANT_PREVIEW_MOVES=patrol, manage or pick: a made-up Tartarus board on that screen, solved as a read one
+        // is, to capture the top three without the game (auto read off). Any other value, empty or "0" included, does
+        // nothing.
+        if let Ok(which) = std::env::var("ASCENDANT_PREVIEW_MOVES").map(|v| v.trim().to_string())
+            && matches!(which.as_str(), "patrol" | "manage" | "pick")
+        {
+            self.session.reading = Some(preview_reading(&which));
+            self.session.solve();
+        }
         self.preview_not_first = std::env::var("ASCENDANT_PREVIEW_NOT_FIRST").is_ok_and(|v| v == "1");
         self.preview_run_over = std::env::var("ASCENDANT_PREVIEW_RUN_OVER").is_ok_and(|v| v == "1");
         // ASCENDANT_PREVIEW_RECORD=read or auto: that hotkey row recording ("Press a key..."); with :same or :typing
@@ -4082,6 +4284,14 @@ impl AscendantApp {
         self.preview_status_open = std::env::var("ASCENDANT_PREVIEW_STATUS_OPEN").is_ok_and(|v| v == "1");
         self.restoring = std::env::var("ASCENDANT_PREVIEW_RESTORE").is_ok_and(|v| v == "1");
         self.floats.tools = std::env::var("ASCENDANT_PREVIEW_TOOLS").is_ok_and(|v| v == "1");
+        // ASCENDANT_PREVIEW_HEALTH=issues or clear: a made-up run check (see `preview_health`) with its window open.
+        if let Ok(v) = std::env::var("ASCENDANT_PREVIEW_HEALTH")
+            && matches!(v.as_str(), "issues" | "clear")
+        {
+            self.session.health = Some(preview_health(v == "issues"));
+            self.session.health_dir = Some(PathBuf::from("2026-11-07_18-18-08"));
+            self.floats.open_health();
+        }
         // ASCENDANT_PREVIEW_NO_OCR=1: as if this computer had no OCR language (the system's OCR is not removed),
         // for the line and the install button; =installing, declined, failed or done shows that state too (PowerShell never starts).
         if let Ok(v) = std::env::var("ASCENDANT_PREVIEW_NO_OCR") {
@@ -4645,6 +4855,7 @@ fn verdict(ranking: &[SolveOption], option: Option<usize>, solving: bool) -> Opt
 /// Column widths of each top-three row: rank, option name, expected loot (`5.69`), gap (small text `−0.12`);
 /// the column headings and every row share them, so they stay aligned even at a width of 200. The name uses the
 /// remaining width (wider than before now that the bars are gone).
+/// `gap` is 0 when the window is too narrow for the gap column: the rows and the heading then leave it out.
 struct Cols {
     rank: f32,
     label: f32,
@@ -4652,34 +4863,287 @@ struct Cols {
     gap: f32,
 }
 
+/// What the top-three columns need, see [`Cols::fit`]: the expected loot column (`num`), the gap column (`gap`), the
+/// two headings over them (`head`, spanning both, right-aligned) or the expected loot's alone (`loot`, without the gap
+/// column), and the name column with the action icon and the
+/// cell number (`cell`) or the icon alone (`icon`).
+struct Need {
+    num: f32,
+    gap: f32,
+    head: f32,
+    loot: f32,
+    cell: f32,
+    icon: f32,
+}
+
 impl Cols {
     #[cfg(test)]
     fn new(width: f32, spacing: f32) -> Cols {
-        Cols::fit(width, spacing, 36.0, 38.0, 0.0)
+        Cols::fit(width, spacing, Need { num: 36.0, gap: 38.0, head: 0.0, loot: 0.0, cell: 40.0, icon: 15.0 })
     }
 
-    /// The number columns get `num` and `gap` (the width actually needed); when the column heading (width
-    /// `head`, spanning two columns, right-aligned) does not fit, the expected loot column is widened; the name
-    /// column uses what is left.
-    fn fit(width: f32, spacing: f32, num: f32, gap: f32, head: f32) -> Cols {
+    /// The number columns get `num` and `gap` (the width actually needed) and the name column what is left, so the
+    /// columns add up to `width` and every row's numbers stay under their headings. When the name column would be
+    /// too narrow, things give way in this order (the row itself drops the small tile first, see `moves`): the
+    /// expected loot column no longer widens for its heading (the heading is elided), the gap column goes, the name
+    /// column keeps only the icon (the gap back if it then fits). The cell number goes after the gap, as it says
+    /// which cell the move acts on. Only when even the icon and the expected loot do not fit does the row run past
+    /// `width`.
+    fn fit(width: f32, spacing: f32, need: Need) -> Cols {
         let rank = 12.0;
-        let num = num.max(head - spacing - gap);
-        let label = (width - rank - num - gap - 3.0 * spacing).max(20.0);
-        Cols { rank, label, num, gap }
+        let wide = need.num.max(need.head - spacing - need.gap);
+        let wide_alone = need.num.max(need.loot);
+        let label = |num: f32, gap: f32| {
+            let columns = if gap > 0.0 { 3.0 } else { 2.0 };
+            width - rank - num - gap - columns * spacing
+        };
+        let tries = [
+            (wide, need.gap, need.cell),
+            (need.num, need.gap, need.cell),
+            (wide_alone, 0.0, need.cell),
+            (need.num, 0.0, need.cell),
+            (need.num, need.gap, need.icon),
+            (need.num, 0.0, need.icon),
+        ];
+        let (num, gap) = tries.iter().find(|&&(num, gap, least)| label(num, gap) >= least).map_or((need.num, 0.0), |&(num, gap, _)| (num, gap));
+        Cols { rank, label: label(num, gap).max(need.icon), num, gap }
     }
 }
 
-/// The `選擇 ` prefix (English "Take ", taken from the translation of `Take {}`) in the top three on the
-/// pick-instrument screen: when two or more rows start with it, those rows drop it (only if text remains after
-/// dropping). Other beginnings (`去` "go", `吃` "eat", "Go to"...) are left alone; the advice card and tooltips
-/// keep the full wording as before.
-fn strip_common_prefix(names: &[String]) -> Vec<String> {
-    let take = tr("Take {}").replace("{}", "");
-    let has = |n: &String| !take.is_empty() && n.starts_with(take.as_str()) && n.len() > take.len();
-    if names.iter().filter(|n| has(n)).count() < 2 {
-        return names.to_vec();
+/// `label` without the leading words of the move template `en` in the window's language (`Take {}` gives "Take " or
+/// `選擇 `), which the row's icon already says; the label itself when it does not start with them or nothing would
+/// be left. The advice card and tooltips keep the full wording.
+fn strip_template(label: &str, en: &'static str) -> String {
+    let head = tr(en).split("{}").next().unwrap_or_default().to_string();
+    match label.strip_prefix(head.as_str()) {
+        Some(rest) if !head.is_empty() && !rest.is_empty() => rest.to_string(),
+        _ => label.to_string(),
     }
-    names.iter().map(|n| if has(n) { n[take.len()..].to_string() } else { n.clone() }).collect()
+}
+
+/// Which tooltip of the first top-three row a preview keeps on show (ASCENDANT_PREVIEW_TOOLTIP=icon, cell or row).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MoveTip {
+    Icon,
+    Cell,
+    Row,
+}
+
+/// The action icon of a top-three row, drawn with the painter (lines and triangles, see [`paint_move_icon`]) rather
+/// than with font characters, which differ between computers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MoveIcon {
+    /// Go to a cell (a patrol, the Interrogation Room included, or the Sewer Ratway's move): an arrow to the right.
+    GoTo,
+    /// Consume, the day's first bite: a triangle pointing down.
+    Consume,
+    /// Chain on into the next cell: two triangles pointing down, one above the other.
+    Chain,
+    /// End the chain: a square (stop).
+    EndChain,
+    /// Replace the Inmate in the Warden's cell: two arrows, one each way.
+    Replace,
+    /// Re-roll the instrument offer: a circle of arrow.
+    Reroll,
+    /// Take or pick an option (an instrument, a treasure, an Interrogation card): a tick.
+    Take,
+    /// Hunt, mark a prey: a crosshair.
+    Hunt,
+    /// Confirm a Prison Incident: an exclamation mark in a ring.
+    Confirm,
+    /// End the day: a crescent moon.
+    EndDay,
+    /// Finish the run (End on the last day): the same crescent moon.
+    Finish,
+}
+
+impl MoveIcon {
+    /// What the icon means, for its tooltip.
+    fn meaning(self) -> String {
+        match self {
+            MoveIcon::GoTo => tr("Go to (move to this cell)").to_string(),
+            MoveIcon::Consume => tr("Consume (eat the Inmate in this cell)").to_string(),
+            MoveIcon::Chain => tr("Chain on (eat this cell next)").to_string(),
+            MoveIcon::EndChain => tr("End the chain (stop eating)").to_string(),
+            MoveIcon::Replace => tr("Replace (a new Inmate in this cell)").to_string(),
+            MoveIcon::Reroll => tr("Re-roll (draw a new offer)").to_string(),
+            MoveIcon::Take => tr("Take (pick this option)").to_string(),
+            MoveIcon::Hunt => trf!("{} (mark the Inmate in this cell as prey)", hunt_name()),
+            MoveIcon::Confirm => trf!("Confirm (go on with this {})", incident_term()),
+            MoveIcon::EndDay => tr("End the day (nothing more today)").to_string(),
+            MoveIcon::Finish => tr("Finish the run (the last day ends)").to_string(),
+        }
+    }
+}
+
+/// What follows the icon in a top-three row: the cell the move acts on (its number and a small tile), or a short
+/// text for a move without one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum MoveTail {
+    Cell(usize),
+    Text(String),
+}
+
+/// A move's icon and what follows it in the top three; `warden` is the Warden's model cell (a Replace acts there).
+fn move_row(action: &Action, label: &str, warden: i64) -> (MoveIcon, MoveTail) {
+    let cell = |n: usize| MoveTail::Cell(n);
+    match action {
+        Action::Patrol { cell: n } => (MoveIcon::GoTo, cell(*n)),
+        Action::Devour { to } => (MoveIcon::Consume, cell(*to)),
+        Action::Chain { to } => (MoveIcon::Chain, cell(*to)),
+        Action::Hunt { cell: n } => (MoveIcon::Hunt, cell(*n)),
+        // The Hunt's own target pick and the Sewer Ratway's move both choose a cell; only the Hunt's label starts
+        // with its name (see solve.rs `hunt_label`).
+        Action::Choose { id: ChoiceId::Cell(n) } if label.starts_with(hunt_name()) => (MoveIcon::Hunt, cell(*n)),
+        Action::Choose { id: ChoiceId::Cell(n) } => (MoveIcon::GoTo, cell(*n)),
+        Action::Choose { id: ChoiceId::Name(_) } => (MoveIcon::Take, MoveTail::Text(strip_template(label, "Take {}"))),
+        Action::Swap => match usize::try_from(warden) {
+            Ok(n) => (MoveIcon::Replace, cell(n)),
+            Err(_) => (MoveIcon::Replace, MoveTail::Text(tr("Replace").to_string())),
+        },
+        Action::Reroll => (MoveIcon::Reroll, MoveTail::Text(label.to_string())),
+        Action::EndChain => (MoveIcon::EndChain, MoveTail::Text(label.to_string())),
+        Action::Event => (MoveIcon::Confirm, MoveTail::Text(strip_template(label, "Confirm {}"))),
+        Action::End if label == tr("Finish the run") => (MoveIcon::Finish, MoveTail::Text(label.to_string())),
+        Action::End => (MoveIcon::EndDay, MoveTail::Text(label.to_string())),
+    }
+}
+
+/// The tooltip of a row's small tile: the cell's number and what it holds, "Cell 11: Magic Mammoth".
+fn cell_tip(n: usize, cell: &CellModel) -> String {
+    trf!("Cell {}: {}", cell_label(n), describe(cell))
+}
+
+/// Draws `icon` in `rect` (a row's height) in `colour`.
+fn paint_move_icon(p: &egui::Painter, rect: Rect, icon: MoveIcon, colour: Color32) {
+    let s = (rect.height() * 0.62).min(rect.width());
+    let c = rect.center();
+    let half = s / 2.0;
+    let stroke = Stroke::new(1.6, colour);
+    let at = |x: f32, y: f32| Pos2::new(c.x + x * half, c.y + y * half);
+    let triangle = |a: Pos2, b: Pos2, d: Pos2| {
+        p.add(Shape::convex_polygon(vec![a, b, d], colour, Stroke::NONE));
+    };
+    match icon {
+        MoveIcon::GoTo => {
+            p.line_segment([at(-1.0, 0.0), at(0.2, 0.0)], stroke);
+            triangle(at(0.0, -0.7), at(1.0, 0.0), at(0.0, 0.7));
+        }
+        MoveIcon::Consume => triangle(at(-0.9, -0.6), at(0.9, -0.6), at(0.0, 0.8)),
+        MoveIcon::Chain => {
+            triangle(at(-0.8, -1.0), at(0.8, -1.0), at(0.0, -0.05));
+            triangle(at(-0.8, 0.1), at(0.8, 0.1), at(0.0, 1.05));
+        }
+        MoveIcon::EndChain => {
+            p.rect_filled(Rect::from_center_size(c, Vec2::splat(s * 0.75)), 1.0, colour);
+        }
+        MoveIcon::Replace => {
+            p.line_segment([at(-1.0, -0.45), at(0.4, -0.45)], stroke);
+            triangle(at(0.3, -0.85), at(1.0, -0.45), at(0.3, -0.05));
+            p.line_segment([at(-0.4, 0.45), at(1.0, 0.45)], stroke);
+            triangle(at(-0.3, 0.05), at(-1.0, 0.45), at(-0.3, 0.85));
+        }
+        MoveIcon::Reroll => {
+            // An arc of about 290 degrees from the top, clockwise, with the arrowhead at its end.
+            let r = half * 0.8;
+            let (start, sweep) = (-std::f32::consts::FRAC_PI_2 + 0.45, 5.0_f32);
+            let arc: Vec<Pos2> = (0..=16).map(|k| start + sweep * k as f32 / 16.0).map(|a| Pos2::new(c.x + r * a.cos(), c.y + r * a.sin())).collect();
+            p.add(Shape::line(arc, stroke));
+            let end = start + sweep;
+            let tip = Pos2::new(c.x + r * end.cos(), c.y + r * end.sin());
+            // The arrowhead points along the arc's direction at its end (clockwise on screen).
+            let dir = Vec2::new(-end.sin(), end.cos());
+            let side = Vec2::new(dir.y, -dir.x);
+            let len = half * 0.6;
+            triangle(tip + dir * len * 0.7, tip - dir * len * 0.3 + side * len * 0.6, tip - dir * len * 0.3 - side * len * 0.6);
+        }
+        MoveIcon::Take => {
+            p.add(Shape::line(vec![at(-0.9, 0.05), at(-0.3, 0.65), at(0.95, -0.7)], Stroke::new(2.0, colour)));
+        }
+        MoveIcon::Hunt => {
+            p.circle_stroke(c, half * 0.62, stroke);
+            for (a, b) in [((-1.0, 0.0), (-0.35, 0.0)), ((0.35, 0.0), (1.0, 0.0)), ((0.0, -1.0), (0.0, -0.35)), ((0.0, 0.35), (0.0, 1.0))] {
+                p.line_segment([at(a.0, a.1), at(b.0, b.1)], stroke);
+            }
+            p.circle_filled(c, 1.3, colour);
+        }
+        MoveIcon::Confirm => {
+            p.circle_stroke(c, half, Stroke::new(1.3, colour));
+            p.line_segment([at(0.0, -0.6), at(0.0, 0.2)], Stroke::new(1.8, colour));
+            p.circle_filled(at(0.0, 0.52), 1.1, colour);
+        }
+        MoveIcon::EndDay | MoveIcon::Finish => {
+            // A crescent opening to the right: between the outer circle's arc and the arc of a circle set to the right
+            // through the same two tips (at ±60 degrees). Filled as a mesh of strips (it is not convex), with a thin
+            // outline for smooth edges.
+            const N: usize = 16;
+            let r = half * 0.95;
+            let d = 0.45 * r;
+            let tip = std::f32::consts::FRAC_PI_3;
+            let inner_r = ((r * tip.cos() - d).powi(2) + (r * tip.sin()).powi(2)).sqrt();
+            let inner_tip = (r * tip.sin()).atan2(r * tip.cos() - d);
+            let arc = |centre: Pos2, radius: f32, from: f32| -> Vec<Pos2> {
+                let sweep = std::f32::consts::TAU - 2.0 * from;
+                (0..=N).map(|k| -from - sweep * k as f32 / N as f32).map(|a| Pos2::new(centre.x + radius * a.cos(), centre.y + radius * a.sin())).collect()
+            };
+            let outer = arc(c, r, tip);
+            let inner = arc(c + Vec2::new(d, 0.0), inner_r, inner_tip);
+            let mut mesh = egui::Mesh::default();
+            for (o, i) in outer.iter().zip(&inner) {
+                mesh.colored_vertex(*o, colour);
+                mesh.colored_vertex(*i, colour);
+            }
+            for k in 0..N as u32 {
+                let (o, i, o2, i2) = (2 * k, 2 * k + 1, 2 * k + 2, 2 * k + 3);
+                mesh.add_triangle(o, o2, i);
+                mesh.add_triangle(i, o2, i2);
+            }
+            p.add(Shape::mesh(mesh));
+            let mut outline = outer;
+            outline.extend(inner.into_iter().rev().skip(1).take(N - 1));
+            p.add(Shape::closed_line(outline, Stroke::new(0.8, colour)));
+        }
+    }
+}
+
+/// A made-up Tartarus board for previews (ASCENDANT_PREVIEW_MOVES): `patrol` the destination pick from the
+/// Interrogation Room, `manage` the decision on a Magic Mammoth's cell, `pick` an instrument offer with a Re-roll.
+fn preview_reading(which: &str) -> crate::app::session::Reading {
+    use crate::board::{ChoiceKind, Step};
+    let inmate = |beast, tier| CellModel::Inmate { beast, tier, ivory: false, prey: None, event: None };
+    let mut m = Model::blank();
+    m.day = 3;
+    m.cells[1] = CellModel::Empty { event: None };
+    m.cells[2] = inmate(Beast::Rat, 0);
+    m.cells[3] = CellModel::Sealed { event: None };
+    m.cells[4] = inmate(Beast::Wolf, 2);
+    m.cells[6] = CellModel::Inmate { beast: Beast::Lion, tier: 1, ivory: false, prey: None, event: Some(EventMark::Unknown) };
+    m.cells[9] = inmate(Beast::Rat, 1);
+    m.cells[10] = inmate(Beast::Mammoth, 1);
+    m.cells[11] = inmate(Beast::Wolf, 0);
+    m.cells[12] = CellModel::Empty { event: None };
+    let screen = match which {
+        "manage" => {
+            m.step = Step::Manage;
+            m.warden = 10;
+            Screen::Manage
+        }
+        "pick" => {
+            m.step = Step::Choice;
+            m.warden = 4;
+            m.choice.kind = ChoiceKind::Tool;
+            m.choice.options = Tool::ALL.iter().copied().take(3).collect();
+            m.choice.rerolls = 1;
+            Screen::InstrumentPick
+        }
+        _ => {
+            m.step = Step::Patrol;
+            m.warden = 0;
+            m.dest = vec![10, 3, 6];
+            Screen::Patrol
+        }
+    };
+    crate::app::session::Reading { model: m, warnings: Vec::new(), screen, days_left: Some(12), at: SystemTime::now(), eater_inferred: false }
 }
 
 /// The minimum number of playouts at which the advice can be "shown steadily" during simulation (the same as
@@ -4992,6 +5456,47 @@ fn click_hides(screen: Screen, action: &Action) -> bool {
     !(matches!(screen, Screen::InstrumentPick | Screen::TreasurePick) && matches!(action, Action::Choose { .. }))
 }
 
+/// How long after a click hid the mark the game's log may take to say the move was played before the mark comes back
+/// ([`click_unconfirmed`]). Measured on the six runs of 2026-11-07 17:53 to 18:20 UTC (the mark hidden on the
+/// release, as now): 109 of 113 hides had the move logged within 0.11 s (median 0.05 s); the other four came 0.49,
+/// 0.51, 1.6 and 1.8 s on, likely a second click. On 513 earlier runs, hidden on the press, 694 of 722 within 0.5 s.
+/// 0.6 s is over five times the usual worst; a move logged later still hides the mark (`played`).
+const CONFIRM_WAIT: Duration = Duration::from_millis(600);
+/// A move logged this long before the click was taken (the look comes up to 50 ms after the release, the log 30 to
+/// 130 ms after the game) still confirms it, when it came after the screen clicked on was read (so not the move before).
+const CONFIRM_EARLY: Duration = Duration::from_millis(300);
+
+/// The game's log lines that say a move was played by a click on the advice's target: a door (`Moved`), a decision
+/// card (`Decision`, `Consume`), a cell (`CellPicked`, `Bite`), the chain's End (`ChainEnd`) or a re-roll (`Reroll`).
+fn confirms_click(signal: super::gamelog::Signal) -> bool {
+    use super::gamelog::Signal;
+    matches!(signal, Signal::Moved | Signal::Decision | Signal::Consume | Signal::CellPicked | Signal::Bite | Signal::ChainEnd | Signal::Reroll)
+}
+
+/// Whether a click that hid the mark at `clicked` on `screen`, whose reading was read at `read`, was not played: the
+/// game's log is followed (`log_live`, its light green), the screen logs its moves ([`confirms_click`]; on 2026-11-07
+/// every Patrol, Manage, Interrogation, cell pick, Consume target and instrument re-roll click the game played logged
+/// one), none was logged since (`move_seen`: after the reading, and at most [`CONFIRM_EARLY`] before the click), and
+/// [`CONFIRM_WAIT`] has gone by. The other screens (the treasure pick, popups, the theme scroll, prison status) log no
+/// such line for their clicks, or not one known to come every time: their mark stays hidden as before.
+/// Accepted as they are (the 2026-11-08 review): a move logged later than CONFIRM_WAIT (4 of 113 hides on 2026-11-07,
+/// likely a second click) brings the mark back for a moment until it comes (`played` then hides it); and a click on
+/// the old box in the one frame the advice changes still counts for the new advice's screen.
+fn click_unconfirmed(screen: Screen, (clicked, read): (Instant, Instant), move_seen: Option<Instant>, now: Instant, log_live: bool) -> bool {
+    let logs_moves = matches!(screen, Screen::Patrol | Screen::Manage | Screen::Interrogation | Screen::CellPick | Screen::ChainTarget | Screen::InstrumentPick);
+    let confirmed = move_seen.is_some_and(|seen| seen >= read && seen + CONFIRM_EARLY >= clicked);
+    log_live && logs_moves && !confirmed && now.saturating_duration_since(clicked) >= CONFIRM_WAIT
+}
+
+/// Whether a click (screen px, see [`mark::Clicks`]) is on the mark: pressed, held and released all in the game's
+/// rect `game` and on the same one of the target read, `read`, and the spot the box holds, `drawn` (it keeps where it
+/// was first marked, see [`Mark::spot`]), with the margin of [`mark::hit_rect`]. The box around every position seen
+/// while held lying in it, so does every position. Both spots are `[x, y, half_w, half_h, unit]` in screen px.
+fn on_mark(click: mark::Click, game: [i32; 4], read: [f32; 5], drawn: Option<[f32; 5]>) -> bool {
+    let on = |spot: [f32; 5], p: (i32, i32)| mark::inside(game, p) && mark::inside(mark::hit_rect(spot), p);
+    [Some(read), drawn].into_iter().flatten().any(|spot| [click.min, click.max, click.down, click.up].into_iter().all(|p| on(spot, p)))
+}
+
 /// The expected loot of the move at `option` in the session's ranking ([`Session::loot`]: the day's first bite left
 /// alone takes the manage screen's value) as the window writes it, `6.74`: the board's advice line, the top three and
 /// the value on the game; None without a value (the window then writes a dash).
@@ -5115,7 +5620,8 @@ fn read_button(ui: &mut egui::Ui, size: Vec2) -> egui::Response {
     response
 }
 
-/// The click-through light in the navigation rail, laid out as the Auto button below it: a dot and "Through", the
+/// The click-through light in the navigation rail, laid out as the Auto button below it: a dot and "Thru" (1.0.4: the
+/// English "Through" was cut to "hroug" in the rail; the smallest text size stays, so a shorter word), the
 /// dot green while click-through is on and unlit while off.
 fn through_button(ui: &mut egui::Ui, size: Vec2, on: bool) -> egui::Response {
     let (rect, response) = ui.allocate_exact_size(size, Sense::click());
@@ -5126,7 +5632,7 @@ fn through_button(ui: &mut egui::Ui, size: Vec2, on: bool) -> egui::Response {
     p.rect_stroke(rect, 5.0, if on { Stroke::new(1.0, ACCENT) } else { visuals.bg_stroke }, StrokeKind::Inside);
     p.circle_filled(rect.center_top() + Vec2::new(0.0, 8.5), 3.5, if on { theme::GOOD } else { Color32::from_gray(85) });
     let text = if on { Color32::WHITE } else { visuals.fg_stroke.color };
-    p.text(rect.center_bottom() - Vec2::new(0.0, 4.0), Align2::CENTER_BOTTOM, tr("Through"), FontId::proportional(MIN_TEXT), text);
+    p.text(rect.center_bottom() - Vec2::new(0.0, 4.0), Align2::CENTER_BOTTOM, tr("Thru"), FontId::proportional(MIN_TEXT), text);
     response
 }
 
@@ -5476,21 +5982,70 @@ mod tests {
     }
 
     #[test]
-    fn common_prefix_is_dropped_from_the_rows() {
-        let names = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-        let take = tr("Take {}").replace("{}", "");
-        let picks = |v: &[&str]| v.iter().map(|s| format!("{take}{s}")).collect::<Vec<_>>();
-        // Picking instruments: Re-roll is first, and the other two rows are both `選擇 …` (English
-        // "Take ...").
-        let mut rows = names(&["重新隨機"]);
-        rows.extend(picks(&["瘋獸的倒刺項圈", "凶獸的饑餓枷鎖"]));
-        assert_eq!(strip_common_prefix(&rows), names(&["重新隨機", "瘋獸的倒刺項圈", "凶獸的饑餓枷鎖"]));
-        // Only one row is "Take ...": left alone.
-        assert_eq!(strip_common_prefix(&picks(&["項圈"])), picks(&["項圈"]));
-        // Other beginnings (`吃` "eat", `去` "go", "Go to") are always left alone.
-        assert_eq!(strip_common_prefix(&names(&["吃 05", "吃 07"])), names(&["吃 05", "吃 07"]));
-        assert_eq!(strip_common_prefix(&names(&["Go to 04", "Go to 05"])), names(&["Go to 04", "Go to 05"]));
-        assert_eq!(strip_common_prefix(&names(&["去 04 號", "去 審訊室"])), names(&["去 04 號", "去 審訊室"]));
+    fn template_words_are_dropped_from_a_row() {
+        // "Take " goes: the tick icon says it.
+        assert_eq!(strip_template("Take Maddened Beast's Barbed Collar", "Take {}"), "Maddened Beast's Barbed Collar");
+        assert_eq!(strip_template("Confirm Riot Drill", "Confirm {}"), "Riot Drill");
+        // A label without them, or with nothing after them, stays whole.
+        assert_eq!(strip_template("Instigate", "Take {}"), "Instigate");
+        assert_eq!(strip_template("Take ", "Take {}"), "Take ");
+    }
+
+    /// Every move the solver offers on the preview boards gets an icon and the cell it acts on, or a short text.
+    #[test]
+    fn each_move_has_an_icon_and_its_cell() {
+        let rows = |which: &str| {
+            let reading = preview_reading(which);
+            let (st, problems) = crate::board::build_state(&reading.model, 1);
+            assert!(problems.is_empty(), "{which}: {problems:?}");
+            crate::solver::solve::candidates(&st).into_iter().map(|c| move_row(&c.action, &c.label, reading.model.warden)).collect::<Vec<_>>()
+        };
+        let patrol = rows("patrol");
+        assert_eq!(patrol.len(), 3);
+        for cell in [10, 3, 6] {
+            assert!(patrol.contains(&(MoveIcon::GoTo, MoveTail::Cell(cell))), "{patrol:?}");
+        }
+        let manage = rows("manage");
+        // A Replace names the Warden's cell, which the old "Replace" text left out.
+        assert!(manage.contains(&(MoveIcon::Replace, MoveTail::Cell(10))), "{manage:?}");
+        assert!(manage.iter().any(|(icon, tail)| *icon == MoveIcon::Consume && matches!(tail, MoveTail::Cell(_))), "{manage:?}");
+        assert!(manage.contains(&(MoveIcon::EndDay, MoveTail::Text("End the day".to_string()))), "{manage:?}");
+        let pick = rows("pick");
+        assert!(pick.contains(&(MoveIcon::Reroll, MoveTail::Text("Re-roll".to_string()))), "{pick:?}");
+        let names: Vec<String> = Tool::ALL.iter().take(3).map(|&t| instrument(t).to_string()).collect();
+        for name in names {
+            assert!(pick.contains(&(MoveIcon::Take, MoveTail::Text(name.clone()))), "{name}: {pick:?}");
+        }
+        // The moves without a preview board.
+        assert_eq!(move_row(&Action::Chain { to: 7 }, "Chain on into 08", 2), (MoveIcon::Chain, MoveTail::Cell(7)));
+        assert_eq!(move_row(&Action::EndChain, "End the chain", 2), (MoveIcon::EndChain, MoveTail::Text("End the chain".to_string())));
+        assert_eq!(move_row(&Action::End, "Finish the run", 2).0, MoveIcon::Finish);
+        assert_eq!(move_row(&Action::Hunt { cell: 5 }, "x", 2), (MoveIcon::Hunt, MoveTail::Cell(5)));
+        let prey = format!("{}: mark the Rare Alpha Wolf in 06 as prey", hunt_name());
+        assert_eq!(move_row(&Action::Choose { id: ChoiceId::Cell(5) }, &prey, 2), (MoveIcon::Hunt, MoveTail::Cell(5)));
+        assert_eq!(move_row(&Action::Choose { id: ChoiceId::Cell(5) }, "Move to 06", 2), (MoveIcon::GoTo, MoveTail::Cell(5)));
+        assert_eq!(move_row(&Action::Event, "Confirm Riot Drill", 2), (MoveIcon::Confirm, MoveTail::Text("Riot Drill".to_string())));
+        assert_eq!(move_row(&Action::Swap, "Replace the Normal Rat in 03", -1).1, MoveTail::Text("Replace".to_string()));
+    }
+
+    /// The three tooltips of a row: the icon's meaning, the small tile's cell, and (unchanged) the full move.
+    #[test]
+    fn row_tooltips_say_the_icon_and_the_cell() {
+        assert_eq!(MoveIcon::GoTo.meaning(), "Go to (move to this cell)");
+        assert_eq!(lang::tr_in(Lang::ZhTw, "Go to (move to this cell)"), "去（移動到這格）");
+        let m = preview_reading("patrol").model;
+        assert_eq!(cell_tip(10, &m.cells[10]), format!("Cell 11: {}", inmate_name(1, Beast::Mammoth)));
+        assert_eq!(cell_tip(0, &m.cells[0]), "Cell 01: Interrogation Room");
+        assert_eq!(lang::tr_in(Lang::ZhTw, "Cell {}: {}"), "{} 號：{}");
+        // Every meaning has its Chinese, with full-width brackets.
+        for icon in [MoveIcon::GoTo, MoveIcon::Consume, MoveIcon::Chain, MoveIcon::EndChain, MoveIcon::Replace, MoveIcon::Reroll, MoveIcon::Take, MoveIcon::EndDay, MoveIcon::Finish] {
+            let en: &'static str = Box::leak(icon.meaning().into_boxed_str());
+            let zh = lang::tr_in(Lang::ZhTw, en);
+            assert!(zh != en && zh.contains('（') && zh.ends_with('）'), "{en}: {zh}");
+        }
+        for en in ["{} (mark the Inmate in this cell as prey)", "Confirm (go on with this {})"] {
+            assert!(lang::tr_in(Lang::ZhTw, en) != en, "{en}");
+        }
     }
 
     #[test]
@@ -5509,6 +6064,46 @@ mod tests {
         let c = Cols::new(152.0, 4.0);
         assert!((c.rank + c.label + c.num + c.gap + 3.0 * 4.0 - 152.0).abs() < 0.01);
         assert!(c.label >= 50.0);
+    }
+
+    /// Narrower and narrower: the heading stops widening the expected loot column, then the gap column goes, then
+    /// the name column keeps only the icon; the columns always add up to the width, so the numbers stay under their
+    /// headings and inside the window.
+    #[test]
+    fn columns_give_way_in_order() {
+        let need = || Need { num: 30.0, gap: 30.0, head: 80.0, loot: 52.0, cell: 36.0, icon: 15.0 };
+        let sum = |c: &Cols| c.rank + c.label + c.num + c.gap + if c.gap > 0.0 { 3.0 } else { 2.0 } * 4.0;
+        let wide = Cols::fit(200.0, 4.0, need());
+        assert_eq!((wide.num, wide.gap), (46.0, 30.0), "the heading widens the expected loot");
+        let elided = Cols::fit(130.0, 4.0, need());
+        assert_eq!((elided.num, elided.gap), (30.0, 30.0), "the heading elided");
+        assert!(elided.label >= 36.0);
+        let no_gap = Cols::fit(100.0, 4.0, need());
+        assert_eq!(no_gap.gap, 0.0, "the gap column gone, the cell number kept");
+        assert!(no_gap.label >= 36.0);
+        let alone = Cols::fit(115.0, 4.0, need());
+        assert_eq!((alone.num, alone.gap), (52.0, 0.0), "without the gap column the expected loot's heading fits alone");
+        let icon = Cols::fit(70.0, 4.0, need());
+        assert!(icon.gap == 0.0 && icon.label >= 15.0 && icon.label < 36.0, "the icon alone");
+        for (c, w) in [(&wide, 200.0), (&elided, 130.0), (&no_gap, 100.0), (&alone, 115.0), (&icon, 70.0)] {
+            assert!((sum(c) - w).abs() < 0.01, "adds up to {w}");
+        }
+    }
+
+    /// The run check's lines: the status bar's says a click opens it (both languages), the window's names no other
+    /// place, health.txt keeps the old one; all clear is the same everywhere.
+    #[test]
+    fn run_check_lines_are_translated() {
+        use crate::lang::{Lang, tr_in};
+        for key in ["Run check: {} to look at, click here to see them.", "Run check: {} to look at.", "Click to see the run check", "Run check", "Run {}", "See"] {
+            assert_ne!(tr_in(Lang::ZhTw, key), key, "{key}");
+        }
+        assert_eq!(tr_in(Lang::ZhTw, "Run check: {} to look at, click here to see them."), "本局檢查：有 {} 個問題，點這裡查看。");
+        let found = preview_health(true);
+        let clear = preview_health(false);
+        let (status, window, text) = (found.status_line(), found.window_summary(), found.text());
+        assert!(status != window && !text.starts_with(&status) && !text.starts_with(&window), "{status} / {window} / {text}");
+        assert_eq!((clear.status_line(), clear.window_summary()), (clear.summary(), clear.summary()));
     }
 
     /// Colour of the gap: grey within 2 paired standard errors (about the same), the normal text colour beyond;
@@ -5626,6 +6221,15 @@ mod tests {
         floats.toggle_tools();
         floats.toggle_tools();
         assert!(floats.whats_new.is_none() && !floats.tools);
+        // The run check's window: one at a time with the others.
+        floats.open_health();
+        assert!(floats.health && floats.whats_new.is_none() && !floats.tools);
+        floats.toggle_tools();
+        assert!(!floats.health && floats.tools, "the instruments window closes the run check");
+        floats.open_health();
+        assert!(floats.health && !floats.tools, "the run check closes the instruments window");
+        floats.open_whats_new(WhatsNew::new(None));
+        assert!(!floats.health && floats.whats_new.is_some(), "What's new closes the run check");
     }
 
     /// Esc closes "What's new" only when no text box has the keyboard and no hotkey is being recorded.
@@ -5676,6 +6280,101 @@ mod tests {
         assert!(click_hides(Screen::Manage, &Action::Devour { to: 4 }));
         assert!(click_hides(Screen::Patrol, &Action::Patrol { cell: 7 }));
         assert!(click_hides(Screen::ChainTarget, &Action::Chain { to: 9 }));
+    }
+
+    /// Only a click on the mark counts (2026-11-07: a click anywhere in the game hid it). The manage screen's Hunt
+    /// button at 1440p, mark_at 1511, 1126, 94 x 94 in that run's log, the game at (100, 50): a click on it or its box
+    /// counts, on the next decision button (End, 460 px along), on the board or off the game does not; the box drawn a
+    /// few px off the read (see `Mark::spot`) counts too.
+    #[test]
+    fn only_a_click_on_the_mark_hides_it() {
+        let u = 4.0 / 3.0;
+        let game = [100, 50, 2560, 1440];
+        let read = [100.0 + 1511.0, 50.0 + 1126.0, 94.0, 94.0, u];
+        let at = |x: i32, y: i32| mark::Click::at((100 + x, 50 + y));
+        assert!(on_mark(at(1511, 1126), game, read, None), "the button");
+        assert!(on_mark(at(1511 + 94 + 16, 1126), game, read, None), "the box's line");
+        assert!(!on_mark(at(1970, 1126), game, read, None), "End, the next button");
+        assert!(!on_mark(at(1280, 600), game, read, None), "the board");
+        assert!(!on_mark(at(1511, 1000), game, read, None), "above the box");
+        assert!(on_mark(at(1511, 1000), game, read, Some([100.0 + 1511.0, 50.0 + 1100.0, 94.0, 94.0, u])), "the box held 26 px higher");
+        let top_cell = [100.0 + 1000.0, 50.0 + 60.0, 87.0, 87.0, u];
+        assert!(!on_mark(mark::Click::at((1100, 40)), game, top_cell, None), "above the game's top, inside the margin");
+    }
+
+    /// A click the game's log does not follow with a move within CONFIRM_WAIT was not played (a way to cancel it the
+    /// clicks do not know): the mark comes back, on the screens whose clicks log their moves. A move logged after the
+    /// click, or just before it, keeps it hidden; on the treasure pick it stays hidden as before.
+    #[test]
+    fn an_unplayed_click_brings_the_mark_back() {
+        // The reading at t0, the click at t0 + 1 s; `later(ms)` after the click.
+        let read = Instant::now();
+        let at = read + Duration::from_secs(1);
+        let later = |ms: u64| at + Duration::from_millis(ms);
+        let unconfirmed = |screen, seen, now| click_unconfirmed(screen, (at, read), seen, now, true);
+        assert!(!unconfirmed(Screen::Patrol, None, later(100)), "not yet");
+        assert!(unconfirmed(Screen::Patrol, None, later(600)), "no move logged: back");
+        assert!(!unconfirmed(Screen::Patrol, Some(later(50)), later(600)), "the door's Moved");
+        assert!(!unconfirmed(Screen::Manage, Some(at - Duration::from_millis(100)), later(900)), "logged just before the look");
+        assert!(unconfirmed(Screen::Manage, Some(at - Duration::from_millis(400)), later(900)), "too long before the click");
+        // A move logged within CONFIRM_EARLY of the click but before the screen was read is the move before.
+        assert!(click_unconfirmed(Screen::Manage, (read + Duration::from_millis(100), read), Some(read - Duration::from_millis(50)), later(900), true), "before the reading");
+        for screen in [Screen::Manage, Screen::Interrogation, Screen::CellPick, Screen::ChainTarget, Screen::InstrumentPick] {
+            assert!(unconfirmed(screen, None, later(700)), "{screen:?}");
+        }
+        assert!(!unconfirmed(Screen::TreasurePick, None, later(5000)), "no reliable line: stays hidden");
+        // The game's log not followed (auto read off, or its light red): no line can come, so it stays hidden as in 1.0.3.
+        assert!(!click_unconfirmed(Screen::Patrol, (at, read), None, later(5000), false), "log not followed");
+        use super::super::gamelog::Signal;
+        assert!(confirms_click(Signal::Moved) && confirms_click(Signal::Bite) && confirms_click(Signal::Reroll));
+        assert!(!confirms_click(Signal::CardsUp(3, 0)) && !confirms_click(Signal::Prison) && !confirms_click(Signal::ObjectiveDone));
+    }
+
+    /// A click counts as a button's (2026-11-08, the user: pressed on the box and let go elsewhere, the game played
+    /// nothing): pressed and released on the box hides it, either end off it does not; a click quicker than the 50 ms
+    /// looks, seen only as "pressed since", takes the cursor then for both ends. The Hunt button of the test above.
+    #[test]
+    fn a_click_hides_the_mark_only_pressed_and_released_on_it() {
+        use mark::{Clicks, Look};
+        let u = 4.0 / 3.0;
+        let game = [100, 50, 2560, 1440];
+        let read = [100.0 + 1511.0, 50.0 + 1126.0, 94.0, 94.0, u];
+        let (on_box, off_box) = (Some((100 + 1511, 50 + 1126)), Some((100 + 1970, 50 + 1126)));
+        let held = |at| Look { down: true, pressed: true, other: false, at };
+        let still = |at| Look { down: true, pressed: false, other: false, at };
+        let up = |at| Look { down: false, pressed: false, other: false, at };
+        let hides = |looks: &[Look]| {
+            let mut clicks = Clicks::default();
+            looks.iter().any(|&look| clicks.next(look).is_some_and(|click| on_mark(click, game, read, None)))
+        };
+        assert!(hides(&[held(on_box), still(on_box), up(on_box)]), "pressed and released on the box");
+        assert!(!hides(&[held(on_box), still(off_box), up(off_box)]), "pressed on the box, released off it");
+        assert!(!hides(&[held(off_box), still(on_box), up(on_box)]), "pressed off the box, released on it");
+        assert!(hides(&[up(None), Look { down: false, pressed: true, other: false, at: on_box }]), "a quick click on the box");
+        assert!(!hides(&[Look { down: false, pressed: true, other: false, at: off_box }]), "a quick click off it");
+        // 2026-11-08 (the user): the right button pressed while the left is held on the box, then both let go: the
+        // game dropped the pick. The middle one counts the same; so does one by the look the left comes up.
+        let other = |look: Look| Look { other: true, ..look };
+        assert!(!hides(&[held(on_box), other(still(on_box)), up(on_box)]), "the right button pressed while held");
+        assert!(!hides(&[held(on_box), still(on_box), other(up(on_box))]), "the right button pressed by the release");
+        assert!(!hides(&[other(held(on_box)), up(on_box)]), "pressed with the left");
+        assert!(!hides(&[other(Look { down: false, pressed: true, other: false, at: on_box })]), "with a quick click");
+        assert!(hides(&[other(up(on_box)), held(on_box), up(on_box)]), "a right click before the left one does not count");
+        assert!(!hides(&[held(on_box), up(None)]), "released on this app's window");
+        assert!(!hides(&[held(on_box), still(on_box)]), "still held: not yet");
+        // 2026-11-08 (the user, a day 1 patrol): pressed on the box, moved off and back, released on it: the game
+        // played nothing, as a button cancels once the cursor leaves it.
+        assert!(!hides(&[held(on_box), still(off_box), still(on_box), up(on_box)]), "off the box and back while held");
+        // Small moves on the box while held: still a click on it.
+        let near = |dx: i32, dy: i32| Some((100 + 1511 + dx, 50 + 1126 + dy));
+        assert!(hides(&[held(on_box), still(near(30, -20)), still(near(-40, 50)), up(near(10, 10))]), "moved a little on the box");
+        assert!(!hides(&[held(on_box), still(None), up(on_box)]), "held over this app's window a while");
+        // Released on the box and a click went by unseen between two looks: the first click is the one that counts.
+        let mut clicks = Clicks::default();
+        assert_eq!(clicks.next(held(off_box)), None);
+        let (a, b) = (off_box.unwrap(), on_box.unwrap());
+        assert_eq!(clicks.next(Look { down: false, pressed: true, other: false, at: on_box }), Some(mark::Click { down: a, up: b, min: (a.0.min(b.0), a.1.min(b.1)), max: (a.0.max(b.0), a.1.max(b.1)) }));
+        assert_eq!(clicks.next(up(on_box)), None, "nothing left");
     }
 
     /// A move left alone is not played out (n = 0, mean 0): with no manage screen's value to take it has none, on the

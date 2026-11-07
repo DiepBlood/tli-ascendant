@@ -13,7 +13,7 @@ pub struct Settings {
     /// Turns auto read on or off.
     pub auto_hotkey: String,
     /// Click-through: if it was on when Ascendant was last closed, it starts on next time. It is turned on and off
-    /// by the navigation rail's "Through" light, whose clicks stay in the window; the click-through hotkey of 1.0.1
+    /// by the navigation rail's "Thru" light, whose clicks stay in the window; the click-through hotkey of 1.0.1
     /// and before is gone, and an old file's `through_hotkey` is ignored.
     pub click_through: bool,
     /// How opaque the window is, from [`MIN_OPACITY`] to 1.

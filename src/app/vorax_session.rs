@@ -1855,7 +1855,7 @@ impl VoraxSession {
                 self.samples = None;
             }
             match self.paused.take() {
-                Some(p) if takes_back(&p, cue) => self.resume_paused(p, at, cue),
+                Some(p) if takes_back(&p, cue) || self.samples_take_back(&p, cue) => self.resume_paused(p, at, cue),
                 // Another page (the intro page) while a game is paused: not a new game yet, which only its charge or
                 // the intro page hidden into the board tells; until then the paused game keeps the log folder.
                 Some(mut p) => {
@@ -2022,10 +2022,11 @@ impl VoraxSession {
     /// The mode a cue switches to by taking the paused game back from Off, when it is not the one [`next_mode`]
     /// gives: a paused game that reached the last round goes on to its result screen (Reward Run, Off otherwise
     /// ignores it) or straight into its endgame battle (Fight or the battle map). The board's own Main Run is left
-    /// to `next_mode`. Whether the cue takes the paused game back at all is decided in one place, [`takes_back`].
+    /// to `next_mode`. Whether the cue takes the paused game back at all is decided in one place, [`takes_back`]
+    /// (and, collecting samples, [`VoraxSession::samples_take_back`]).
     fn paused_entry(&self, cue: Cue) -> Option<Mode> {
         let p = self.paused.as_ref().filter(|_| self.mode == Mode::Off)?;
-        if !takes_back(p, Some(cue)) {
+        if !takes_back(p, Some(cue)) && !self.samples_take_back(p, Some(cue)) {
             return None;
         }
         match cue {
@@ -2033,6 +2034,24 @@ impl VoraxSession {
             Cue::Fight | Cue::BattleEntered => Some(Mode::Battle),
             _ => None,
         }
+    }
+
+    /// Private builds collecting samples ([`samples::Samples`]): the result page (Reward Run) also takes the paused
+    /// game back once it has a finished game's picks ([`by_picks`]). No round is read while collecting samples, so
+    /// [`takes_back`] never sees the last round, and a game whose board was closed after its last confirm (the
+    /// skip-animation habit) had its result page left out: 2026-11-07_14-43-32, Main Destory 0.67 s before Reward
+    /// Run. No frame reaches the session while it is off, so the page is saved only with the game taken back into
+    /// Result. The risk [`by_picks`] names (an older game's result page at entry, given up, ending this one) can at
+    /// worst end a sample game early; no advice is given while collecting samples.
+    #[cfg(feature = "dev-samples")]
+    fn samples_take_back(&self, p: &Paused, cue: Option<Cue>) -> bool {
+        self.samples.is_some() && cue == Some(Cue::Page(Page::Reward, PageState::Run)) && by_picks(p)
+    }
+
+    /// Without the feature (the public build) nothing more than [`takes_back`].
+    #[cfg(not(feature = "dev-samples"))]
+    fn samples_take_back(&self, _: &Paused, _: Option<Cue>) -> bool {
+        false
     }
 
     /// Take the paused game back (the same game goes on): keep the instruments, the round and the pending
@@ -2393,11 +2412,14 @@ impl VoraxSession {
             return;
         }
         self.clock = self.clock.max(at_ms);
-        // Collecting samples: the frame may be saved, and is never read.
+        // Collecting samples: the frame may be saved, and is never read; none of the resolve animation (the battle
+        // has no gate).
         #[cfg(feature = "dev-samples")]
-        if let Some(s) = &mut self.samples {
-            if let Some(log) = &mut self.log {
-                s.frame(&mut self.learn, log, &frame, at_ms, self.mode);
+        if self.samples.is_some() {
+            let (mode, ui) = (self.mode, self.ui());
+            let animating = mode != Mode::Battle && self.gate_closed(at_ms);
+            if let (Some(s), Some(log), false) = (&mut self.samples, &mut self.log, animating) {
+                s.frame(&mut self.learn, log, &frame, at_ms, mode, ui);
             }
             return;
         }
@@ -3420,6 +3442,14 @@ impl VoraxSession {
     pub fn log_window(&mut self, window: &str) {
         if let Some(log) = &mut self.log {
             log.window(json!({ "window": window, "ocr": crate::reader::ocr::language() }));
+        }
+    }
+
+    /// The window language was switched, so OCR is made again for it: the window row is written again with the new
+    /// `ocr` (as Tartarus's [`super::session::Session::log_language`]); nothing before the first window row.
+    pub fn log_language(&mut self) {
+        if let Some(log) = &mut self.log {
+            log.set_ocr(crate::reader::ocr::language());
         }
     }
 
@@ -5547,23 +5577,71 @@ mod tests {
         s.board_cue(Cue::Dealt, 5_000);
         s.read(frame(120), 5_300, "auto");
         s.read(frame(60), 5_700, "auto");
+        // A confirm closes the gate: the resolve animation is neither saved nor counted, until the deal opens it
+        // (the times as a real confirm: the deal 1 s after it).
+        s.board_cue(Cue::Synced, 6_000);
+        assert!(s.gate_closed(6_700));
+        s.read(frame(90), 6_700, "auto");
+        s.board_cue(Cue::Dealt, 7_000);
+        assert!(!s.gate_closed(7_700));
+        s.read(frame(150), 7_700, "auto");
         assert!(s.view().advice.is_none());
         s.log().unwrap().wait();
-        assert_eq!(files_named(&root, samples::PREFIX).len(), 3);
+        assert_eq!(files_named(&root, samples::PREFIX).len(), 4);
         let rows = rows_of(s, &root);
         assert!(kinds(&rows, "vorax_read").is_empty() && kinds(&rows, "vorax_advice").is_empty());
         let saved = kinds(&rows, samples::EVENT);
         let got: Vec<(&str, i64)> = saved.iter().map(|r| (r["why"].as_str().unwrap_or(""), r["index"].as_i64().unwrap_or(0))).collect();
         // 2.0 s the first frame; after the resume 4.5 s is the same screen as the last saved (not again), 4.6 s a new
         // one 2.6 s after it (index 2: the count went on); 5.3 s too early after the deal and inside the spacing;
-        // 5.7 s the hand.
-        assert_eq!(got, [("interval", 1), ("interval", 2), ("hand", 3)]);
+        // 5.7 s the hand; 6.7 s inside the gate (not saved, though the confirm's hand was due); 7.7 s the next hand.
+        assert_eq!(got, [("interval", 1), ("interval", 2), ("hand", 3), ("hand", 4)]);
         // Observe modes off: not entered, nothing saved.
         let (mut s, root) = english_observing("off");
         s.configure(Config { observe: false, learn: false, ..s.config.clone() });
         assert_eq!(s.note_cue(page(Page::Main, Run), Some(1_000)), ModeChange::None);
         assert_eq!(s.view().blocked.as_deref(), Some(NOT_ZH));
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A game on the board with a finished game's picks and no round read, closed after its last confirm: paused.
+    fn paused_with_its_picks(s: &mut VoraxSession) {
+        use PageState::{Destory, Run};
+        assert_eq!(s.note_cue(page(Page::Main, Run), Some(1_000)), ModeChange::Entered);
+        s.game.picks = LAST_ROUND as u32;
+        assert_eq!(s.note_cue(page(Page::Main, Destory), Some(2_000)), ModeChange::Left);
+        assert_eq!(s.paused.as_ref().map(|p| (p.last_round, p.game.picks)), Some((0, LAST_ROUND as u32)));
+    }
+
+    /// Private builds only, as 2026-11-07_14-43-32: collecting samples, the board closed after the last confirm and
+    /// the result page 0.67 s on takes the paused game back into Result (no round is read, its picks tell), so the
+    /// page is saved; start surgery goes on into the battle.
+    #[cfg(feature = "dev-samples")]
+    #[test]
+    fn collecting_samples_the_result_page_takes_the_game_back() {
+        let (mut s, root) = english_observing("reward");
+        paused_with_its_picks(&mut s);
+        assert!(s.samples.is_some());
+        assert_eq!(s.note_cue(page(Page::Reward, PageState::Run), Some(2_670)), ModeChange::Entered);
+        assert_eq!(s.mode(), Mode::Result);
+        assert!(s.paused.is_none(), "taken back");
+        assert!(s.samples.is_some(), "still collecting");
+        assert_eq!(s.note_cue(Cue::Fight, Some(4_200)), ModeChange::None);
+        assert_eq!(s.mode(), Mode::Battle);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Not collecting samples (a Traditional Chinese client, any build), as before: the result page alone does not
+    /// take back a paused game whose round is unknown.
+    #[test]
+    fn not_collecting_samples_the_result_page_alone_takes_nothing_back() {
+        let mut s = session();
+        paused_with_its_picks(&mut s);
+        #[cfg(feature = "dev-samples")]
+        assert!(s.samples.is_none());
+        assert_eq!(s.note_cue(page(Page::Reward, PageState::Run), Some(2_670)), ModeChange::None);
+        assert_eq!(s.mode(), Mode::Off);
+        assert!(s.paused.is_some());
     }
 
     /// Without the feature (the public build), as in 1.0.2: an English client with observe mode on and a log folder

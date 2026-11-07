@@ -29,6 +29,11 @@ use std::sync::Arc;
 use std::sync::mpsc::{Receiver, TryRecvError, channel};
 use std::time::SystemTime;
 
+/// How long after a run's run_end row the riot battle's boss still goes into that run's folder (see
+/// [`Session::log_riot_boss`]): the battle starts a second after the checkout and its boss row comes when the game
+/// leaves it, 64 s after the checkout on 2026-11-07; the next run is a few minutes off at the least.
+const RIOT_AFTER_END: std::time::Duration = std::time::Duration::from_secs(600);
+
 /// Rounds the worker plays between two partial rankings.
 pub const ROUND: usize = 50;
 /// The seed of the board's hidden parts and of the playouts, as in `ascendant-cli solve`.
@@ -1288,6 +1293,13 @@ struct Progress {
     options: Vec<SolveOption>,
 }
 
+/// The manage screen's Hunt values, kept for the Hunt's target pick (see [`Session::loot`]): the expected loot of a
+/// Hunt on each target cell whose playouts ran, and the cells the board had when they were solved.
+struct ManageHunt {
+    cells: Vec<CellModel>,
+    values: Vec<(usize, f64)>,
+}
+
 pub struct Session {
     pub reading: Option<Reading>,
     /// Set by the riot screen that ends a run: the line the window shows in
@@ -1376,7 +1388,9 @@ pub struct Session {
     /// The last run's check (see [`super::health`]), and its channel while
     /// it runs.
     pub health: Option<super::health::Report>,
-    health_rx: Option<Receiver<super::health::Report>>,
+    health_rx: Option<Receiver<(super::health::Report, std::path::PathBuf)>>,
+    /// The folder of the run `health` checked, for the run check window.
+    pub health_dir: Option<std::path::PathBuf>,
     /// Since when `problems` has held one, see [`Session::notice`].
     problems_since: Option<std::time::Instant>,
     /// The last model of a patrol, manage or Sewer Ratway cell pick screen, corrections included:
@@ -1496,6 +1510,10 @@ pub struct Session {
     /// The expected loot `manage_bite` was solved with (its playouts ran), for its target screen's first bite: forced
     /// there, that bite is not played out (see [`Session::loot`]). Set and cleared with `manage_bite`.
     manage_loot: Option<f64>,
+    /// The manage screen's Hunt values by target cell (those whose playouts ran) and the cells they were solved on, for
+    /// the Hunt's target pick: with one target it is forced there and not played out (see [`Session::loot`]). Set with
+    /// `manage_bite`, cleared with it.
+    manage_hunt: Option<ManageHunt>,
     /// The last Consume target read showed the eater's cell locked after an
     /// Exalted eater's bite: it went to the vault, see [`Session::solve`].
     eater_vaulted: bool,
@@ -1504,6 +1522,9 @@ pub struct Session {
     /// The last read taken came after a bite the game's log counted: its
     /// Consume target screen is a chain's, whatever its cells show.
     bite_logged: bool,
+    /// The folder of the run that just ended with a run_end row, and when: the riot battle that follows the run's
+    /// checkout writes its boss there (see [`Session::log_riot_boss`]). Cleared by the next run's start.
+    ended: Option<(std::path::PathBuf, std::time::Instant)>,
     /// The game's log said the run's objective completed.
     objective_done: bool,
     /// The day the game's log last said Consume was pressed on.
@@ -1688,6 +1709,7 @@ impl Session {
             run_over_at: None,
             health: None,
             health_rx: None,
+            health_dir: None,
             problems_since: None,
             board: None,
             consume: None,
@@ -1723,9 +1745,11 @@ impl Session {
             offered_wide: None,
             manage_bite: None,
             manage_loot: None,
+            manage_hunt: None,
             eater_vaulted: false,
             overlay_seen: false,
             bite_logged: false,
+            ended: None,
             objective_done: false,
             consumed_on: None,
             played_at: None,
@@ -2624,6 +2648,9 @@ impl Session {
         if new_run && let Some(log) = &mut self.log {
             log.new_run();
         }
+        if new_run {
+            self.ended = None;
+        }
         if self.days.higher.is_some() {
             self.held_before_higher = self.tools.len();
         }
@@ -2927,6 +2954,42 @@ impl Session {
     pub fn log_window(&mut self, window: &str) {
         if let Some(log) = &mut self.log {
             log.window(json!({ "window": window, "ocr": crate::reader::ocr::language() }));
+        }
+    }
+
+    /// Writes the riot battle's special boss ([`Signal::RiotBoss`]) as a `riot_boss` row: into the folder of the run
+    /// that just ended (its run_end row was written up to [`RIOT_AFTER_END`] before), else into the folder on show,
+    /// `after_run_end` saying which. `at` is when the boss came (else when its chest opened), from the game log's
+    /// times. Nothing is shown and nothing else reads the row: the run check, the review and the advice ignore it.
+    pub fn log_riot_boss(&self, boss: gamelog::RiotBoss) {
+        let Some(log) = &self.log else { return };
+        let time = |ms: i64| u64::try_from(ms).ok().map(|ms| std::time::UNIX_EPOCH + std::time::Duration::from_millis(ms));
+        let stamp = |ms: Option<i64>| ms.and_then(time).map(timestamp);
+        let at = boss.spawned_at.or(boss.chest_at).and_then(time).unwrap_or_else(SystemTime::now);
+        let ended = self.ended.as_ref().filter(|(_, at)| at.elapsed() < RIOT_AFTER_END).map(|(dir, _)| dir);
+        let fields = json!({
+            "level": gamelog::RIOT_LEVEL,
+            "npc": (boss.spawned > 0).then_some(gamelog::RIOT_BOSS_NPC),
+            "spawned": boss.spawned,
+            "warned": boss.warned,
+            "died": boss.died,
+            "died_at": stamp(boss.died_at),
+            "chests": boss.chests,
+            "chest_at": stamp(boss.chest_at),
+            "chest_drops": (boss.chests > 0).then_some(boss.chest_drops),
+            "after_run_end": ended.is_some(),
+        });
+        match ended {
+            Some(dir) => log.event_in(dir, "riot_boss", at, fields),
+            None => log.event("riot_boss", at, fields),
+        }
+    }
+
+    /// The window language was switched, so Windows OCR reads in another language now: the window line is written
+    /// again with it, and later run folders start with it.
+    pub fn log_language(&mut self) {
+        if let Some(log) = &mut self.log {
+            log.set_ocr(crate::reader::ocr::language());
         }
     }
 
@@ -3938,6 +4001,7 @@ impl Session {
                 self.eater_seen = None;
                 self.manage_bite = None;
                 self.manage_loot = None;
+                self.manage_hunt = None;
                 // In a Cage Fight the chain's badges number the bites ahead:
                 // the one on the meal just eaten goes at once, and the mark,
                 // left on that meal, hides like any other theme's until a
@@ -4020,9 +4084,15 @@ impl Session {
                 self.chain_armed = false;
                 self.manage_bite = None;
                 self.manage_loot = None;
+                self.manage_hunt = None;
                 self.moved_from = self.reading.as_ref().map(|r| r.model.warden);
             }
-            Signal::RunStart if self.reading.is_some() && self.run_over.is_none() => self.end_run(),
+            // A run under way that missed its riot screen has no riot battle after it.
+            Signal::RunStart if self.reading.is_some() && self.run_over.is_none() => {
+                self.end_run();
+                self.ended = None;
+            }
+            Signal::RunStart => self.ended = None,
             Signal::RunEnd if self.reading.is_some() => self.end_run(),
             _ => {}
         }
@@ -4359,6 +4429,8 @@ impl Session {
             if self.reading.as_ref().is_some_and(|r| r.screen == Screen::Manage) {
                 self.manage_bite = matches!(a.action, Action::Devour { .. }).then(|| a.clone());
                 self.manage_loot = self.manage_bite.as_ref().and_then(|a| self.ranking.get(a.option?)).filter(|o| o.n > 0).map(|o| o.mean);
+                let hunts: Vec<(usize, f64)> = self.ranking.iter().filter(|o| o.n > 0).filter_map(|o| if let Action::Hunt { cell } = &o.action { Some((*cell, o.mean)) } else { None }).collect();
+                self.manage_hunt = self.reading.as_ref().map(|r| ManageHunt { cells: r.model.cells.clone(), values: hunts });
             }
             // A move played since the reading's read is not held again: the
             // board before a bite, its eater not risen yet, gave the next
@@ -4430,12 +4502,20 @@ impl Session {
     /// day's first bite, forced on its target screen, takes the value the manage screen's Consume advice was solved
     /// with, when it is the bite that advice planned (the same cell, before the bite; a move or the day's end clears
     /// it); None otherwise. No playout runs for it, so the advice comes no later (2026-11-07: it showed 0.00).
+    /// A Hunt's lone target, forced on its pick, takes the manage screen's value for a Hunt on that cell, on the board
+    /// it was solved on (the pick's cells are the manage screen's, see `rebuilt`): 2026-11-07 the window wrote a dash
+    /// and the game showed no value on 11 such picks in three runs, while the manage screen had rated the Hunt.
     pub fn loot(&self, option: Option<usize>) -> Option<f64> {
         let o = self.ranking.get(option?)?;
         if o.n > 0 {
             return Some(o.mean);
         }
         let r = self.reading.as_ref()?;
+        if r.screen == Screen::CellPick && r.model.choice.kind == ChoiceKind::Prey {
+            let Action::Choose { id: ChoiceId::Cell(cell) } = &o.action else { return None };
+            let hunt = self.manage_hunt.as_ref().filter(|h| h.cells == r.model.cells)?;
+            return hunt.values.iter().find(|&&(c, _)| c == *cell).map(|&(_, mean)| mean);
+        }
         let planned = self.manage_bite.as_ref()?;
         (r.screen == Screen::ChainTarget && planned.action == o.action).then_some(self.manage_loot).flatten()
     }
@@ -4885,6 +4965,7 @@ impl Session {
         self.eater_vaulted = false;
         self.manage_bite = None;
         self.manage_loot = None;
+        self.manage_hunt = None;
         self.chain_follow.clear();
         self.chain_numbers.clear();
         self.eaten = None;
@@ -4916,10 +4997,12 @@ impl Session {
             None => tr("The run is over.").to_string(),
         });
         self.run_over_at = Some(std::time::Instant::now());
+        self.ended = None;
         if let Some(log) = &mut self.log
             && self.reading.as_ref().is_some_and(|r| r.model.day >= r.model.max_days)
         {
             log.event("run_end", SystemTime::now(), json!({ "vaulted": vaulted }));
+            self.ended = Some((log.dir().to_path_buf(), std::time::Instant::now()));
             // The run's check, once its lines are on disk (see `health`).
             let (dir, written) = (log.dir().to_path_buf(), log.flushed());
             let (tx, rx) = channel();
@@ -4930,7 +5013,7 @@ impl Session {
                 let crash = super::settings::app_dir().map(|d| d.join("crash.log"));
                 if let Some(report) = super::health::check(&dir, crash.as_deref()) {
                     let _ = std::fs::write(dir.join("health.txt"), report.text());
-                    let _ = tx.send(report);
+                    let _ = tx.send((report, dir));
                 }
                 if let Some(notify) = &notify {
                     notify();
@@ -4972,6 +5055,7 @@ impl Session {
         self.held = None;
         self.manage_bite = None;
         self.manage_loot = None;
+        self.manage_hunt = None;
         self.bite_logged = false;
         self.objective_done = false;
         self.consumed_on = None;
@@ -5027,8 +5111,8 @@ impl Session {
                 Err(TryRecvError::Empty) => {}
             }
         }
-        if let Some(report) = self.health_rx.as_ref().and_then(|rx| rx.try_recv().ok()) {
-            self.health = Some(report);
+        if let Some((report, dir)) = self.health_rx.as_ref().and_then(|rx| rx.try_recv().ok()) {
+            (self.health, self.health_dir) = (Some(report), Some(dir));
             self.health_rx = None;
             changed = true;
         }
@@ -5348,6 +5432,83 @@ mod tests {
         assert_eq!(s.loot(Some(0)), Some(7.25), "played out: its own mean");
         assert_eq!(s.loot(None), None);
         assert_eq!(s.loot(Some(3)), None);
+    }
+
+    /// The riot battle's boss goes into the folder of the run that just ended, as one riot_boss row with the game
+    /// log's times; with no run just ended, or after the next run's start, into the folder on show.
+    #[test]
+    fn the_riot_boss_goes_to_the_run_just_ended() {
+        let root = std::env::temp_dir().join(format!("ascendant-riot-boss-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let mut s = Session::new(100, Vec::new(), None, Some(10));
+        s.log = Some(RunLog::new(root.clone()));
+        let rows = |dir: &std::path::Path| -> Vec<serde_json::Value> {
+            std::fs::read_to_string(dir.join("log.jsonl")).unwrap_or_default().lines().map(|l| serde_json::from_str(l).unwrap()).collect()
+        };
+        let log = s.log.as_mut().unwrap();
+        log.event("run_end", SystemTime::now(), json!({ "vaulted": 5 }));
+        let ended = log.dir().to_path_buf();
+        log.new_run();
+        s.ended = Some((ended.clone(), std::time::Instant::now()));
+        // 2026-11-07 14:39:55.306 UTC and the times after it.
+        let at = 1_794_062_395_306;
+        let boss = gamelog::RiotBoss { spawned: 1, spawned_at: Some(at), warned: true, died: true, died_at: Some(at + 922), chests: 1, chest_at: Some(at + 2747), chest_drops: 97 };
+        s.log_riot_boss(boss);
+        s.log.as_ref().unwrap().wait();
+        let got = rows(&ended);
+        assert_eq!(got.len(), 2);
+        let row = &got[1];
+        assert_eq!(row["kind"], "riot_boss");
+        assert_eq!(row["at"], "2026-11-07T14:39:55.306Z");
+        assert_eq!((row["npc"].as_u64(), row["level"].as_u64(), row["spawned"].as_u64()), (Some(5_026_001), Some(235_501), Some(1)));
+        assert_eq!((row["warned"].as_bool(), row["died"].as_bool(), row["died_at"].as_str()), (Some(true), Some(true), Some("2026-11-07T14:39:56.228Z")));
+        assert_eq!((row["chests"].as_u64(), row["chest_at"].as_str(), row["chest_drops"].as_u64()), (Some(1), Some("2026-11-07T14:39:58.053Z"), Some(97)));
+        assert_eq!(row["after_run_end"], true);
+        // The next run started: the folder on show, which a riot_boss row makes.
+        s.note_game(Signal::RunStart);
+        assert!(s.ended.is_none());
+        s.log_riot_boss(gamelog::RiotBoss { chests: 1, chest_at: Some(at), chest_drops: 3, ..Default::default() });
+        let current = s.log.as_ref().unwrap().dir().to_path_buf();
+        s.log.as_ref().unwrap().wait();
+        assert_eq!(rows(&ended).len(), 2, "the ended run's folder is left alone");
+        let got = rows(&current);
+        let row = got.iter().find(|r| r["kind"] == "riot_boss").unwrap();
+        assert_eq!((row["after_run_end"].as_bool(), row["npc"].is_null(), row["died"].as_bool(), row["chest_drops"].as_u64()), (Some(false), true, Some(false), Some(3)));
+        drop(s);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A Hunt's pick with one target is not played out: it shows the value the manage screen's Hunt on that cell was
+    /// solved with, on the board it was solved on; another cell, another board, a Ratway move or no manage value give
+    /// none (2026-11-07, day 3: the window wrote a dash and the game showed no value).
+    #[test]
+    fn a_lone_hunt_target_takes_the_manage_value() {
+        let mut s = Session::new(100, Vec::new(), None, Some(10));
+        let pick = |cell: usize, mean: f64, n: usize| SolveOption { label: String::new(), action: Action::Choose { id: ChoiceId::Cell(cell) }, mean, se: 0.0, gap_se: 0.0, n, best: 0.0, policy: true };
+        let mut model = board();
+        model.choice.kind = ChoiceKind::Prey;
+        let on = |model: &Model, screen: Screen| Some(Reading { model: model.clone(), warnings: Vec::new(), screen, days_left: None, at: SystemTime::now(), eater_inferred: false });
+        s.reading = on(&model, Screen::CellPick);
+        s.ranking = vec![pick(6, 0.0, 0)];
+        assert_eq!(s.loot(Some(0)), None, "no manage value to take it from");
+        s.manage_hunt = Some(ManageHunt { cells: model.cells.clone(), values: vec![(4, 10.5), (6, 11.627)] });
+        assert_eq!(s.loot(Some(0)), Some(11.627), "the manage screen's Hunt on that cell");
+        s.ranking = vec![pick(2, 0.0, 0)];
+        assert_eq!(s.loot(Some(0)), None, "the manage screen did not rate a Hunt on this cell");
+        s.ranking = vec![pick(6, 0.0, 0)];
+        let mut replaced = model.cells.clone();
+        replaced[6] = inmate(Beast::Lion, 3);
+        assert_ne!(replaced, model.cells);
+        s.manage_hunt = Some(ManageHunt { cells: replaced, values: vec![(6, 11.627)] });
+        assert_eq!(s.loot(Some(0)), None, "solved on another board (a Replace since)");
+        s.manage_hunt = Some(ManageHunt { cells: model.cells.clone(), values: vec![(6, 11.627)] });
+        let mut ratway = model.clone();
+        ratway.choice.kind = ChoiceKind::Cell;
+        s.reading = on(&ratway, Screen::CellPick);
+        assert_eq!(s.loot(Some(0)), None, "a Ratway move is no Hunt");
+        s.reading = on(&model, Screen::CellPick);
+        s.ranking = vec![pick(6, 12.5, 1600), pick(4, 10.0, 1600)];
+        assert_eq!(s.loot(Some(0)), Some(12.5), "played out: its own mean");
     }
 
     /// A live session in a chain on `board`, its first bite taken.

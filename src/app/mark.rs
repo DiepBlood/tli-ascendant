@@ -4,6 +4,7 @@
 //! through, drawn from a premultiplied BGRA bitmap.
 
 use super::capture::{dpi_aware, ours};
+use std::sync::atomic::{AtomicBool, Ordering};
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, SIZE, WPARAM};
 use windows::Win32::Foundation::RECT;
 use windows::Win32::Graphics::Gdi::{
@@ -12,7 +13,7 @@ use windows::Win32::Graphics::Gdi::{
     DeleteObject, DrawTextW, FW_BOLD, GdiFlush, HDC, OUT_DEFAULT_PRECIS, SelectObject, SetBkMode, SetTextColor, TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON};
+use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON, VK_MBUTTON, VK_RBUTTON};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, GetCursorPos, RegisterClassW, SW_HIDE, SW_SHOWNOACTIVATE, ShowWindow, ULW_ALPHA,
     UpdateLayeredWindow, WNDCLASSW, WindowFromPoint, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
@@ -62,6 +63,13 @@ const SAME_SHARE: f32 = 0.25;
 /// button under the cursor floats up; the buttons stand side by side, and
 /// cells and cards sit at fixed heights.
 const SAME_SHARE_Y: f32 = 0.5;
+/// How far outside the target, in reference px, a click still counts as one on its mark (see [`hit_rect`]): the loud
+/// box's line, PAD out and LOUD_STROKE wide, ends PAD + LOUD_STROKE / 2 = 12.5 out; the other 4.5 are slack for the
+/// cursor moving on between the click and the next look, 50 ms later. Tighter than the glow: a cell is 87 screen px
+/// half high at 1440p and the next row's centre 187 px down (the 2026-11-07 run log's mark_at), so 17 reaches 10 px
+/// into the cell below; the decision buttons stand 460 px apart (Consume 590, Replace 1050, Hunt 1510, End 1970 on
+/// that run's manage frame) and the doors 440 wide, clear of each other.
+const HIT_PAD: f32 = PAD + LOUD_STROKE;
 
 /// How a mark is drawn: its lines thicker on a target pick.
 #[derive(Clone, Copy, PartialEq)]
@@ -517,26 +525,145 @@ fn segment(x: f32, y: f32, a: (f32, f32), b: (f32, f32)) -> f32 {
     (ex * ex + ey * ey).sqrt()
 }
 
-/// Clears the left button's pressed-since-last-call bit, so the next
-/// [`clicked_in`] sees only clicks after this call.
-pub fn forget_clicks() {
+/// A mouse button, as [`button_down`] reads it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Button {
+    Left,
+    Right,
+    Middle,
+}
+
+/// Each button's "pressed since the last call" bit (by [`Button`] in order), kept for [`Clicks`]: Windows clears it
+/// for the whole process on every `GetAsyncKeyState` call, and click-through's thread reads the buttons too (see
+/// [`button_down`]), so a quick click between two looks went to whichever read first.
+static PRESSED: [AtomicBool; 3] = [const { AtomicBool::new(false) }; 3];
+
+/// Whether `button` is down now. Every read of the mouse buttons in this app goes through here, so the bit "pressed
+/// since the last call" that the read clears is kept in [`PRESSED`] for [`Clicks`] whoever read it.
+pub fn button_down(button: Button) -> bool {
+    let vk = match button {
+        Button::Left => VK_LBUTTON,
+        Button::Right => VK_RBUTTON,
+        Button::Middle => VK_MBUTTON,
+    };
     // SAFETY: a plain Win32 call.
-    unsafe {
-        GetAsyncKeyState(VK_LBUTTON.0 as i32);
+    let state = unsafe { GetAsyncKeyState(vk.0 as i32) } as u16;
+    if state & 1 != 0 {
+        PRESSED[button as usize].store(true, Ordering::SeqCst);
+    }
+    state & 0x8000 != 0
+}
+
+/// Whether `button` was pressed since the last look (any read in this app counts, see [`button_down`]); clears it.
+fn take_pressed(button: Button) -> bool {
+    PRESSED[button as usize].swap(false, Ordering::SeqCst)
+}
+
+/// One look at the mouse for [`Clicks`]: whether the left button is down, whether it was pressed since the last look,
+/// whether the right or middle button is down or was pressed since (`other`), and where the cursor is in physical
+/// screen px (None when it is on this app's own window over the game, or unknown).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Look {
+    pub down: bool,
+    pub pressed: bool,
+    pub other: bool,
+    pub at: Option<(i32, i32)>,
+}
+
+/// Looks at the buttons and the cursor now, see [`Look`]. It takes the "pressed since" bits: one call per look.
+pub fn look() -> Look {
+    // SAFETY: plain Win32 calls; the point is a valid out pointer.
+    let (down, other, cursor) = dpi_aware(|| {
+        let down = button_down(Button::Left);
+        // Both read, not one or the other: each read keeps its own "pressed since" bit.
+        let (right, middle) = (button_down(Button::Right), button_down(Button::Middle));
+        let mut p = POINT::default();
+        (down, right || middle, unsafe { GetCursorPos(&mut p).ok().map(|_| (p, WindowFromPoint(p))) })
+    });
+    let pressed = take_pressed(Button::Left);
+    let other = other | take_pressed(Button::Right) | take_pressed(Button::Middle);
+    Look { down, pressed, other, at: cursor.filter(|&(_, under)| !ours(under)).map(|(p, _)| (p.x, p.y)) }
+}
+
+/// One click as [`Clicks`] saw it, in physical screen px: where the button went down, where it came up, and the box
+/// around every cursor position seen while it was held (`min`, `max`, the two ends included).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Click {
+    pub down: (i32, i32),
+    pub up: (i32, i32),
+    pub min: (i32, i32),
+    pub max: (i32, i32),
+}
+
+impl Click {
+    /// A click down and up at `p` without moving.
+    pub fn at(p: (i32, i32)) -> Click {
+        Click { down: p, up: p, min: p, max: p }
+    }
+
+    /// The click with the cursor seen at `p` too, which is where it is now.
+    fn through(self, p: (i32, i32)) -> Click {
+        Click { up: p, min: (self.min.0.min(p.0), self.min.1.min(p.1)), max: (self.max.0.max(p.0), self.max.1.max(p.1)), ..self }
     }
 }
 
-/// Whether the left button is down, or was pressed since the last call,
-/// with the cursor in `rect` (left, top, width, height in physical screen px)
-/// and not on this app's own window over the game.
-pub fn clicked_in([left, top, width, height]: [i32; 4]) -> bool {
-    // SAFETY: plain Win32 calls; the point is a valid out pointer.
-    let (state, cursor) = dpi_aware(|| unsafe {
-        let mut p = POINT::default();
-        (GetAsyncKeyState(VK_LBUTTON.0 as i32), GetCursorPos(&mut p).ok().map(|_| (p, WindowFromPoint(p))))
-    });
-    let pressed = state as u16 & 0x8001 != 0;
-    pressed && cursor.is_some_and(|(p, under)| (left..left + width).contains(&p.x) && (top..top + height).contains(&p.y) && !ours(under))
+/// The left button's clicks as a game button takes them: pressed on it, held without leaving it, and released on it
+/// (2026-11-08, the user: pressed on the box and let go elsewhere, and pressed on it, moved off and back and let go
+/// on it: the game played neither and the box went). From looks 50 ms apart, every cursor position seen while held
+/// goes into the click's box ([`Click::min`], [`Click::max`]); a move off and back between two looks is not seen. The
+/// right or middle button pressed while the left is held cancels it too (2026-11-08, the user: the game dropped the
+/// pick); one pressed by the look the left first shows down, or comes up, counts as during it, the order unknown. A
+/// click quicker than the looks, down and up between two, shows only as "pressed since": the cursor then is taken
+/// for the whole click.
+#[derive(Default)]
+pub struct Clicks {
+    /// The button is down since a look: the click so far, None when it does not count (it went down on this app's
+    /// window or was held over it, or was down already when the clicks were forgotten).
+    held: Option<Option<Click>>,
+}
+
+impl Clicks {
+    /// Forgets the clicks so far (no mark was on show): a press under way does not count when it comes up.
+    pub fn forget(&mut self) {
+        let down = button_down(Button::Left);
+        for button in [Button::Left, Button::Right, Button::Middle] {
+            button_down(button);
+            take_pressed(button);
+        }
+        self.held = down.then_some(None);
+    }
+
+    /// The click that ended by `look`, every position seen on the game; None while the button is down, when there
+    /// was no click, when the cursor was on this app's window (or unknown) at a look while it was held, or when the
+    /// right or middle button was pressed meanwhile.
+    pub fn next(&mut self, look: Look) -> Option<Click> {
+        let at = look.at.filter(|_| !look.other);
+        if look.down {
+            let held = match self.held {
+                None => at.map(Click::at),
+                Some(click) => click.zip(at).map(|(click, p)| click.through(p)),
+            };
+            self.held = Some(held);
+            return None;
+        }
+        match self.held.take() {
+            Some(click) => click.zip(at).map(|(click, p)| click.through(p)),
+            None if look.pressed => at.map(Click::at),
+            None => None,
+        }
+    }
+}
+
+/// Whether the point `(x, y)` lies in `rect` (left, top, width, height, all in the same px).
+pub fn inside([left, top, width, height]: [i32; 4], (x, y): (i32, i32)) -> bool {
+    (left..left + width).contains(&x) && (top..top + height).contains(&y)
+}
+
+/// Where a click counts as one on the mark of target `[x, y, half_w, half_h, unit]` (screen px, see [`Mark::show`]):
+/// the target and [`HIT_PAD`] reference px around it, as left, top, width and height in screen px.
+pub fn hit_rect([x, y, half_w, half_h, unit]: [f32; 5]) -> [i32; 4] {
+    let (w, h) = (half_w + HIT_PAD * unit, half_h + HIT_PAD * unit);
+    [(x - w).floor() as i32, (y - h).floor() as i32, (2.0 * w).ceil() as i32, (2.0 * h).ceil() as i32]
 }
 
 #[cfg(test)]
@@ -563,6 +690,21 @@ mod tests {
         assert!(same_target(&button(800.0), &button(770.0)), "a button floated up under the cursor");
         assert!(!same_target(&cell(500.0), &[500.0 * u, 575.0 * u, 65.0 * u, 65.0 * u, u]), "the cell below");
         assert!(!same_target(&door(939.0), &[939.0 * u, 835.0 * u, 70.0 * u, 70.0 * u, u]), "another size");
+    }
+
+    /// At 1440p a hunt target in the top row (the 2026-11-07 run's cell 06, mark_at 1862, 187, 87 x 87): a click on
+    /// it or on its box counts; one a little past the box, on the next cell along or on the row below does not.
+    #[test]
+    fn a_click_counts_on_the_target_and_its_box() {
+        let u = 4.0 / 3.0;
+        let hit = hit_rect([1862.0, 187.0, 87.0, 87.0, u]);
+        assert_eq!(hit, [1752, 77, 220, 220]);
+        assert!(inside(hit, (1862, 187)), "the target's centre");
+        assert!(inside(hit, (1862 + 87 + 16, 187)), "on the loud box's line (12.5 reference px out)");
+        assert!(!inside(hit, (1862 + 111, 187)), "past the box and its slack");
+        assert!(!inside(hit, (1629, 187)), "the next cell along");
+        assert!(!inside(hit, (1862, 374)), "the cell below");
+        assert!(!inside(hit, (300, 700)), "elsewhere on the game");
     }
 
     /// A 4 x 3 bitmap at (10, 20), each pixel's blue its index: clipped at

@@ -79,6 +79,126 @@ pub enum Signal {
     /// The game's UI scale changed or was applied again: `micro` is the HUD page's ([`HUD_PAGE`]) `PageScale` in
     /// millionths (0.66702182888985 -> 667022). See [`ui_scale`].
     UiScale { micro: u32 },
+    /// The riot battle after a run (level [`RIOT_LEVEL`]) had its special boss or the boss's chest; sent once the
+    /// game leaves that level, see [`Riot`]. Only written to the run log: nothing is shown, read or advised on it.
+    RiotBoss(RiotBoss),
+}
+
+/// The riot battle's level: the run's checkout (`S16GamePlayCheckOut`) starts it with
+/// `Btn_S16GamePlay_CheckOut_StartChallenge`, the game logging `LevelMgr:_EnterLevelSuccess() 235501` and
+/// `UGameMgr::EnterLevel(235501) mode=2`; the town (`110`) comes after it.
+pub const RIOT_LEVEL: u32 = 235_501;
+/// The riot battle's special boss (`Monster Created: npc id 5026001 rarity 4`, its skin `TaLuoSiDeYuZu`): one riot
+/// battle in three on 2026-11-07, 35 s in, right after Liliah's line [`RIOT_BOSS_LINE`].
+pub const RIOT_BOSS_NPC: u32 = 5_026_001;
+/// Liliah's warning line 0.1 s before the boss comes: `DialogueDesc = 623136139 -> 623136139 Inmate power exceeds
+/// expectations. Please exercise caution, Warden.`
+const RIOT_BOSS_LINE: &str = "DialogueDesc = 623136139 ";
+/// The boss's death shout, a FindRow warning line as the other sound effects the game has no row for.
+const RIOT_BOSS_DIES: &str = "'Play_Boss_Elite_Shout_YuZu_Die'";
+/// The drop carrier (chest) the boss leaves: `drop carrier triggered cfgId 109034`. Its 97 drops on 2026-11-07
+/// against 0 to 28 for each of the other carriers of three riot battles.
+pub const RIOT_BOSS_CHEST: u32 = 109_034;
+/// How long after the boss's chest its drops (`UDropInstanceMgr@ AddInstance!` lines) are counted, unless another
+/// carrier comes first: the 97 came within 0.3 s on 2026-11-07.
+const CHEST_DROPS_WITHIN: i64 = 2_000;
+
+/// What one riot battle's special boss did, see [`Signal::RiotBoss`]. Times are the game log lines' UTC ms (see
+/// [`game_millis`]); None when a line had no time or did not come.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RiotBoss {
+    /// Bosses created ([`RIOT_BOSS_NPC`]); 0 when only the chest was seen.
+    pub spawned: u32,
+    /// When the first was created.
+    pub spawned_at: Option<i64>,
+    /// Liliah warned of it ([`RIOT_BOSS_LINE`]).
+    pub warned: bool,
+    /// The boss's death shout played.
+    pub died: bool,
+    /// When it first played.
+    pub died_at: Option<i64>,
+    /// Boss chests opened ([`RIOT_BOSS_CHEST`]).
+    pub chests: u32,
+    /// When the first chest opened.
+    pub chest_at: Option<i64>,
+    /// The drops of the boss's chests, see [`CHEST_DROPS_WITHIN`].
+    pub chest_drops: u32,
+}
+
+/// Follows the game log line by line for the riot battle's special boss (see [`RIOT_LEVEL`]): only lines while the
+/// game is in that level count, so a monster or chest of the same ids on another map is not taken. The level is
+/// known from the level lines only, so a log followed from mid battle takes nothing until the next level.
+#[derive(Default)]
+pub struct Riot {
+    level: Option<u32>,
+    boss: RiotBoss,
+    /// Drops are being counted for the chest opened at this time.
+    counting: Option<i64>,
+}
+
+impl Riot {
+    /// The [`Signal::RiotBoss`] of the riot battle just left, when the game left [`RIOT_LEVEL`] on this line and the
+    /// boss or its chest was seen there.
+    pub fn line(&mut self, line: &str) -> Option<Signal> {
+        if let Some(level) = level_entered(line) {
+            if self.level == Some(level) {
+                return None;
+            }
+            let left = std::mem::take(&mut self.boss);
+            self.level = Some(level);
+            self.counting = None;
+            return (left.spawned > 0 || left.chests > 0).then_some(Signal::RiotBoss(left));
+        }
+        if self.level != Some(RIOT_LEVEL) {
+            return None;
+        }
+        let at = game_millis(line);
+        let carrier = carrier(line);
+        if let Some(opened) = self.counting {
+            if carrier.is_some() || at.is_some_and(|at| at - opened > CHEST_DROPS_WITHIN) {
+                self.counting = None;
+            } else if line.contains("UDropInstanceMgr@ AddInstance!") {
+                self.boss.chest_drops += 1;
+            }
+        }
+        if carrier == Some(RIOT_BOSS_CHEST) {
+            self.boss.chests += 1;
+            self.boss.chest_at = self.boss.chest_at.or(at);
+            // A chest line without a time counts its drops until the next carrier or the level's end.
+            self.counting = Some(at.unwrap_or(i64::MAX - CHEST_DROPS_WITHIN));
+        } else if monster(line) == Some(RIOT_BOSS_NPC) {
+            self.boss.spawned += 1;
+            self.boss.spawned_at = self.boss.spawned_at.or(at);
+        } else if line.contains(RIOT_BOSS_LINE) {
+            self.boss.warned = true;
+        } else if line.contains(RIOT_BOSS_DIES) {
+            self.boss.died = true;
+            self.boss.died_at = self.boss.died_at.or(at);
+        }
+        None
+    }
+}
+
+/// The number right after `key` in `line`, up to the first character that is not a digit.
+fn number_after(line: &str, key: &str) -> Option<u32> {
+    let rest = line.split_once(key)?.1;
+    let end = rest.find(|c: char| !c.is_ascii_digit()).unwrap_or(rest.len());
+    rest[..end].parse().ok()
+}
+
+/// The level a `LevelMgr:_EnterLevelSuccess() 235501` or `UGameMgr::EnterLevel(235501) mode=2 reload=0.` line enters.
+fn level_entered(line: &str) -> Option<u32> {
+    number_after(line, "LevelMgr:_EnterLevelSuccess() ").or_else(|| number_after(line, "UGameMgr::EnterLevel("))
+}
+
+/// The npc id of a `Monster Created: npc id 5026001 rarity 4` line.
+fn monster(line: &str) -> Option<u32> {
+    number_after(line, "Monster Created: npc id ")
+}
+
+/// The cfgId of a `drop carrier triggered cfgId 109034 ety id 5041` line.
+fn carrier(line: &str) -> Option<u32> {
+    number_after(line, "drop carrier triggered cfgId ")
 }
 
 /// The page whose `PageScale` is the game's UI scale setting: the HUD, applied on every level entered. The prison
@@ -590,6 +710,7 @@ pub fn follow(path: &Path, stopped: &AtomicBool, mut on: impl FnMut(Signal, Opti
     }
     let mut partial = String::new();
     let mut cards = Cards::default();
+    let mut riot = Riot::default();
     let mut missing_since: Option<std::time::Instant> = None;
     let mut last_new = std::time::Instant::now();
     while !stopped.load(Ordering::Relaxed) {
@@ -607,6 +728,8 @@ pub fn follow(path: &Path, stopped: &AtomicBool, mut on: impl FnMut(Signal, Opti
         let len = file.metadata().map_or(0, |m| m.len());
         if len < at {
             (at, partial) = (0, String::new());
+            // A new log (the game restarted, maybe mid-battle): a battle the old log left open ended with it.
+            riot = Riot::default();
         }
         if len == at {
             continue;
@@ -624,6 +747,9 @@ pub fn follow(path: &Path, stopped: &AtomicBool, mut on: impl FnMut(Signal, Opti
         // The last line may still be written: it waits for its end.
         let complete = partial.rfind('\n').map_or(0, |k| k + 1);
         for line in partial[..complete].lines() {
+            if let Some(boss) = riot.line(line) {
+                on(boss, game_millis(line));
+            }
             if let Some(signal) = cards.signal(line) {
                 on(signal, game_millis(line));
             }
@@ -635,6 +761,77 @@ pub fn follow(path: &Path, stopped: &AtomicBool, mut on: impl FnMut(Signal, Opti
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The riot boss signals of a game log's lines, as [`follow`] sends them.
+    fn riot_of(text: &str) -> Vec<Signal> {
+        let mut riot = Riot::default();
+        text.lines().filter_map(|line| riot.line(line)).collect()
+    }
+
+    /// The 2026-11-07 14:39 riot battle (tests/fixtures/riot-boss-C.log: its level, monster, dialogue, boss shout,
+    /// carrier and drop lines from UE_game.log, and the town's level lines after it): one boss, warned, killed, and
+    /// its chest's 97 drops; the 2 drops after the 2 s are not the chest's. The signal comes as the game enters the
+    /// town, once.
+    #[test]
+    fn the_riot_boss_of_a_real_battle() {
+        let text = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/riot-boss-C.log")).unwrap();
+        let ms = |stamp: &str| game_millis(&format!("[2026.11.07-{stamp}][1]")).unwrap();
+        let boss = RiotBoss {
+            spawned: 1,
+            spawned_at: Some(ms("14.39.55:306")),
+            warned: true,
+            died: true,
+            died_at: Some(ms("14.39.56:228")),
+            chests: 1,
+            chest_at: Some(ms("14.39.58:053")),
+            chest_drops: 97,
+        };
+        assert_eq!(riot_of(&text), [Signal::RiotBoss(boss)]);
+        let town = text.lines().position(|l| l.contains("_EnterLevelSuccess() 110")).unwrap();
+        let mut riot = Riot::default();
+        let sent: Vec<usize> = text.lines().enumerate().filter_map(|(k, line)| riot.line(line).map(|_| k)).collect();
+        assert_eq!(sent, [town], "sent on the town's first level line");
+    }
+
+    /// The 2026-11-07 14:30 riot battle had no boss (tests/fixtures/riot-boss-A.log, the same lines): no signal,
+    /// though its other monsters and carriers drop as the boss's would.
+    #[test]
+    fn no_riot_boss_in_a_battle_without_one() {
+        let text = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/riot-boss-A.log")).unwrap();
+        assert!(text.contains("Monster Created: npc id ") && text.contains("UDropInstanceMgr@ AddInstance!"));
+        assert_eq!(riot_of(&text), []);
+    }
+
+    /// Only the riot level counts, and only the boss's own ids: the same lines on another map, another npc or
+    /// carrier whose id starts with the boss's, or a log followed from mid battle give nothing. A battle left
+    /// without its level line (the log followed from the middle) is not taken either.
+    #[test]
+    fn the_riot_boss_only_in_the_riot_level() {
+        let line = |stamp: &str, text: &str| format!("[2026.11.07-14.39.{stamp}][805]TLGame: Display: [Game] {text}\n");
+        let boss = line("55:306", "Monster Created: npc id 5026001 rarity 4");
+        let chest = line("58:053", "drop carrier triggered cfgId 109034 ety id 5041");
+        let drop = line("58:313", "UDropInstanceMgr@ AddInstance! InstanceId = 507 InstanceIndex = 0");
+        let enter = |level: &str| line("20:819", &format!("LevelMgr:_EnterLevelSuccess() {level}"));
+        let town = enter("110");
+        // Another map.
+        assert_eq!(riot_of(&format!("{}{boss}{chest}{drop}{}", enter("5301"), enter("110"))), []);
+        // No level line seen: the log followed from mid battle.
+        assert_eq!(riot_of(&format!("{boss}{chest}{drop}{town}")), []);
+        // Ids that only start like the boss's.
+        let others = format!("{}{}", line("55:306", "Monster Created: npc id 50260011 rarity 4"), line("58:053", "drop carrier triggered cfgId 1090345 ety id 1"));
+        assert_eq!(riot_of(&format!("{}{others}{drop}{town}", enter("235501"))), []);
+        // The chest alone still counts, with its drop; the level's second line does not start it again.
+        let again = line("23:459", "UGameMgr::EnterLevel(235501) mode=2 reload=0.");
+        let got = riot_of(&format!("{}{again}{chest}{drop}{town}", enter("235501")));
+        assert!(matches!(got.as_slice(), [Signal::RiotBoss(RiotBoss { spawned: 0, chests: 1, chest_drops: 1, died: false, .. })]), "{got:?}");
+        // Another carrier ends the count, as do 2 s.
+        let next = line("58:400", "drop carrier triggered cfgId 109006 ety id 9");
+        let late = "[2026.11.07-14.40.00:200][805]TLGame: Display: [Game] UDropInstanceMgr@ AddInstance! InstanceId = 600 InstanceIndex = 0\n";
+        let got = riot_of(&format!("{}{boss}{chest}{drop}{next}{drop}{town}", enter("235501")));
+        assert!(matches!(got.as_slice(), [Signal::RiotBoss(RiotBoss { spawned: 1, chest_drops: 1, .. })]), "{got:?}");
+        let got = riot_of(&format!("{}{boss}{chest}{drop}{}{late}{town}", enter("235501"), line("58:900", "UDropInstanceMgr@ AddInstance! InstanceId = 508 InstanceIndex = 1")));
+        assert!(matches!(got.as_slice(), [Signal::RiotBoss(RiotBoss { chest_drops: 2, .. })]), "{got:?}");
+    }
 
     /// Original text of the 2026-11-04 log: accumulated progress of Vorax (Coin_826) and Tartarus (Coin_828); other
     /// Coins do not count.

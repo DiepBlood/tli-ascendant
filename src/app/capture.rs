@@ -1360,6 +1360,8 @@ pub enum Event {
     /// time (UTC ms) and when it was read off the log, to see how late it
     /// comes.
     Game(Signal, Option<i64>, SystemTime),
+    /// The riot battle after a run had its special boss ([`Signal::RiotBoss`]): for the run log only.
+    RiotBoss(gamelog::RiotBoss),
 }
 
 /// The watcher's state the UI thread reaches too.
@@ -1850,6 +1852,13 @@ fn on_log_signal(signal: Signal, stamp: Option<i64>, state: &Mutex<Shared>, tx: 
         // Vorax mode (the deadlock guard) or drop a paused Vorax game.
         Signal::UiScale { micro } => {
             if tx.send(Event::Game(Signal::Vorax(Cue::UiScale { micro }), stamp, SystemTime::now())).is_ok() {
+                notify();
+            }
+        }
+        // The riot battle's boss is written to the run log and nothing else: it wakes no read, and as a game signal
+        // it would end a Vorax mode (the deadlock guard) and count in the run check as a move.
+        Signal::RiotBoss(boss) => {
+            if tx.send(Event::RiotBoss(boss)).is_ok() {
                 notify();
             }
         }

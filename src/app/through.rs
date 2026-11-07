@@ -12,7 +12,6 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 use windows::Win32::Foundation::{HWND, POINT, RECT};
 use windows::Win32::Graphics::Gdi::ScreenToClient;
-use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON, VK_MBUTTON, VK_RBUTTON};
 use windows::Win32::UI::WindowsAndMessaging::{
     GWL_EXSTYLE, GetClientRect, GetCursorPos, GetWindowLongPtrW, SetCursorPos, SetWindowLongPtrW, WS_EX_TRANSPARENT,
 };
@@ -97,10 +96,12 @@ fn over_nothing(hwnd: HWND, rects: &[[i32; 4]]) -> Option<bool> {
 }
 
 /// A mouse button is down: the style stays as it is until it comes up, so
-/// a drag that leaves a widget (a slider's) keeps going.
+/// a drag that leaves a widget (a slider's) keeps going. The buttons are read through [`super::mark::button_down`],
+/// which keeps the "pressed since" bits this read clears for the mark's clicks (this thread looks every 16 ms and
+/// took a quick click's bit before the mark's look 50 ms apart could see it).
 fn pressed() -> bool {
-    // SAFETY: a plain Win32 call.
-    [VK_LBUTTON, VK_RBUTTON, VK_MBUTTON].iter().any(|&vk| unsafe { GetAsyncKeyState(vk.0 as i32) } < 0)
+    use super::mark::{Button, button_down};
+    [Button::Left, Button::Right, Button::Middle].into_iter().any(button_down)
 }
 
 /// Sets or clears `WS_EX_TRANSPARENT` on `hwnd`; returns whether it differed.

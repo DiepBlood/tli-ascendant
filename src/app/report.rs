@@ -1857,7 +1857,8 @@ fn settle_once(name: &str, text: &str, ui: Lang, rollouts: usize, cancel: &Atomi
 /// The run's facts: game language, OCR language, resolution (from the window line, which is deleted later, and the reads).
 fn run_facts(game: Game, text: &str) -> (String, String, String) {
     let rows = rows(text);
-    let window = rows.iter().find(|r| kind(&r.v) == "window");
+    // The last window line: a language switch mid run writes it again with the new OCR language (`set_ocr`).
+    let window = rows.iter().rfind(|r| kind(&r.v) == "window");
     let ocr = window.and_then(|r| r.v["ocr"].as_str().map(str::to_string)).or_else(crate::reader::ocr::language).unwrap_or_else(|| tr("none").to_string());
     let size = rows.iter().find_map(|r| {
         let s = r.v["size"].as_array()?;

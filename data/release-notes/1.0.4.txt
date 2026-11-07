@@ -1,0 +1,30 @@
+[[zh-TW]]
+Ascendant 1.0.4：前三名改成圖示、點擊撤框與狩獵期望值修正、本局檢查與紀錄修正
+
+- 前三名改成「動作圖示＋格號＋盤面小格子」（去、吃、連吃、換、選擇、結束今天等各有圖示），一眼看出要做什麼、在哪一格；英文介面不再被裁成「Go to cell...」。滑鼠停在圖示上說明動作，停在小格子上顯示那一格的內容（例如「07 號：魔法狂獅，獄中事變標記」），停在其他地方顯示完整建議。
+- 字型調大或視窗很窄時，前三名依序省略小格子、差距欄、格號（圖示一定留著），期望值不再被擠出視窗或和標題對不齊。
+- 塔羅斯：在遊戲裡點一下，只有在綠框上按下並放開才會讓綠框消失；點到別的地方，或按住時移出綠框、按了右鍵（遊戲不會執行這次選擇，就算移回來才放開也一樣），都不再撤框。
+- 塔羅斯：狩獵只有一個目標時，沿用選「狩獵」那一步的期望值，不再顯示「—」。
+- 塔羅斯：刑具與主題那一行改成主題在前，刑具名稱很長（英文常見）時，主題不再被擠出視窗。
+- 英文介面：側欄的點擊穿透燈改寫成「Thru」，不再被裁成「hroug」。
+- 本局檢查：點狀態列的本局檢查那一行，會跳出視窗顯示全部內容，不用再把滑鼠停在上面。
+- 本局檢查：同一張門卡在 1 秒內點兩次（遊戲只走一步，但會記兩次點擊），不再列成「沒有建議就點擊」。
+- 本局檢查：遊戲在其他視窗後面時，建議其實早就出來了，只是標記等遊戲回到前面才顯示，這種情況不再算成「建議太慢」。只有 1 次時，英文寫成「Once ...」，不再寫「1 times」。
+- 紀錄：塔羅斯暴動戰鬥出現特殊頭目時，本局紀錄會記下頭目出現、死亡和頭目寶箱的掉落數量（畫面上不顯示）。
+- 紀錄：一局中途切換 Ascendant 的介面語言，紀錄會記下新的辨識語言，之後的紀錄資料夾也從新的語言開始（以前會一直記著原本的語言）。
+
+[[en]]
+
+Ascendant 1.0.4: icons in the top three, mark and hunt value fixes, run check and log fixes
+
+- The top three now show each move as an icon, the cell number and a small copy of that cell (go, eat, chain on, replace, take, end the day and so on each have their own icon), so you see what to do and where at a glance; in English they are no longer cut to "Go to cell...". Point at the icon for what the move does, at the small cell for what is in it, and anywhere else on the row for the full advice.
+- With a large font or a narrow window, the top three drop the small cell, then the Gap column, then the cell number (the icon always stays), so the values no longer run out of the window or out of line with their headings.
+- Tartarus: the green box goes away only when the mouse button is pressed and released on it; a click elsewhere, or a press that leaves the box or meets a right click while held (the game does not act on it, even if released back on the box), no longer hides it.
+- Tartarus: a hunt with a single target takes the value of the move that chose to hunt instead of showing "—".
+- Tartarus: the instruments and theme line now shows the theme first, so a long instrument name (common in English) no longer pushes it out of the window.
+- English window: the click-through light in the side bar now says "Thru" and is no longer cut to "hroug".
+- Run check: click its line in the status bar to open a window with all of it, instead of holding the mouse over it.
+- Run check: a door card clicked twice within 1 s (the game moves once but logs both clicks) is no longer listed as a click with no advice.
+- Run check: with the game behind another window, advice that was ready at once but marked only when the game came back to the front no longer counts as slow. A single slow time now reads "Once ..." instead of "1 times".
+- Logs: when the special boss shows up in a Tartarus riot battle, the run's log records it, its death and how many drops its chest gave (nothing is shown on screen).
+- Logs: switching Ascendant's language during a run records the new reading language, and later log folders start with it (they kept the old one before).

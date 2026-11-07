@@ -39,7 +39,7 @@ pub const CREDIT_EN: &str = "Vorax solver: vorax-solver-rs (MIT; DinoRaos, tidew
 pub struct VoraxView {
     session: VoraxSession,
     /// The boxes over the game, created only when first needed. Does not share ui.rs's `mark`: Tartarus's
-    /// `clicked` and `forget_clicks` are tied to that one.
+    /// `clicked` and `clicks` (see `mark::Clicks`) are tied to that one.
     marks: Vec<Mark>,
     /// The advised option's expected final activity on the game, above the first box (see [`advised_k`]), made
     /// when first needed.
@@ -160,6 +160,11 @@ impl VoraxView {
         self.session.log().map(|l| l.flushed())
     }
 
+    /// The window language was switched: the Vorax log's window row says the new OCR language from here on.
+    pub fn log_language(&mut self) {
+        self.session.log_language();
+    }
+
     /// Reading or solving (the window shows a spinner).
     pub fn busy(&self) -> bool {
         self.session.busy()
@@ -239,6 +244,8 @@ impl VoraxView {
             }
             // Observe-mode frames: not given to Tartarus in Vorax mode.
             Event::Observe(..) => None,
+            // The riot battle's boss goes to the Tartarus run log whatever the mode: it does not leave Vorax.
+            Event::RiotBoss(_) => Some(event),
         }
     }
 
