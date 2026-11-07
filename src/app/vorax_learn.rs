@@ -44,7 +44,7 @@ pub const MAX_SAVES: u32 = 2;
 /// The disk holding the log folder needs at least this much free space before a jpg is saved.
 pub const MIN_FREE: u64 = 5 << 30;
 /// JPEG quality of the whole frame, the region crop and the resolve strip.
-const FRAME_QUALITY: u8 = 92;
+pub(crate) const FRAME_QUALITY: u8 = 92;
 const CROP_QUALITY: u8 = 98;
 const STRIP_QUALITY: u8 = 90;
 /// The first read within this long after a resolve cue saves the strip.
@@ -506,7 +506,7 @@ impl Learn {
 
     /// The free space check of [`Learn::jpegs_allowed`], whether or not observe mode is on: once per game, false
     /// below the threshold or when it cannot be determined, true with threshold 0.
-    fn space_ok(&mut self) -> bool {
+    pub(crate) fn space_ok(&mut self) -> bool {
         if let Some(ok) = self.space {
             return ok;
         }

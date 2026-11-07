@@ -12,8 +12,8 @@ body:
     id: version
     attributes:
       label: 版本（Version）
-      description: Ascendant 的版本號，例如 1.0.1（The Ascendant version, e.g. 1.0.1）
-      placeholder: "1.0.1"
+      description: Ascendant 的版本號，例如 1.0.3（The Ascendant version, e.g. 1.0.3）
+      placeholder: "1.0.3"
     validations:
       required: true
   - type: dropdown

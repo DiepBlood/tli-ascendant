@@ -25,7 +25,7 @@ use super::capture::{Event, Watcher, capture, game_in_front, game_pid, game_rect
 use super::elevation;
 use super::mark::{self, Mark, Notice};
 use super::gamelog::{self, Fill};
-use super::hotkey::{Hotkey, parse};
+use super::hotkey::{Hotkey, Recorded, parse};
 use super::session::{CellEdit, Session};
 use super::theme::{self, ACCENT, ADVICE_TEXT, BAR_IDLE, DIVIDER, MIN_TEXT, MUTED, SIDEBAR, Switch, Verdict};
 use super::through::ClickThrough;
@@ -137,7 +137,48 @@ impl Which {
     }
 }
 
-/// A registered hotkey, its field as typed (applied when it loses focus) and
+/// A hotkey being recorded on the settings page (see [`AscendantApp::record_key`]): which one, and why the last key
+/// pressed was refused, shown in its row in place of "Press a key..." until the next key: short enough for a narrow
+/// window's key cap, and in full on hover.
+struct Recording {
+    which: Which,
+    refused: Option<Refusal>,
+}
+
+/// Why a key was refused while recording: a short line for the key cap and the whole reason for its hover.
+#[derive(Debug, PartialEq)]
+struct Refusal {
+    short: String,
+    full: String,
+}
+
+/// What recording a hotkey does with the key pressed (see [`judge`]).
+#[derive(Debug, PartialEq)]
+enum Judged {
+    /// Esc: stop, the hotkey as it was.
+    Cancel,
+    /// Try to register this key.
+    Try(String),
+    /// Refused, with the reason shown in the row; recording goes on.
+    Refuse(Refusal),
+}
+
+/// What recording a hotkey does with `got`, the other hotkey being `other` (its saved text and which it is). A key
+/// that is the other's, or one that would take a key from typing, is refused before Windows is asked.
+fn judge(got: Recorded, other: (&str, Which)) -> Judged {
+    match got {
+        Recorded::Cancel => Judged::Cancel,
+        Recorded::Clipboard => Judged::Refuse(Refusal { short: tr("Used by copy and paste").into(), full: tr("It would take copy, cut or paste from every program").into() }),
+        Recorded::Unusable => Judged::Refuse(Refusal { short: tr("Not a key for a hotkey").into(), full: tr("Use F1 to F24, or a letter or digit with Ctrl or Alt").into() }),
+        Recorded::Typing(text) => Judged::Refuse(Refusal { short: trf!("{} needs Ctrl/Alt", text), full: trf!("{} alone would get in the way of typing: add Ctrl or Alt", text) }),
+        Recorded::Key(text) if parse(&text).is_ok() && parse(&text) == parse(other.0) => {
+            Judged::Refuse(Refusal { short: trf!("Already the {} key", tr(other.1.name())), full: trf!("{} is already the {} key.", text, tr(other.1.name())) })
+        }
+        Recorded::Key(text) => Judged::Try(text),
+    }
+}
+
+/// A registered hotkey, the text its row shows (the saved key) and
 /// the flag its presses set.
 #[derive(Default)]
 struct Key {
@@ -241,8 +282,8 @@ pub struct AscendantApp {
     /// The release notes of every version, newest first: the ones built into the exe, and `this_notes` only for a
     /// version that has none built in ([`release_notes`]).
     notes_history: Vec<update::SavedNotes>,
-    /// The "What's new" window while it is open (see [`AscendantApp::whats_new_window`]).
-    whats_new: Option<WhatsNew>,
+    /// "What's new" and the instruments and theme window, never both open (see [`Floats`]).
+    floats: Floats,
     /// The version a download refused as unverified: later checks do not offer it again ([`update::drop_refused`]).
     /// Kept in memory only, so a restart checks it afresh.
     refused: Option<[u64; 3]>,
@@ -284,6 +325,8 @@ pub struct AscendantApp {
     notice: Option<Notice>,
     /// The numbers on the targets of a planned chain, see [`AscendantApp::show_chain`].
     badges: Vec<Notice>,
+    /// The advised move's expected value on the game, above the mark's spot (see [`AscendantApp::highlight`]).
+    value: Option<Notice>,
     /// The screen, board and advised action the player clicked in the game
     /// after: no mark until a reading changes one of them, so the re-reads of
     /// the same screen as the game moves on after the click leave it hidden.
@@ -291,11 +334,13 @@ pub struct AscendantApp {
     /// Live advice for Vorax surgery: while the mode is on, frames and game log hints go to it and the Tartarus
     /// Session is paused.
     vorax: VoraxView,
-    /// The hotkey being changed on the settings page: after pressing "Change" that row turns into the original
-    /// input box, and the edit is applied when it loses focus (including Enter).
-    editing_key: Option<Which>,
-    /// "Change" was just pressed: the next time the input box is drawn it should take focus.
-    key_focus: bool,
+    /// The hotkey being recorded on the settings page, after its "Change" was pressed: the next key pressed becomes it
+    /// (see [`AscendantApp::record_key`]). Both hotkeys are released meanwhile, so the key pressed reaches this window
+    /// and does nothing else.
+    recording: Option<Recording>,
+    /// At this frame's start a text box had the keyboard or a hotkey was being recorded: Esc is theirs, so it does
+    /// not close "What's new" (see [`esc_closes`]).
+    esc_busy: bool,
     /// The Run tab's review: the automatic settlements of the last Tartarus run and Vorax game (see
     /// [`settle::spawn`], [`super::vorax_settle::spawn`]), the run picked to review instead, and the export card.
     review: RunReview,
@@ -311,8 +356,6 @@ pub struct AscendantApp {
     over_reviewed: bool,
     /// The "Restore defaults" confirmation window is open.
     restoring: bool,
-    /// The window that edits instruments and theme is open (toggled by clicking that line on the board page).
-    tools_open: bool,
     /// Whether the layout is currently compact (see [`next_compact`]); None before the first frame.
     compact: Option<bool>,
     /// When the font size was last changed, see [`AscendantApp::rescaling`].
@@ -379,6 +422,8 @@ pub struct AscendantApp {
     preview_auto_waiting: Option<String>,
     /// For previews (ASCENDANT_PREVIEW_STATUS_OPEN=1): the floating list of the administrator notice's text kept open.
     preview_status_open: bool,
+    /// For previews (ASCENDANT_PREVIEW_RECORD): a hotkey row recording; the window not being in front does not cancel it.
+    preview_recording: bool,
 }
 
 impl AscendantApp {
@@ -445,7 +490,7 @@ impl AscendantApp {
             release_quiet: false,
             seen: None,
             next_check: None,
-            whats_new: None,
+            floats: Floats::default(),
             refused: None,
             held: None,
             preview_updated: None,
@@ -468,17 +513,17 @@ impl AscendantApp {
             last_view: None,
             notice: None,
             badges: Vec::new(),
+            value: None,
             clicked: None,
             vorax,
-            editing_key: None,
-            key_focus: false,
+            recording: None,
+            esc_busy: false,
             review: RunReview::default(),
             vorax_ended: None,
             run_over_at: None,
             was_over: false,
             over_reviewed: false,
             restoring: false,
-            tools_open: false,
             compact: None,
             rescaled: None,
             preview_bottom: false,
@@ -504,6 +549,7 @@ impl AscendantApp {
             preview_elevated: None,
             preview_auto_waiting: None,
             preview_status_open: false,
+            preview_recording: false,
         };
         app.set_text_scale(&cc.egui_ctx, app.settings.font_scale);
         // Previews (ASCENDANT_PREVIEW_UPDATE, ASCENDANT_PREVIEW_UPDATED) inject the update state instead and never ask
@@ -584,36 +630,77 @@ impl AscendantApp {
     /// and [`AscendantApp::mark_spot`] gives one; hides it otherwise. Looks
     /// again every 50 ms while the session has a mark, shown or not, so a
     /// window move, a click or the game coming back in front is seen.
+    /// With "Show the expected value on the game" on, the advised move's expected loot ([`loot_text`], the number the
+    /// window shows) goes just above the same spot, whether the mark is on or not, and goes when the mark's spot does.
     fn highlight(&mut self, ctx: &egui::Context) {
-        let spot = if self.settings.highlight { self.session.mark_or_why() } else { Err("off") };
+        let value = if self.settings.show_value { self.session.shown_advice().and_then(|a| loot_text(&self.session, a.option)) } else { None };
+        let spot = if self.settings.highlight || value.is_some() { self.session.mark_or_why() } else { Err("off") };
         if spot.is_ok() {
             ctx.request_repaint_after(Duration::from_millis(50));
         }
+        // A Cage Fight's target screen: the chain's numbered badges stand in for the mark (see `Session::mark_or_why`).
+        let badges = spot == Err("badges");
         let placed = spot.and_then(|spot| self.mark_spot(spot));
-        // With no advice there is no box to draw, so nothing counts as hidden.
-        self.mark_hidden = match placed {
-            Err(why) if why != "no_advice" && (why != "off" || self.session.shown_advice().is_some()) => Some(why),
-            _ => None,
+        // With no advice there is no box to draw, so nothing counts as hidden; with the mark off, that is why.
+        self.mark_hidden = if self.settings.highlight {
+            match placed {
+                Err(why) if why != "no_advice" => Some(why),
+                _ => None,
+            }
+        } else {
+            self.session.shown_advice().is_some().then_some("off")
         };
+        let mut at = None;
         match placed.ok() {
             Some((x, y, half_w, half_h, unit, game)) => {
-                if self.mark.is_none() {
-                    self.mark = Mark::new();
-                }
                 // A target pick paints its targets red and gold: its mark
                 // is the loud one.
                 let pick = self.session.reading.as_ref().is_some_and(|r| matches!(r.screen, Screen::ChainTarget | Screen::CellPick));
                 let style = if pick { mark::Style::Loud } else { mark::Style::Plain };
-                // A mark growing in is drawn again each frame until in place.
-                if let Some(mark) = &mut self.mark
-                    && mark.show([x, y, half_w, half_h, unit], style, game)
-                {
-                    ctx.request_repaint();
+                if self.settings.highlight {
+                    if self.mark.is_none() {
+                        self.mark = Mark::new();
+                    }
+                    // A mark growing in is drawn again each frame until in place.
+                    if let Some(mark) = &mut self.mark
+                        && mark.show([x, y, half_w, half_h, unit], style, game)
+                    {
+                        ctx.request_repaint();
+                    }
+                } else if let Some(mark) = &mut self.mark {
+                    mark.hide();
                 }
+                // The value goes with the spot the mark holds (it keeps where it was first marked), else the one read.
+                let spot = self.mark.as_ref().and_then(Mark::spot).unwrap_or([x, y, half_w, half_h, unit]);
+                at = Some((spot, style, game[1]));
             }
             None => {
                 if let Some(mark) = &mut self.mark {
                     mark.hide();
+                }
+            }
+        }
+        // On the badges' screen the value goes above the first badge's cell, the bite the advice starts, as it would
+        // above a mark there; with the mark setting off the badges are not drawn, but the value is.
+        if at.is_none() && badges && value.is_some() {
+            let title = &self.settings.window_title;
+            let game = if game_in_front(title) { game_rect(title).ok() } else { None };
+            at = first_badge_spot(&self.session.chain_spots(), game).map(|(spot, top)| (spot, mark::Style::Loud, top));
+            ctx.request_repaint_after(Duration::from_millis(50));
+        }
+        match (value, at) {
+            (Some(text), Some(([x, y, _, half_h, unit], style, game_top))) => {
+                if self.value.is_none() {
+                    self.value = Notice::value();
+                }
+                if let Some(v) = &mut self.value {
+                    let (above, below) = mark::reach(half_h, unit, style);
+                    v.show_value(&text, x, (y - above, y + below), game_top as f32, unit);
+                }
+            }
+            _ => {
+                if let Some(v) = &mut self.value {
+                    v.hide();
                 }
             }
         }
@@ -697,11 +784,13 @@ impl AscendantApp {
             return Err("behind");
         }
         let rect @ [left, top, _, height] = game_rect(title).map_err(|_| "rect")?;
-        // Clicks while no mark showed are not clicks on it.
-        if !self.mark.as_ref().is_some_and(Mark::shown) {
+        // Clicks while no mark (nor value) showed are not clicks on it.
+        if !self.mark.as_ref().is_some_and(Mark::shown) && !self.value.as_ref().is_some_and(Notice::shown) {
             mark::forget_clicks();
         }
-        if mark::clicked_in(rect) {
+        // A click on an instrument or treasure card only selects it; the mark stays until "Confirm" takes the cards away
+        // (the screen changes or the target is gone). The click is still read, so it is not counted later.
+        if mark::clicked_in(rect) && click_hides(shown.0, &shown.2) {
             self.clicked = Some(shown);
             return Err("clicked");
         }
@@ -826,8 +915,79 @@ impl AscendantApp {
         }
     }
 
-    /// Registers the typed `which` hotkey in place of the current one; on
-    /// failure the previous key stays.
+    /// "Change" of the `which` row: that row waits for a key (see [`AscendantApp::record_key`]). Both hotkeys are
+    /// released meanwhile: one still registered takes its key before this window sees it (F8 would turn auto read on
+    /// instead of being recorded).
+    fn start_recording(&mut self, which: Which) {
+        for key in &mut self.keys {
+            key.hotkey = None;
+        }
+        self.recording = Some(Recording { which, refused: None });
+    }
+
+    /// Recording ends (a key saved, Esc, a click elsewhere, the window left): the hotkeys not registered are
+    /// registered again from the saved keys.
+    fn stop_recording(&mut self) {
+        if self.recording.take().is_none() {
+            return;
+        }
+        for which in Which::ALL {
+            if self.keys[which as usize].hotkey.is_none() {
+                let text = which.setting(&mut self.settings).clone();
+                match self.register(which, &text) {
+                    Ok(h) => self.keys[which as usize].hotkey = Some(h),
+                    Err(e) => self.error = Some(e),
+                }
+            }
+        }
+    }
+
+    /// While a hotkey is recorded, at the frame's start before any widget is drawn: every key pressed is taken out of
+    /// the frame (it reaches no button or window), and the first becomes the hotkey ([`hotkey::record`], [`judge`]).
+    /// Esc cancels; a refused key leaves its reason in the row and recording goes on; a key Windows registers is
+    /// saved and recording ends, and one Windows refuses (another program has it) is refused the same way. The window
+    /// losing the keyboard cancels too (not in the recording preview, whose window need not be in front).
+    fn record_key(&mut self, ctx: &egui::Context) {
+        let Some(which) = self.recording.as_ref().map(|r| r.which) else { return };
+        if !self.preview_recording && !ctx.input(|i| i.focused) {
+            self.stop_recording();
+            return;
+        }
+        let got = ctx.input_mut(|i| {
+            let got = super::hotkey::record(&i.events);
+            i.events.retain(|e| !matches!(e, egui::Event::Key { .. } | egui::Event::Text(_) | egui::Event::Copy | egui::Event::Cut | egui::Event::Paste(_)));
+            got
+        });
+        let Some(got) = got else { return };
+        let other = if which == Which::Read { Which::Auto } else { Which::Read };
+        let other_text = other.setting(&mut self.settings).clone();
+        match judge(got, (&other_text, other)) {
+            Judged::Cancel => self.stop_recording(),
+            Judged::Refuse(why) => self.refuse_key(why),
+            Judged::Try(text) => match self.register(which, &text) {
+                Ok(h) => {
+                    let i = which as usize;
+                    self.keys[i].hotkey = Some(h);
+                    self.keys[i].text.clone_from(&text);
+                    *which.setting(&mut self.settings) = text;
+                    self.error = None;
+                    self.save();
+                    self.stop_recording();
+                }
+                Err(e) => self.refuse_key(Refusal { short: trf!("{} is taken by another program", text), full: e }),
+            },
+        }
+    }
+
+    /// The key just pressed is refused: `why` shows in the recording row until the next key.
+    fn refuse_key(&mut self, why: Refusal) {
+        if let Some(r) = &mut self.recording {
+            r.refused = Some(why);
+        }
+    }
+
+    /// Registers the `which` hotkey its row shows (`Key::text`, set by "Restore defaults") in place of the current
+    /// one; on failure the previous key stays.
     fn apply_hotkey(&mut self, which: Which) {
         let i = which as usize;
         let text = self.keys[i].text.trim().to_string();
@@ -1373,12 +1533,25 @@ impl AscendantApp {
     /// next page.
     fn set_tab(&mut self, tab: Tab) {
         if self.tab != tab {
-            self.whats_new = None;
-            self.tools_open = false;
+            self.floats = Floats::default();
             self.editing = None;
             self.restoring = false;
+            // A hotkey being recorded is on the settings page: leaving it cancels, and the hotkeys come back.
+            self.stop_recording();
         }
         self.tab = tab;
+    }
+
+    /// Opens "What's new", closing the instruments window at the same spot (see [`Floats`]); with `pending`, the newer
+    /// release on offer comes first with its verified notes, copied only now (see [`AscendantApp::pending_notes`]).
+    fn open_whats_new(&mut self, pending: bool) {
+        let notes = if pending { self.pending_notes() } else { None };
+        self.floats.open_whats_new(WhatsNew::new(notes));
+    }
+
+    /// The verified notes of the newer release on offer, when it has some.
+    fn pending_notes(&self) -> Option<update::SavedNotes> {
+        self.release.as_ref().filter(|r| !r.notes.is_empty()).map(|r| update::SavedNotes { version: r.version_text(), notes: r.notes.clone() })
     }
 
     /// Open the Run tab and review the finished run `entry` instead of the latest (the run picker, and the
@@ -1393,7 +1566,7 @@ impl AscendantApp {
     /// once whether to share run logs, says a new version is available when already installed (only one the check
     /// at start or "Check now" found: the hourly check's shows as the red dot instead), or says which version an
     /// update just installed until it is dismissed.
-    fn notice(&self) -> Option<NoticeKind> {
+    fn notice(&self) -> Option<NoticeKind<'_>> {
         if self.current.is_some() && !self.installed && self.settings.offer_install {
             Some(NoticeKind::Install)
         } else if self.settings.share_logs.is_none() && self.settings.run_log && self.uploader.is_some() {
@@ -1401,7 +1574,7 @@ impl AscendantApp {
         } else if let Some(r) = self.release.as_ref().filter(|_| !self.update_locked && !self.release_quiet) {
             // After a failure that moved the exe (see `locks_update`) there is no update to offer until Ascendant starts
             // again: the notice would show an "Update" that does nothing, and the error says what to do instead.
-            Some(NoticeKind::Update { version: r.version_text(), notes: r.notes.clone(), history: !self.notes_history.is_empty(), updating: self.update_step(), checking: self.checking.is_some() })
+            Some(NoticeKind::Update { version: r.version_text(), notes: &r.notes, history: !self.notes_history.is_empty(), updating: self.update_step(), checking: self.checking.is_some() })
         } else {
             self.this_notes
                 .as_ref()
@@ -1409,14 +1582,14 @@ impl AscendantApp {
                 // The built-in notes of that version when there are some (see `release_notes`), for the tooltip too.
                 .map(|n| {
                     let notes = self.notes_history.iter().find(|h| h.version == n.version).map_or(&n.notes, |h| &h.notes);
-                    NoticeKind::Updated { version: n.version.clone(), notes: notes.clone() }
+                    NoticeKind::Updated { version: n.version.clone(), notes }
                 })
         }
     }
 
     /// All status bar states, in priority order: error, game log light red, the game run as administrator, notice,
     /// progress full, auto read waiting, run check. Click-through is not one: the rail's "Through" light shows it.
-    fn status_items(&self) -> Vec<StatusItem> {
+    fn status_items(&self) -> Vec<StatusItem<'_>> {
         let mut items = Vec::new();
         if let Some(e) = &self.error {
             items.push(StatusItem::Error(e.clone()));
@@ -1540,7 +1713,7 @@ impl AscendantApp {
             }
             Some(NoticeAct::Share(on)) => self.set_sharing(on),
             Some(NoticeAct::Update) => self.start_update(),
-            Some(NoticeAct::WhatsNew(pending)) => self.whats_new = Some(WhatsNew::new(pending)),
+            Some(NoticeAct::WhatsNew(pending)) => self.open_whats_new(pending),
             Some(NoticeAct::Settings) => self.set_tab(Tab::Settings),
             Some(NoticeAct::Dismiss) => self.seen_updated(),
             Some(NoticeAct::Relaunch) => self.start_relaunch(ui.ctx()),
@@ -1555,16 +1728,17 @@ impl AscendantApp {
     }
 }
 
-/// Notice kinds of the status bar (see [`AscendantApp::notice`]).
-enum NoticeKind {
+/// Notice kinds of the status bar (see [`AscendantApp::notice`]); the release notes are borrowed, not copied for
+/// every frame.
+enum NoticeKind<'a> {
     Install,
     Share,
     /// A newer release: its version and verified notes, whether there is a notes history (see
     /// [`AscendantApp::notes_history`]), the update's step while it runs, and whether a check runs (which turns
     /// "Update" off).
-    Update { version: String, notes: String, history: bool, updating: Option<update::Step>, checking: bool },
+    Update { version: String, notes: &'a str, history: bool, updating: Option<update::Step>, checking: bool },
     /// An update installed this version: its version and the notes kept from its verified release.
-    Updated { version: String, notes: String },
+    Updated { version: String, notes: &'a str },
     /// The game runs with more rights than Ascendant, so the hotkeys do nothing while it is in front (or starting again
     /// as administrator was just declined): the text, and whether Windows' prompt is waiting for an answer.
     Elevated { text: String, waiting: bool },
@@ -1577,8 +1751,9 @@ enum NoticeAct {
     Share(bool),
     Update,
     /// Open the "What's new" window (see [`AscendantApp::whats_new_window`]), with the newer release on offer and not
-    /// installed yet above the history when there is one; no browser is opened.
-    WhatsNew(Option<update::SavedNotes>),
+    /// installed yet above the history when there is one (true: its notes are copied only when the button is
+    /// pressed, see [`AscendantApp::pending_notes`]); no browser is opened.
+    WhatsNew(bool),
     /// Open the Settings tab (the game log reminder).
     Settings,
     /// The "x" of "Updated to X.Y.Z": not shown again.
@@ -1592,9 +1767,9 @@ enum NoticeAct {
 }
 
 /// One item of the status bar (see [`AscendantApp::status_items`]).
-enum StatusItem {
+enum StatusItem<'a> {
     Error(String),
-    Notice(NoticeKind),
+    Notice(NoticeKind<'a>),
     /// The game log light is red: the reminder (see [`log_alert`]).
     Log(String),
     Auto(String),
@@ -1603,7 +1778,7 @@ enum StatusItem {
     Health { summary: String, issues: Vec<String> },
 }
 
-impl StatusItem {
+impl StatusItem<'_> {
     /// Short form for line 1 of the compact layout: auto read shows only "waiting"; the rest is the same as
     /// [`StatusItem::text`].
     fn short(&self) -> String {
@@ -1730,13 +1905,14 @@ fn notice_choices(kind: &NoticeKind) -> Vec<(String, bool, NoticeAct)> {
     match kind {
         NoticeKind::Install => vec![(tr("Install").into(), true, NoticeAct::Install), (tr("Not now").into(), true, NoticeAct::NotNow)],
         NoticeKind::Share => vec![(tr("Share").into(), true, NoticeAct::Share(true)), (tr("Don't share").into(), true, NoticeAct::Share(false))],
-        NoticeKind::Update { version, notes, history, updating, checking } => {
-            let pending = (!notes.is_empty()).then(|| update::SavedNotes { version: version.clone(), notes: notes.clone() });
-            let enabled = updating.is_none() && (pending.is_some() || *history);
+        NoticeKind::Update { notes, history, updating, checking, .. } => {
+            // Only whether there are notes: they are copied when "What's new" is pressed, not for every frame.
+            let pending = !notes.is_empty();
+            let enabled = updating.is_none() && (pending || *history);
             vec![(tr("Update").into(), updating.is_none() && !checking, NoticeAct::Update), (tr("What's new").into(), enabled, NoticeAct::WhatsNew(pending))]
         }
         // The version just installed: its notes are the newest of the history.
-        NoticeKind::Updated { notes, .. } => vec![(tr("What's new").into(), !notes.is_empty(), NoticeAct::WhatsNew(None)), ("\u{d7}".into(), true, NoticeAct::Dismiss)],
+        NoticeKind::Updated { notes, .. } => vec![(tr("What's new").into(), !notes.is_empty(), NoticeAct::WhatsNew(false)), ("\u{d7}".into(), true, NoticeAct::Dismiss)],
         // Off while Windows' prompt waits for an answer, so one click starts one copy.
         NoticeKind::Elevated { waiting, .. } => vec![
             (tr("Restart as administrator").into(), !waiting, NoticeAct::Relaunch),
@@ -1797,6 +1973,36 @@ impl WhatsNew {
     }
 }
 
+/// The two floating windows anchored at the same spot under the title bar: "What's new" (see
+/// [`AscendantApp::whats_new_window`]) and the instruments and theme window (see [`AscendantApp::tools_window`]). Only
+/// one is open at a time, so neither covers the other: opening one closes the other.
+#[derive(Default)]
+struct Floats {
+    whats_new: Option<WhatsNew>,
+    tools: bool,
+}
+
+impl Floats {
+    fn open_whats_new(&mut self, w: WhatsNew) {
+        self.whats_new = Some(w);
+        self.tools = false;
+    }
+
+    /// A click on the instruments line: opens the window (closing "What's new") or closes it.
+    fn toggle_tools(&mut self) {
+        self.tools = !self.tools;
+        if self.tools {
+            self.whats_new = None;
+        }
+    }
+}
+
+/// Whether Esc (`pressed` this frame) closes "What's new": not while a text box has the keyboard or a hotkey is
+/// being recorded (`busy`, as at the frame's start), whose Esc it is.
+fn esc_closes(pressed: bool, busy: bool) -> bool {
+    pressed && !busy
+}
+
 /// The release notes of every version, one file per version in data/release-notes (`<X.Y.Z>.txt`, UTF-8 without a
 /// byte order mark, LF, at most 8000 characters, no control or hidden format characters; the tests check all of it
 /// and that the running version has one), one section per language, each opened by its marker line (`[[zh-TW]]`,
@@ -1804,7 +2010,7 @@ impl WhatsNew {
 /// cover, so they are as trusted as the program and a fresh install sees the whole history. A new version adds its
 /// file here.
 const RELEASE_NOTES: &[(&str, &str)] =
-    &[("1.0.2", include_str!("../../data/release-notes/1.0.2.txt")), ("1.0.1", include_str!("../../data/release-notes/1.0.1.txt")), ("1.0.0", include_str!("../../data/release-notes/1.0.0.txt"))];
+    &[("1.0.3", include_str!("../../data/release-notes/1.0.3.txt")), ("1.0.2", include_str!("../../data/release-notes/1.0.2.txt")), ("1.0.1", include_str!("../../data/release-notes/1.0.1.txt")), ("1.0.0", include_str!("../../data/release-notes/1.0.0.txt"))];
 
 /// Which of the versions "What's new" lists (in its order, each with whether it is a release not installed yet) starts
 /// unfolded: the release not installed yet when there is one, else the `running` version, else the newest.
@@ -1939,6 +2145,18 @@ fn status_detail(ui: &mut egui::Ui, item: &StatusItem) -> Option<NoticeAct> {
         }
         _ => None,
     }
+}
+
+/// A chain badge's number and its cell (centre and half size, frame px), as [`Session::chain_spots`] gives them.
+type ChainSpot = (usize, (f32, f32, f32, f32));
+
+/// Where the expected value goes on a Cage Fight's target screen, whose numbered badges stand in for the mark: the
+/// first badge's cell (`spots` as [`Session::chain_spots`] gives them, frame px), as a mark's spot in screen px
+/// (`[x, y, half_w, half_h, unit]`), with the game's top; None without a badge or without the game's rect.
+fn first_badge_spot(spots: &[ChainSpot], game: Option<[i32; 4]>) -> Option<([f32; 5], i32)> {
+    let [left, top, _, height] = game?;
+    let &(_, (x, y, half_w, half_h)) = spots.first()?;
+    Some(([left as f32 + x, top as f32 + y, half_w, half_h, height as f32 / 1080.0], top))
 }
 
 /// A chain badge's size against the notice's (see [`AscendantApp::show_chain`]).
@@ -2167,6 +2385,11 @@ impl eframe::App for AscendantApp {
     /// The hotkeys, auto read and the worker results. eframe skips `ui` while
     /// the game covers the window but still calls this on a repaint request.
     fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        // Recording a hotkey stops once the window loses the keyboard (a click on the game, say), here as well as in
+        // `ui`, which eframe may skip while the window is covered: the hotkeys, released while recording, come back.
+        if self.recording.is_some() && !self.preview_recording && !ctx.input(|i| i.focused) {
+            self.stop_recording();
+        }
         self.place(ctx);
         self.remember_position(ctx);
         self.poll_update(ctx);
@@ -2264,6 +2487,9 @@ impl eframe::App for AscendantApp {
             if let Some(n) = &mut self.notice {
                 n.hide();
             }
+            if let Some(v) = &mut self.value {
+                v.hide();
+            }
             self.badges.iter_mut().for_each(Notice::hide);
             // While in Vorax mode the Board tab does not show Tartarus's warning count.
             self.warned = 0;
@@ -2325,6 +2551,10 @@ impl eframe::App for AscendantApp {
 
 
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+        // Before anything is drawn: whose Esc this frame's is (see `esc_closes`), and the key a hotkey being recorded
+        // takes out of the frame.
+        self.esc_busy = ui.ctx().text_edit_focused() || self.recording.is_some();
+        self.record_key(&ui.ctx().clone());
         // Measure the size after the player drags and remember it (reused on the next launch); the window no
         // longer resizes itself.
         self.track_size(ui.ctx());
@@ -2657,7 +2887,8 @@ impl AscendantApp {
         // Whether there is advice (the test replacement counts too): with no advice no reason is written.
         let shown = if self.preview_not_first && s.ranking.len() >= 2 { Some(option) } else { advice.as_ref().map(|_| option) };
         let reason = advice_reason(&s.ranking, shown, s.solving, s.rounds);
-        let expected = option.and_then(|k| s.ranking.get(k)).map(|o| trf!("Expected loot {}", format!("{:.2}", o.mean)));
+        // A move with no value (not played out) writes a dash, so the line keeps its parts.
+        let expected = option.filter(|&k| k < s.ranking.len()).map(|k| trf!("Expected loot {}", loot_text(s, Some(k)).unwrap_or_else(|| "\u{2014}".to_string())));
         // Small text: when the advice is not the 1st ranked, write the reason first, then the objective
         // progress and expected loot.
         let line: Vec<&str> = reason.into_iter().chain(goal.iter().map(String::as_str)).chain(expected.iter().map(String::as_str)).collect();
@@ -2790,14 +3021,14 @@ impl AscendantApp {
         let theme_text = theme_name(self.session.theme).unwrap_or(tr("None"));
         let text = trf!("{}s: {}   Theme: {}", instrument_term(), list, theme_text);
         if theme::click_line(ui, &text, MUTED).clicked() {
-            self.tools_open = !self.tools_open;
+            self.floats.toggle_tools();
         }
     }
 
     /// The edit window for instruments and theme (formerly a feature of the Run tab, behaviour unchanged:
     /// set_tools, set_theme).
     fn tools_window(&mut self, ctx: &egui::Context) {
-        if !self.tools_open {
+        if !self.floats.tools {
             return;
         }
         let mut open = true;
@@ -2814,7 +3045,7 @@ impl AscendantApp {
             .anchor(Align2::CENTER_TOP, [RAIL / 2.0, 30.0])
             .show(ctx, |ui| self.tools_editor(ui));
         if !open {
-            self.tools_open = false;
+            self.floats.tools = false;
         }
     }
 
@@ -2844,7 +3075,7 @@ impl AscendantApp {
         // The number columns use the width they actually need (the wider of the value and the column heading)
         // and the rest goes to the name column.
         let width_of = |text: &str, style: egui::TextStyle| ui.painter().layout_no_wrap(text.to_string(), style.resolve(ui.style()), Color32::WHITE).size().x;
-        let num_w = shown.iter().map(|&k| width_of(&format!("{:.2}", s.ranking[k].mean), egui::TextStyle::Body)).fold(width_of("0.00", egui::TextStyle::Body), f32::max);
+        let num_w = shown.iter().map(|&k| width_of(&loot_text(s, Some(k)).unwrap_or_default(), egui::TextStyle::Body)).fold(width_of("0.00", egui::TextStyle::Body), f32::max);
         let gap_w = shown.iter().map(|&k| width_of(&format!("\u{2212}{:.2}", (s.ranking[k].mean - top).abs()), egui::TextStyle::Small)).fold(width_of(tr("Gap"), egui::TextStyle::Small), f32::max);
         let head_w = width_of(tr("Expected loot"), egui::TextStyle::Small) + spacing + width_of(tr("Gap"), egui::TextStyle::Small);
         let cols = Cols::fit(ui.available_width(), spacing, num_w + 2.0, gap_w + 2.0, head_w);
@@ -2877,7 +3108,7 @@ impl AscendantApp {
             let chosen = advised == Some(k);
             let gap = o.mean - top;
             let label = RichText::new(&names[row]);
-            let number = RichText::new(format!("{:.2}", o.mean));
+            let number = RichText::new(loot_text(s, Some(k)).unwrap_or_else(|| "\u{2014}".to_string()));
             // The first row (the first rank itself) writes no gap. The gap is written with its sign: the order
             // is "candidates still running first, then by mean" (solve.rs), so an eliminated row or one ranked
             // later may have a higher mean than the first; a gap that rounds to 0 is written `±0.00`.
@@ -3238,41 +3469,61 @@ impl AscendantApp {
                 self.settings.highlight = highlight;
                 self.save();
             }
+            let mut value = self.settings.show_value;
+            let hover = tr("Shows the advised move's expected value just above where to click on the game (Tartarus: expected loot, Vorax: expected final activity), in small text. Clicks go through it to the game");
+            if ui.add(Switch::new(&mut value, tr("Show the expected value on the game"))).on_hover_text(hover).changed() {
+                self.settings.show_value = value;
+                self.save();
+            }
+            // Width of the wider of "Change" and "Cancel": the row's button is one or the other, and the label column
+            // keeps its width either way.
+            let button = [tr("Change"), tr("Cancel")]
+                .map(|t| egui::WidgetText::from(RichText::new(t).small()).into_galley(ui, None, f32::INFINITY, egui::TextStyle::Small).size().x)
+                .into_iter()
+                .fold(0.0, f32::max);
+            let (mut start, mut cancel, mut outside) = (None, false, false);
             for (which, label) in [(Which::Read, tr("Read key")), (Which::Auto, tr("Auto read key"))] {
-                // The right side is left for the "Change" button and a key-cap label at least KEYCAP_MIN wide,
-                // so on a narrow window the start of the key name (such as `Ctrl+…`) is still visible.
-                let change = egui::WidgetText::from(RichText::new(tr("Change")).small()).into_galley(ui, None, f32::INFINITY, egui::TextStyle::Small).size().x;
-                let keep = change + ui.spacing().button_padding.x * 2.0 + ui.spacing().item_spacing.x + KEYCAP_MIN;
+                // The right side is left for the button and a key-cap label at least KEYCAP_MIN wide, so on a narrow
+                // window the start of the key name (such as `Ctrl+…`) is still visible.
+                let keep = button + ui.spacing().button_padding.x * 2.0 + ui.spacing().item_spacing.x + KEYCAP_MIN;
+                // While recording, the label column narrows to the label itself, so the key cap has room for why a
+                // key was refused; only widths change, the row's height does not.
+                let keep = if self.recording.as_ref().is_some_and(|r| r.which == which) {
+                    let label_w = egui::WidgetText::from(label).into_galley(ui, None, f32::INFINITY, egui::TextStyle::Body).size().x + 4.0;
+                    keep.max(ui.available_width() - label_w - ui.spacing().item_spacing.x)
+                } else {
+                    keep
+                };
                 row_with(ui, label, keep, |ui| {
-                    let hint = tr("Such as F8, Ctrl+Shift+R or Alt+5");
-                    if self.editing_key == Some(which) {
-                        let text = &mut self.keys[which as usize].text;
-                        let r = ui.add(egui::TextEdit::singleline(text).desired_width(ui.available_width().min(100.0))).on_hover_text(hint);
-                        if std::mem::take(&mut self.key_focus) {
-                            r.request_focus();
-                        }
-                        // Apply on losing focus (Enter, Esc or a click elsewhere), the same as the original
-                        // input box.
-                        if r.lost_focus() {
-                            self.editing_key = None;
-                            self.apply_hotkey(which);
-                        }
+                    let hint = tr("Click, then press the new key");
+                    // Recording: the same button and key cap, so the row keeps its height; the cap asks for the key, or
+                    // says why the last one was refused.
+                    if let Some(r) = self.recording.as_ref().filter(|r| r.which == which) {
+                        let b = ui.small_button(tr("Cancel")).on_hover_text(tr("Press the new key, or Esc to cancel"));
+                        let (text, full, colour) = match &r.refused {
+                            Some(why) => (why.short.as_str(), why.full.as_str(), theme::WARN),
+                            None => (tr("Press a key..."), tr("Press a key..."), ACCENT),
+                        };
+                        let cap = theme::keycap_prompt(ui, text, colour).on_hover_text(format!("{full}\n{}", tr("Press the new key, or Esc to cancel")));
+                        cancel |= b.clicked();
+                        // A press anywhere else in the window cancels (the other row's "Change" then starts that row).
+                        let area = b.rect.union(cap.rect);
+                        outside |= ui.input(|i| i.pointer.any_pressed() && i.pointer.interact_pos().is_some_and(|p| !area.contains(p)));
                     } else {
                         if ui.small_button(tr("Change")).on_hover_text(hint).clicked() {
-                            // When "Change" of this row is pressed while another row is being edited: that
-                            // row's input box is not drawn this frame, so it never receives the focus loss;
-                            // apply it for that row first.
-                            if let Some(other) = self.editing_key.filter(|&o| o != which) {
-                                self.apply_hotkey(other);
-                            }
-                            self.editing_key = Some(which);
-                            self.key_focus = true;
+                            start = Some(which);
                         }
                         // On a narrow window the key name is truncated: the hover tooltip shows the full key.
                         let key = &self.keys[which as usize].text;
                         theme::keycap(ui, key).on_hover_text(format!("{key}\n{hint}"));
                     }
                 });
+            }
+            if cancel || outside {
+                self.stop_recording();
+            }
+            if let Some(which) = start {
+                self.start_recording(which);
             }
             // Always shown, so nothing moves; the status bar's notice tells when it is needed.
             let mut admin = self.settings.start_as_admin;
@@ -3437,7 +3688,7 @@ impl AscendantApp {
                         // the button shows them in the "What's new" window, no network needed (no tooltip: the
                         // window has them).
                         if !self.notes_history.is_empty() && ui.add(egui::Button::new(RichText::new(tr("What's new")).small()).small()).clicked() {
-                            self.whats_new = Some(WhatsNew::new(None));
+                            self.open_whats_new(false);
                         }
                     });
                 });
@@ -3498,7 +3749,7 @@ impl AscendantApp {
     /// while it runs, why it failed, and "Verify downloaded files..." with its answer. Nothing is downloaded without
     /// the player's "Update".
     fn update_section(&mut self, ui: &mut egui::Ui) {
-        let (mut check_now, mut update_now, mut verify_now, mut show_notes) = (false, false, false, None);
+        let (mut check_now, mut update_now, mut verify_now, mut show_notes) = (false, false, false, false);
         theme::heading(ui, tr("Updates"));
         let group = theme::group_frame().show(ui, |ui| {
             ui.set_width(ui.available_width());
@@ -3544,10 +3795,9 @@ impl AscendantApp {
                     }
                     // The "What's new" window: this release's verified notes, marked not installed yet, above the
                     // history; off when there are none to show.
-                    let pending = (!r.notes.is_empty()).then(|| update::SavedNotes { version: r.version_text(), notes: r.notes.clone() });
-                    let enabled = pending.is_some() || !self.notes_history.is_empty();
+                    let enabled = !r.notes.is_empty() || !self.notes_history.is_empty();
                     if ui.add_enabled(enabled, egui::Button::new(RichText::new(tr("What's new")).small()).small()).clicked() {
-                        show_notes = Some(WhatsNew::new(pending));
+                        show_notes = true;
                     }
                 });
                 if let Some(step) = self.update_step() {
@@ -3604,8 +3854,8 @@ impl AscendantApp {
         if verify_now {
             self.pick_verify = true;
         }
-        if show_notes.is_some() {
-            self.whats_new = show_notes;
+        if show_notes {
+            self.open_whats_new(true);
         }
     }
 
@@ -3618,7 +3868,7 @@ impl AscendantApp {
     /// are, so the main window's layout does not move; the text wraps, can be selected and copied, and scrolls when it
     /// is taller than the window allows. Its "x" or Esc closes it.
     fn whats_new_window(&mut self, ctx: &egui::Context) {
-        let Some(w) = &self.whats_new else { return };
+        let Some(w) = &self.floats.whats_new else { return };
         let pending = w.pending.as_ref().map(|p| (p, true));
         let kept = self.notes_history.iter().filter(|n| w.pending.as_ref().is_none_or(|p| p.version != n.version)).map(|n| (n, false));
         let shown: Vec<(&update::SavedNotes, bool)> = pending.into_iter().chain(kept).collect();
@@ -3657,8 +3907,8 @@ impl AscendantApp {
                     ui.scroll_to_cursor(Some(Align::BOTTOM));
                 }
             });
-        if !open || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-            self.whats_new = None;
+        if !open || esc_closes(ctx.input(|i| i.key_pressed(egui::Key::Escape)), self.esc_busy) {
+            self.floats.whats_new = None;
         }
     }
 
@@ -3754,6 +4004,24 @@ impl AscendantApp {
         self.preview_tooltip_progress = std::env::var("ASCENDANT_PREVIEW_TOOLTIP").is_ok_and(|v| v == "progress");
         self.preview_not_first = std::env::var("ASCENDANT_PREVIEW_NOT_FIRST").is_ok_and(|v| v == "1");
         self.preview_run_over = std::env::var("ASCENDANT_PREVIEW_RUN_OVER").is_ok_and(|v| v == "1");
+        // ASCENDANT_PREVIEW_RECORD=read or auto: that hotkey row recording ("Press a key..."); with :same or :typing
+        // added, as after the other hotkey's key or a plain letter was pressed (the refusal in the row).
+        if let Ok(v) = std::env::var("ASCENDANT_PREVIEW_RECORD") {
+            let (row, then) = v.split_once(':').unwrap_or((v.as_str(), ""));
+            let which = if row == "auto" { Which::Auto } else { Which::Read };
+            let other = if which == Which::Read { Which::Auto } else { Which::Read };
+            self.preview_recording = true;
+            self.start_recording(which);
+            let other_text = other.setting(&mut self.settings).clone();
+            let got = match then {
+                "same" => Some(Recorded::Key(other_text.clone())),
+                "typing" => Some(Recorded::Typing("A".into())),
+                _ => None,
+            };
+            if let Some(Judged::Refuse(why)) = got.map(|g| judge(g, (&other_text, other))) {
+                self.refuse_key(why);
+            }
+        }
         // ASCENDANT_PREVIEW_LOG=following, searching, closed, stale, missing, manual-missing or off: that game log
         // status instead of the watcher's (for the settings page, the light and the status bar).
         if let Ok(v) = std::env::var("ASCENDANT_PREVIEW_LOG") {
@@ -3813,7 +4081,7 @@ impl AscendantApp {
         self.preview_auto_waiting = std::env::var("ASCENDANT_PREVIEW_AUTO_WAITING").ok();
         self.preview_status_open = std::env::var("ASCENDANT_PREVIEW_STATUS_OPEN").is_ok_and(|v| v == "1");
         self.restoring = std::env::var("ASCENDANT_PREVIEW_RESTORE").is_ok_and(|v| v == "1");
-        self.tools_open = std::env::var("ASCENDANT_PREVIEW_TOOLS").is_ok_and(|v| v == "1");
+        self.floats.tools = std::env::var("ASCENDANT_PREVIEW_TOOLS").is_ok_and(|v| v == "1");
         // ASCENDANT_PREVIEW_NO_OCR=1: as if this computer had no OCR language (the system's OCR is not removed),
         // for the line and the install button; =installing, declined, failed or done shows that state too (PowerShell never starts).
         if let Ok(v) = std::env::var("ASCENDANT_PREVIEW_NO_OCR") {
@@ -3871,7 +4139,6 @@ impl AscendantApp {
             self.preview_update_scroll = true;
             let release = update::Release {
                 version: [1, 1, 0],
-                page: format!("{}/tag/v1.1.0", update::RELEASES_PAGE),
                 notes: "[[zh-TW]]\n- 自動更新：下載後先驗證 Ed25519 簽章\n- 渴血：排名第 4～6 名改成一行\n- 塔羅斯：盤面讀取更穩定\n- 設定頁新增「立即檢查」\n- 其他小修正\n[[en]]\n- Updates: the Ed25519 signature is checked after the download\n- Vorax: ranks 4 to 6 on one line\n- Tartarus: steadier board reading\n- Settings: new \"Check now\"\n- Other small fixes".to_string(),
                 exe: update::Asset { url: String::new(), size: 0, digest: None },
                 sums: update::Asset { url: String::new(), size: 0, digest: None },
@@ -3913,8 +4180,7 @@ impl AscendantApp {
             }
         }
         if updated.as_deref() == Some("notes") {
-            let pending = self.release.as_ref().map(|r| update::SavedNotes { version: r.version_text(), notes: r.notes.clone() });
-            self.whats_new = Some(WhatsNew::new(pending));
+            self.open_whats_new(true);
         }
         if let Ok(v) = std::env::var("ASCENDANT_PREVIEW_VERIFY") {
             self.preview_update_scroll = true;
@@ -3984,7 +4250,7 @@ impl AscendantApp {
         self.settings = restored(&old);
         // Release the two old hotkeys before registering the new ones: old and new may swap (for example the
         // old read key is the new auto read key).
-        self.editing_key = None;
+        self.recording = None;
         for which in Which::ALL {
             let key = &mut self.keys[which as usize];
             key.hotkey = None;
@@ -4019,7 +4285,7 @@ impl AscendantApp {
 ///   deleting the player's run logs).
 /// - Back to default: `read_hotkey`, `auto_hotkey`, `click_through` (off), `opacity`,
 ///   `window_title`, `rollouts`, `auto_read`, `auto_place`, `window_pos` and `window_size` (back to 296×520 on
-///   the next launch and placed by the game panel again), `observe`, `highlight`, `font_scale` (standard),
+///   the next launch and placed by the game panel again), `observe`, `highlight`, `show_value`, `font_scale` (standard),
 ///   `vorax_enabled`, `vorax_rollouts`, `vorax_learn`, `vorax_strips`, `game_log` (automatic again), `start_as_admin`
 ///   ("Start as administrator", off).
 ///
@@ -4719,6 +4985,20 @@ fn row_with<R>(ui: &mut egui::Ui, label: &str, keep: f32, control: impl FnOnce(&
     .inner
 }
 
+/// Whether a click in the game while the mark shows `action` on `screen` hides the mark until a reading changes:
+/// not for picking an instrument or a treasure card, which only selects it (2026-11-07, the mark went 6.8 s before
+/// "Confirm"); every other move (a reroll on those screens too) is played by its click.
+fn click_hides(screen: Screen, action: &Action) -> bool {
+    !(matches!(screen, Screen::InstrumentPick | Screen::TreasurePick) && matches!(action, Action::Choose { .. }))
+}
+
+/// The expected loot of the move at `option` in the session's ranking ([`Session::loot`]: the day's first bite left
+/// alone takes the manage screen's value) as the window writes it, `6.74`: the board's advice line, the top three and
+/// the value on the game; None without a value (the window then writes a dash).
+fn loot_text(session: &Session, option: Option<usize>) -> Option<String> {
+    session.loot(option).map(|mean| format!("{mean:.2}"))
+}
+
 /// A move's label without its bracketed details, which the board marks show.
 fn short(label: &str) -> &str {
     label.split_once(" (").map_or(label, |(name, _)| name)
@@ -5266,7 +5546,7 @@ mod tests {
             "window_title":"Game","rollouts":800,"tools":["lion_trap"],"tools_days":12,"theme":3,"auto_read":false,
             "auto_place":false,"window_pos":[10,20],"window_size":[300.0,600.0],"run_log":false,"keep_all_logs":true,"observe":true,
             "check_updates":false,"updated_seen":"1.0.1","offer_install":false,"share_logs":true,"shared_from":"2026-11-01_00-00-00",
-            "install_id":"abc","desktop_shortcut":true,"highlight":true,"language":"zh-TW","vorax_enabled":false,
+            "install_id":"abc","desktop_shortcut":true,"highlight":true,"show_value":false,"language":"zh-TW","vorax_enabled":false,
             "vorax_rollouts":1024,"vorax_learn":false,"vorax_strips":true,"font_scale":1.3,"layout":"compact",
             "game_log":"D:/Logs/UE_game.log"}"#,
         )
@@ -5318,19 +5598,108 @@ mod tests {
                 _ => None,
             })
         };
-        let updated = NoticeKind::Updated { version: "1.0.0".into(), notes: "- kept".into() };
-        assert_eq!(whats_new(&updated), Some((true, None)));
-        let new = update::SavedNotes { version: "1.1.0".into(), notes: "- new".into() };
-        let available = NoticeKind::Update { version: "1.1.0".into(), notes: "- new".into(), history: true, updating: None, checking: true };
-        assert_eq!(whats_new(&available), Some((true, Some(new))));
-        let running = NoticeKind::Update { version: "1.1.0".into(), notes: "- new".into(), history: true, updating: Some(update::Step::Download), checking: false };
+        let updated = NoticeKind::Updated { version: "1.0.0".into(), notes: "- kept" };
+        assert_eq!(whats_new(&updated), Some((true, false)));
+        let available = NoticeKind::Update { version: "1.1.0".into(), notes: "- new", history: true, updating: None, checking: true };
+        assert_eq!(whats_new(&available), Some((true, true)));
+        let running = NoticeKind::Update { version: "1.1.0".into(), notes: "- new", history: true, updating: Some(update::Step::Download), checking: false };
         assert_eq!(whats_new(&running).map(|w| w.0), Some(false));
         // A release without notes still lists the built-in ones; with none at all there is nothing to show.
-        let bare = NoticeKind::Update { version: "1.1.0".into(), notes: String::new(), history: true, updating: None, checking: false };
-        assert_eq!(whats_new(&bare), Some((true, None)));
-        let nothing = NoticeKind::Update { version: "1.1.0".into(), notes: String::new(), history: false, updating: None, checking: false };
+        let bare = NoticeKind::Update { version: "1.1.0".into(), notes: "", history: true, updating: None, checking: false };
+        assert_eq!(whats_new(&bare), Some((true, false)));
+        let nothing = NoticeKind::Update { version: "1.1.0".into(), notes: "", history: false, updating: None, checking: false };
         assert_eq!(whats_new(&nothing).map(|w| w.0), Some(false));
-        assert_eq!(whats_new(&NoticeKind::Updated { version: "1.0.0".into(), notes: String::new() }).map(|w| w.0), Some(false));
+        assert_eq!(whats_new(&NoticeKind::Updated { version: "1.0.0".into(), notes: "" }).map(|w| w.0), Some(false));
+    }
+
+    /// "What's new" and the instruments window share one spot: opening one closes the other, and closing the
+    /// instruments window leaves "What's new" closed.
+    #[test]
+    fn whats_new_and_the_instruments_window_take_turns() {
+        let mut floats = Floats::default();
+        floats.open_whats_new(WhatsNew::new(None));
+        assert!(floats.whats_new.is_some() && !floats.tools);
+        floats.toggle_tools();
+        assert!(floats.whats_new.is_none() && floats.tools, "the instruments window closes What's new");
+        floats.open_whats_new(WhatsNew::new(None));
+        assert!(floats.whats_new.is_some() && !floats.tools, "What's new closes the instruments window");
+        floats.toggle_tools();
+        floats.toggle_tools();
+        assert!(floats.whats_new.is_none() && !floats.tools);
+    }
+
+    /// Esc closes "What's new" only when no text box has the keyboard and no hotkey is being recorded.
+    #[test]
+    fn esc_is_the_text_box_or_the_recording_first() {
+        assert!(esc_closes(true, false));
+        assert!(!esc_closes(true, true), "a text box or a recording has it");
+        assert!(!esc_closes(false, false));
+    }
+
+    /// Recording a hotkey: Esc cancels, the other hotkey's key and a key that types are refused with a reason, a
+    /// usable key is tried.
+    #[test]
+    fn recorded_keys_are_judged() {
+        let auto = ("F8", Which::Auto);
+        assert_eq!(judge(Recorded::Cancel, auto), Judged::Cancel);
+        assert_eq!(judge(Recorded::Key("Ctrl+Shift+R".into()), auto), Judged::Try("Ctrl+Shift+R".into()));
+        assert_eq!(judge(Recorded::Key("F9".into()), auto), Judged::Try("F9".into()));
+        // The auto read key, however written.
+        assert!(matches!(judge(Recorded::Key("F8".into()), auto), Judged::Refuse(why) if why.full.contains("F8")));
+        assert!(matches!(judge(Recorded::Key("Ctrl+Alt+5".into()), ("alt+ctrl+5", Which::Read)), Judged::Refuse(_)));
+        assert!(matches!(judge(Recorded::Typing("A".into()), auto), Judged::Refuse(why) if why.short.contains('A') && why.full.contains('A')));
+        assert!(matches!(judge(Recorded::Unusable, auto), Judged::Refuse(_)));
+        assert!(matches!(judge(Recorded::Clipboard, auto), Judged::Refuse(_)));
+    }
+
+    /// On a Cage Fight's target screen the value sits over the first badge's cell (the next bite), in screen px.
+    #[test]
+    fn the_value_goes_over_the_first_badge() {
+        let spots = [(1, (900.0, 500.0, 65.0, 65.0)), (2, (1200.0, 500.0, 65.0, 65.0))];
+        let game = Some([100, 50, 2560, 1440]);
+        assert_eq!(first_badge_spot(&spots, game), Some(([1000.0, 550.0, 65.0, 65.0, 1440.0 / 1080.0], 50)));
+        assert_eq!(first_badge_spot(&[], game), None);
+        assert_eq!(first_badge_spot(&spots, None), None, "the game behind or gone");
+    }
+
+    /// A click selecting an instrument or treasure card keeps the mark; a reroll there, and a click on any other screen,
+    /// hides it.
+    #[test]
+    fn picking_a_card_keeps_the_mark() {
+        use crate::engine::ChoiceId;
+        let card = Action::Choose { id: ChoiceId::Cell(3) };
+        assert!(!click_hides(Screen::InstrumentPick, &card), "an instrument card picked, not confirmed");
+        assert!(!click_hides(Screen::TreasurePick, &card), "a treasure card picked, not confirmed");
+        assert!(click_hides(Screen::InstrumentPick, &Action::Reroll));
+        assert!(click_hides(Screen::TreasurePick, &Action::Reroll));
+        assert!(click_hides(Screen::CellPick, &card), "a cell pick is played by its click");
+        assert!(click_hides(Screen::Manage, &Action::Devour { to: 4 }));
+        assert!(click_hides(Screen::Patrol, &Action::Patrol { cell: 7 }));
+        assert!(click_hides(Screen::ChainTarget, &Action::Chain { to: 9 }));
+    }
+
+    /// A move left alone is not played out (n = 0, mean 0): with no manage screen's value to take it has none, on the
+    /// game or in the window (the session's tests cover the value taken).
+    #[test]
+    fn a_move_not_played_out_has_no_value() {
+        let mut s = Session::new(100, Vec::new(), None, Some(10));
+        s.ranking = vec![SolveOption { label: String::new(), action: Action::Devour { to: 4 }, mean: 0.0, se: 0.0, gap_se: 0.0, n: 0, best: 0.0, policy: true }];
+        assert_eq!(loot_text(&s, Some(0)), None);
+    }
+
+    /// The value on the game is the board's own "Expected loot" number for the advised move: the same function
+    /// writes both, two decimals of that move's mean (not the first row's).
+    #[test]
+    fn the_value_on_the_game_is_the_boards_number() {
+        let option = |mean: f64| SolveOption { label: String::new(), action: Action::Swap, mean, se: 0.1, gap_se: 0.1, n: 1600, best: 0.0, policy: false };
+        let mut s = Session::new(100, Vec::new(), None, Some(10));
+        s.ranking = vec![option(6.8123), option(6.7406), option(5.0)];
+        assert_eq!(loot_text(&s, Some(1)).as_deref(), Some("6.74"));
+        assert_eq!(loot_text(&s, Some(1)), Some(format!("{:.2}", s.ranking[1].mean)), "the top three's number");
+        assert_eq!(loot_text(&s, None), None);
+        assert_eq!(loot_text(&s, Some(9)), None);
+        s.ranking.clear();
+        assert_eq!(loot_text(&s, Some(0)), None);
     }
 
     /// Every file in data/release-notes is built in under its version with the same text, the running version has
@@ -5445,7 +5814,6 @@ mod tests {
     fn hourly_check_keeps_an_offered_update() {
         let release = |minor: u64| update::Release {
             version: [1, minor, 0],
-            page: String::new(),
             notes: String::new(),
             exe: update::Asset { url: String::new(), size: 0, digest: None },
             sums: update::Asset { url: String::new(), size: 0, digest: None },

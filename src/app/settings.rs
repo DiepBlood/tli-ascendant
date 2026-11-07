@@ -80,6 +80,10 @@ pub struct Settings {
     /// Mark on the game what to click for the advised move, see
     /// [`super::mark`].
     pub highlight: bool,
+    /// Show on the game, just above the advised target, the advised move's own expected value (Tartarus: the
+    /// expected loot, Vorax: the expected final activity), the same number the window shows. Separate from
+    /// `highlight`: on with the mark off it still shows. On by default and in older files (the player's choice, 2026-11-07).
+    pub show_value: bool,
     /// The game client's language, which the reader reads and the window
     /// writes in: "en" or "zh-TW" (see [`crate::lang::Lang::key`]).
     pub language: String,
@@ -137,6 +141,7 @@ impl Default for Settings {
             install_id: String::new(),
             desktop_shortcut: false,
             highlight: false,
+            show_value: true,
             language: "en".to_string(),
             vorax_enabled: true,
             vorax_rollouts: 4096,

@@ -1493,6 +1493,9 @@ pub struct Session {
     /// The manage screen's advice to Consume, shown on its target screen
     /// while that solves, see [`Session::shown_advice`]; until a bite.
     manage_bite: Option<Advice>,
+    /// The expected loot `manage_bite` was solved with (its playouts ran), for its target screen's first bite: forced
+    /// there, that bite is not played out (see [`Session::loot`]). Set and cleared with `manage_bite`.
+    manage_loot: Option<f64>,
     /// The last Consume target read showed the eater's cell locked after an
     /// Exalted eater's bite: it went to the vault, see [`Session::solve`].
     eater_vaulted: bool,
@@ -1719,6 +1722,7 @@ impl Session {
             meal_doubt: Vec::new(),
             offered_wide: None,
             manage_bite: None,
+            manage_loot: None,
             eater_vaulted: false,
             overlay_seen: false,
             bite_logged: false,
@@ -3933,6 +3937,7 @@ impl Session {
                 self.inferred_from = None;
                 self.eater_seen = None;
                 self.manage_bite = None;
+                self.manage_loot = None;
                 // In a Cage Fight the chain's badges number the bites ahead:
                 // the one on the meal just eaten goes at once, and the mark,
                 // left on that meal, hides like any other theme's until a
@@ -4014,6 +4019,7 @@ impl Session {
             Signal::Moved => {
                 self.chain_armed = false;
                 self.manage_bite = None;
+                self.manage_loot = None;
                 self.moved_from = self.reading.as_ref().map(|r| r.model.warden);
             }
             Signal::RunStart if self.reading.is_some() && self.run_over.is_none() => self.end_run(),
@@ -4352,6 +4358,7 @@ impl Session {
             self.shown = Some(a.action.clone());
             if self.reading.as_ref().is_some_and(|r| r.screen == Screen::Manage) {
                 self.manage_bite = matches!(a.action, Action::Devour { .. }).then(|| a.clone());
+                self.manage_loot = self.manage_bite.as_ref().and_then(|a| self.ranking.get(a.option?)).filter(|o| o.n > 0).map(|o| o.mean);
             }
             // A move played since the reading's read is not held again: the
             // board before a bite, its eater not risen yet, gave the next
@@ -4416,6 +4423,21 @@ impl Session {
             Some(k) => Advice { action: self.ranking[k].action.clone(), label: self.ranking[k].label.clone(), why: a.why, option: Some(k) },
             None => a,
         }
+    }
+
+    /// The expected loot of the move at `option` in [`Session::ranking`], the number the window and the value on the
+    /// game show: its mean once playouts ran for it. A move left alone is not played out (n 0, mean 0, no value): the
+    /// day's first bite, forced on its target screen, takes the value the manage screen's Consume advice was solved
+    /// with, when it is the bite that advice planned (the same cell, before the bite; a move or the day's end clears
+    /// it); None otherwise. No playout runs for it, so the advice comes no later (2026-11-07: it showed 0.00).
+    pub fn loot(&self, option: Option<usize>) -> Option<f64> {
+        let o = self.ranking.get(option?)?;
+        if o.n > 0 {
+            return Some(o.mean);
+        }
+        let r = self.reading.as_ref()?;
+        let planned = self.manage_bite.as_ref()?;
+        (r.screen == Screen::ChainTarget && planned.action == o.action).then_some(self.manage_loot).flatten()
     }
 
     /// Where the player clicks for the advice: the target's centre, half
@@ -4862,6 +4884,7 @@ impl Session {
         self.eater_seen = None;
         self.eater_vaulted = false;
         self.manage_bite = None;
+        self.manage_loot = None;
         self.chain_follow.clear();
         self.chain_numbers.clear();
         self.eaten = None;
@@ -4948,6 +4971,7 @@ impl Session {
         self.moved_from = None;
         self.held = None;
         self.manage_bite = None;
+        self.manage_loot = None;
         self.bite_logged = false;
         self.objective_done = false;
         self.consumed_on = None;
@@ -5299,6 +5323,31 @@ mod tests {
             scene.cells[cell as usize - 2].target = true;
         }
         scene
+    }
+
+    /// The day's first bite, the only target on its screen, is not played out: it shows the value the manage screen's
+    /// Consume advice for that cell was solved with; not another plan's, and nothing when there is none to take.
+    #[test]
+    fn the_first_bite_takes_the_manage_value() {
+        let mut s = Session::new(100, Vec::new(), None, Some(10));
+        let option = |to: usize, mean: f64, n: usize| SolveOption { label: String::new(), action: Action::Devour { to }, mean, se: 0.0, gap_se: 0.0, n, best: 0.0, policy: false };
+        let advice = |to: usize| Advice { action: Action::Devour { to }, label: String::new(), why: String::new(), option: Some(0) };
+        s.reading = Some(Reading { model: board(), warnings: Vec::new(), screen: Screen::ChainTarget, days_left: None, at: SystemTime::now(), eater_inferred: false });
+        s.ranking = vec![option(4, 0.0, 0)];
+        assert_eq!(s.loot(Some(0)), None, "no manage advice to take it from");
+        (s.manage_bite, s.manage_loot) = (Some(advice(4)), Some(8.495));
+        assert_eq!(s.loot(Some(0)), Some(8.495), "the manage screen's Consume 04");
+        s.manage_bite = Some(advice(7));
+        assert_eq!(s.loot(Some(0)), None, "the manage screen planned another cell");
+        (s.manage_bite, s.manage_loot) = (Some(advice(4)), None);
+        assert_eq!(s.loot(Some(0)), None, "the manage advice had no playouts either");
+        (s.manage_bite, s.manage_loot) = (Some(advice(4)), Some(8.495));
+        s.reading = Some(Reading { model: board(), warnings: Vec::new(), screen: Screen::Manage, days_left: None, at: SystemTime::now(), eater_inferred: false });
+        assert_eq!(s.loot(Some(0)), None, "not on the target screen");
+        s.ranking = vec![option(4, 7.25, 1600)];
+        assert_eq!(s.loot(Some(0)), Some(7.25), "played out: its own mean");
+        assert_eq!(s.loot(None), None);
+        assert_eq!(s.loot(Some(3)), None);
     }
 
     /// A live session in a chain on `board`, its first bite taken.

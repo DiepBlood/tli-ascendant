@@ -1083,6 +1083,13 @@ fn vorax_shots(dir: &Path, text: &str) -> Vec<Shot> {
                     }
                 }
             }
+            // Private builds only: the English client's whole frames ([`SAMPLE_TREAT`]).
+            #[cfg(feature = "dev-samples")]
+            k if k == super::vorax_session::samples::EVENT => {
+                if let Some(f) = v["file"].as_str().filter(|f| is_sample(f) && exists(f)) {
+                    shots.push(Shot { ms: r.ms, file: f.to_string(), treat: SAMPLE_TREAT });
+                }
+            }
             "vorax_battle_frame" | "vorax_battle_end" => {
                 if let Some(f) = v["frame"].as_str().filter(|f| f.starts_with("frame-battle-") && exists(f)) {
                     shots.push(Shot { ms: r.ms, file: f.to_string(), treat: Treat::AsIs });
@@ -1103,6 +1110,81 @@ fn vorax_shots(dir: &Path, text: &str) -> Vec<Shot> {
     }
     shots.sort_by_key(|s| s.ms);
     shots
+}
+
+/// Private builds only (feature `dev-samples`): the English client's whole frames (`sample-NNNN.jpg`, see
+/// `super::vorax_session::samples`) go in whole with [`mask_ids`] applied, as a Tartarus board frame does: they may
+/// show any screen, the battle's map with its UID and chat included.
+#[cfg(feature = "dev-samples")]
+const SAMPLE_TREAT: Treat = Treat::Full(Game::Tartarus);
+
+/// The interface scale a run's sample frames are masked for when its log has none ([`sample_scale`]): the
+/// largest setting is about 1.5 times the one the id blocks were measured at.
+#[cfg(feature = "dev-samples")]
+const SAMPLE_SCALE_DEFAULT: f32 = 1.5;
+
+/// The interface scale of a run's sample frames, for [`sample_rects`]: the largest `ui_scale` the log has, as a
+/// multiple of the setting the id blocks were measured at (PageScale 0.667, see `crate::vorax::ui_scale`), never
+/// under 1; [`SAMPLE_SCALE_DEFAULT`] without one.
+#[cfg(feature = "dev-samples")]
+fn sample_scale(text: &str) -> f32 {
+    rows(text)
+        .iter()
+        .filter(|r| kind(&r.v) == "ui_scale")
+        .filter_map(|r| r.v["scale"].as_f64())
+        .map(|p| (p / 0.667) as f32)
+        .fold(None, |m: Option<f32>, s| Some(m.map_or(s, |m| m.max(s))))
+        .map_or(SAMPLE_SCALE_DEFAULT, |s| s.clamp(1.0, 2.0))
+}
+
+/// [`id_rects`] for a sample frame at interface scale `s`: each block `s` times as large from its corner. The HUD
+/// grows with the interface (at the largest setting the UID starts 0.486 of the height from the right edge, past
+/// the 0.375 measured at the original setting).
+#[cfg(feature = "dev-samples")]
+fn sample_rects(w: usize, h: usize, s: f32) -> [Rect; 3] {
+    let (wf, hf) = (w as f32, h as f32);
+    let corner = |(fw, fh): (f32, f32)| ((fw * s * hf).ceil().min(wf) as i32, (fh * s * hf).ceil().min(hf) as i32);
+    let (rw, rh) = corner(UID_RIGHT);
+    let (cw, ch) = corner(CHAT_LEFT);
+    let (lw, lh) = corner(ID_LINE_LEFT);
+    [Rect::new(w as i32 - rw, h as i32 - rh, rw, rh), Rect::new(0, h as i32 - ch, cw, ch), Rect::new(0, h as i32 - lh, lw, lh)]
+}
+
+/// The most sample frames one export takes: evenly spread over the run when there are more.
+#[cfg(feature = "dev-samples")]
+const SAMPLE_PICKS: usize = 80;
+
+/// A sample frame's file name ([`SAMPLE_TREAT`]).
+#[cfg(feature = "dev-samples")]
+fn is_sample(file: &str) -> bool {
+    let name = file.rsplit('/').next().unwrap_or(file);
+    name.strip_prefix(super::vorax_session::samples::PREFIX).is_some_and(|rest| rest.starts_with('-')) && name.ends_with(".jpg")
+}
+
+/// The picks of a Vorax export with the run's sample frames added (each once, at most [`SAMPLE_PICKS`], evenly
+/// spread): they are what the run is for, so not only those near a moment.
+#[cfg(feature = "dev-samples")]
+fn with_samples(mut picks: Vec<Pick>, shots: &[Shot]) -> Vec<Pick> {
+    let samples: Vec<&Shot> = shots.iter().filter(|s| is_sample(&s.file)).collect();
+    let n = samples.len();
+    let take = n.min(SAMPLE_PICKS);
+    for i in 0..take {
+        let shot = samples[i * n / take];
+        if !picks.iter().any(|p| p.shot.file == shot.file) {
+            picks.push(Pick { shot: shot.clone(), moments: Vec::new(), step: false });
+        }
+    }
+    picks
+}
+
+/// The note of a zip with sample frames, shown in the listing before saving.
+#[cfg(feature = "dev-samples")]
+fn sample_note(n: usize) -> String {
+    if lang::zh() {
+        format!("含整張畫面 {n} 張（已遮 UID 與聊天）：英文客戶端樣本，只在私人測試版。")
+    } else {
+        format!("Includes {n} whole frames (UID and chat blacked out): English client samples, private test build only.")
+    }
 }
 
 /// Each move's time: the read time of each Tartarus advice, each Vorax round (`vorax_round`).
@@ -1318,6 +1400,16 @@ fn process(dir: &Path, shot: &Shot, width: usize, quality: u8, hint: &mut Option
     let path = dir.join(&shot.file);
     let bytes = std::fs::read(&path).map_err(|e| format!("{}: {e}", shot.file))?;
     let img = decode_jpeg(&bytes).map_err(|e| format!("{}: {e}", shot.file))?;
+    // Private builds only: a sample frame goes in whole with the id blocks grown to its interface scale (`hint`, set
+    // from the run's log by `prepare`), never through the treatments below.
+    #[cfg(feature = "dev-samples")]
+    if is_sample(&shot.file) {
+        let mut img = img;
+        for r in sample_rects(img.w, img.h, hint.unwrap_or(SAMPLE_SCALE_DEFAULT)) {
+            blacken(&mut img, r);
+        }
+        return encode_jpeg(&shrink(img, width), quality).map(Some);
+    }
     treat_image(img, shot.treat, hint).map(|img| encode_jpeg(&shrink(img, width), quality)).transpose()
 }
 
@@ -1805,6 +1897,11 @@ pub fn prepare(req: &Request, cancel: &AtomicBool, status: &dyn Fn(String)) -> R
     let mut cache: HashMap<String, Option<Vec<u8>>> = HashMap::new();
     let mut sized: Option<(usize, u8)> = None;
     let mut hint = None;
+    // A Vorax run's sample frames are masked for its interface scale (`process`); Vorax cuts do not use the hint.
+    #[cfg(feature = "dev-samples")]
+    if req.game == Game::Vorax {
+        hint = Some(sample_scale(&text));
+    }
     for (k, drop) in attempts() {
         let level = LEVELS[k];
         if sized != Some((level.width, level.quality)) {
@@ -1812,6 +1909,8 @@ pub fn prepare(req: &Request, cancel: &AtomicBool, status: &dyn Fn(String)) -> R
             sized = Some((level.width, level.quality));
         }
         let picks = plan(req.game, &shots, &steps, &moments, &level, drop);
+        #[cfg(feature = "dev-samples")]
+        let picks = if req.game == Game::Vorax { with_samples(picks, &shots) } else { picks };
         let todo: Vec<&Pick> = picks.iter().filter(|p| !cache.contains_key(&p.shot.file)).collect();
         for (n, p) in todo.iter().enumerate() {
             check()?;
@@ -1841,6 +1940,18 @@ pub fn prepare(req: &Request, cancel: &AtomicBool, status: &dyn Fn(String)) -> R
                 None => p.moments.iter().for_each(|&m| skipped[m] = true),
             }
         }
+        #[cfg(not(feature = "dev-samples"))]
+        let notes = notes.clone();
+        // Private builds only: a zip with sample frames says so first.
+        #[cfg(feature = "dev-samples")]
+        let notes = {
+            let mut notes = notes.clone();
+            let n = files.iter().filter(|(name, _)| is_sample(name)).count();
+            if n > 0 {
+                notes.insert(0, sample_note(n));
+            }
+            notes
+        };
         let mut prepared = Prepared {
             run: run.clone(),
             game: Some(req.game),
@@ -1850,7 +1961,7 @@ pub fn prepare(req: &Request, cancel: &AtomicBool, status: &dyn Fn(String)) -> R
             images: files.len(),
             removed: removed.clone(),
             level: (k, drop),
-            notes: notes.clone(),
+            notes,
             quiet: quiet.clone(),
         };
         let report = scrub_text(&report_text(&prepared, &level, &facts), &scrub, &mut Removed::default());
@@ -2423,6 +2534,11 @@ fn contents(ui: &mut egui::Ui, p: &Prepared) {
     };
     ui.label(RichText::new(trf!("{} \u{b7} {}", run_time(&p.run), p.game.map_or("", Game::name))).strong());
     small(ui, &trf!("{} images, {} in all ({} for the moves)", p.images, size_text(p.zip.len() as u64), p.step_images), theme::TEXT);
+    // Private builds only: a zip with the English client's whole frames says so before it is saved.
+    #[cfg(feature = "dev-samples")]
+    if let Some(n) = p.notes.first().filter(|n| p.images > 0 && (n.starts_with("含整張畫面") || n.starts_with("Includes"))) {
+        small(ui, n, theme::WARN);
+    }
     let (k, drop) = p.level;
     if k > 0 || drop > 0 {
         let l = LEVELS[k];
@@ -2486,6 +2602,67 @@ mod tests {
 
     fn line(v: Value) -> String {
         v.to_string()
+    }
+
+    /// Private builds only: a Vorax run's sample frames are shots treated whole with the id corners blacked out,
+    /// every one is picked (evenly spread over the cap), and the listing's note says the zip has whole frames.
+    #[cfg(feature = "dev-samples")]
+    #[test]
+    fn sample_frames_go_in_whole_and_masked() {
+        let dir = std::env::temp_dir().join(format!("ascendant-report-samples-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut text = String::new();
+        for k in 0..100 {
+            let file = format!("sample-{:04}.jpg", k + 1);
+            std::fs::write(dir.join(&file), b"x").unwrap();
+            text.push_str(&line(json!({"at": t(&format!("00:{:02}.{:03}", k / 10, (k % 10) * 100)), "kind": "vorax_sample", "file": file, "why": "interval"})));
+            text.push('\n');
+        }
+        // A sample row whose file is gone, and a row of another kind naming a sample file: neither is a shot.
+        text.push_str(&line(json!({"at": t("00:20.000"), "kind": "vorax_sample", "file": "sample-0999.jpg"})));
+        text.push('\n');
+        text.push_str(&line(json!({"at": t("00:21.000"), "kind": "vorax_note", "file": "sample-0001.jpg"})));
+        let shots = vorax_shots(&dir, &text);
+        assert_eq!(shots.len(), 100);
+        assert!(shots.iter().all(|s| s.treat == SAMPLE_TREAT && masked(s.treat)));
+        let picks = with_samples(Vec::new(), &shots);
+        assert_eq!(picks.len(), SAMPLE_PICKS);
+        assert_eq!((picks[0].shot.file.as_str(), picks[79].shot.file.as_str()), ("sample-0001.jpg", "sample-0099.jpg"));
+        // Already picked (near a moment): not twice.
+        let again = with_samples(picks.clone(), &shots);
+        assert_eq!(again.len(), SAMPLE_PICKS);
+        // Even through the treatments, a sample frame is masked and kept whole.
+        let img = Rgba { w: 2560, h: 1440, data: vec![255; 2560 * 1440 * 4] };
+        let out = treat_image(img.clone(), SAMPLE_TREAT, &mut None).unwrap();
+        assert_eq!((out.w, out.h), (2560, 1440));
+        for r in id_rects(2560, 1440) {
+            assert_eq!(out.rgb(r.x + r.w / 2, r.y + r.h / 2), [0, 0, 0], "{r:?}");
+        }
+        // The blocks grow with the interface scale: at scale 1 they are the usual ones; at the largest setting the
+        // UID (0.486 of the height from the right edge) is covered.
+        assert_eq!(sample_rects(2560, 1440, 1.0), id_rects(2560, 1440));
+        let uid = sample_rects(2560, 1440, 1.5)[0];
+        assert!(2560 - uid.x >= (0.486 * 1440.0) as i32, "{uid:?}");
+        // process: whole, at its width, the id blocks of the run's scale blacked out (decoded back from JPEG).
+        std::fs::write(dir.join("sample-0001.jpg"), encode_jpeg(&img, 90).unwrap()).unwrap();
+        let shot = Shot { ms: 0, file: "sample-0001.jpg".into(), treat: SAMPLE_TREAT };
+        let out = decode_jpeg(&process(&dir, &shot, 2560, 90, &mut Some(1.5)).unwrap().unwrap()).unwrap();
+        assert_eq!((out.w, out.h), (2560, 1440));
+        let at_uid = (2560 - (0.47 * 1440.0) as i32, 1440 - 40);
+        assert!(out.rgb(at_uid.0, at_uid.1)[0] < 40, "UID at the largest scale");
+        assert!(out.rgb(1280, 400)[0] > 215, "the board kept");
+        let at_one = decode_jpeg(&process(&dir, &shot, 2560, 90, &mut Some(1.0)).unwrap().unwrap()).unwrap();
+        assert!(at_one.rgb(at_uid.0, at_uid.1)[0] > 215, "scale 1 leaves that spot");
+        // The run's scale: the largest ui_scale row over the measured setting, at least 1; 1.5 without one.
+        let scaled = format!("{}
+{}", line(json!({"at": t("00:00.000"), "kind": "ui_scale", "scale": 0.841017})), line(json!({"at": t("00:01.000"), "kind": "ui_scale", "scale": 1.0})));
+        assert!((sample_scale(&scaled) - 1.0 / 0.667).abs() < 1e-3);
+        assert!((sample_scale(&line(json!({"at": t("00:00.000"), "kind": "ui_scale", "scale": 0.5}))) - 1.0).abs() < 1e-6);
+        assert_eq!(sample_scale(""), SAMPLE_SCALE_DEFAULT);
+        assert!(is_sample("sample-0001.jpg") && !is_sample("samples.jpg") && !is_sample("frame-0001.jpg") && !is_sample("sample-0001.png"));
+        assert!(sample_note(3).contains('3'));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn t(s: &str) -> String {

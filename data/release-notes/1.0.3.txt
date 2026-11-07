@@ -1,0 +1,16 @@
+[[zh-TW]]
+Ascendant 1.0.3：快捷鍵直接按鍵設定、遊戲上顯示期望值
+
+- 改快捷鍵：在設定頁按「改」之後，直接按下想要的按鍵就設定好，不用再打字；按 Esc 取消。和另一個快捷鍵相同、被其他程式佔用，或會干擾打字的按鍵（沒加 Ctrl／Alt 的字母或數字、複製／剪下／貼上用的鍵）會被擋下並說明原因。
+- 新選項「在遊戲上顯示期望值」（設定頁「建議與輔助」，預設開啟）：在遊戲上要點擊的位置正上方，以小字顯示建議選項的期望值（塔羅斯：預期收容；渴血：預期最終活性）。不需要開「標示要點擊的位置」也能用，點擊會穿透到遊戲。吃的第一口沿用選「吃」那一步的期望值；渴血一律要拿的卡顯示「必拿」。
+- 塔羅斯選刑具、選珍藏時，點了卡、還沒按確認，綠框不再提早消失（Ascendant 以系統管理員身分執行時才會發生）。
+- 「更新內容」：按 Esc 不會在輸入文字或設定快捷鍵時誤關；和刑具視窗不再同時開而疊在一起。
+
+[[en]]
+
+Ascendant 1.0.3: set hotkeys by pressing them, and the expected value on the game
+
+- Changing a hotkey: press "Change" in Settings, then press the key you want; no more typing it in. Esc cancels. A key that is already the other hotkey, taken by another program, or would get in the way of typing (a letter or digit without Ctrl or Alt, or a copy, cut or paste key) is refused with the reason.
+- New option "Show the expected value on the game" (Settings, Advice and controls, on by default): shows the advised move's expected value in small text just above where to click on the game (Tartarus: expected loot; Vorax: expected final activity). It works without "Highlight where to click", and clicks go through it to the game. The first bite takes the value of the move that chose to bite; a Vorax card always taken shows "Always take".
+- Tartarus instrument and treasure picks: the green box no longer goes away once you click a card and before you confirm (it happened only with Ascendant run as administrator).
+- "What's new": Esc no longer closes it while you type or set a hotkey, and it no longer opens on top of the instruments window.

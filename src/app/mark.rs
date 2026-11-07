@@ -82,6 +82,42 @@ impl Style {
 /// The dark edge's opacity.
 const EDGE_ALPHA: f32 = 180.0 / 255.0;
 
+/// The padded box plus a `stroke` wide line and its glow on every side, and 2 px slack, in screen px at `unit`.
+fn side(stroke: f32, unit: f32) -> f32 {
+    (PAD + stroke / 2.0 + GLOW) * unit + 2.0
+}
+
+/// How far the mark of a target `half_h` high (half its height, screen px) reaches above its centre (the box, the
+/// arrow and their glow) and below it (the box and its glow), in screen px at `unit` screen px per reference px.
+pub fn reach(half_h: f32, unit: f32, style: Style) -> (f32, f32) {
+    let (stroke, arrow) = style.terms();
+    let below = half_h + side(stroke, unit);
+    (below + (ARROW_GAP + ARROW_H * arrow) * unit, below)
+}
+
+/// The text height of the expected value on the game (see [`Notice::value`]) against the notice's: small, so it
+/// covers little of the game.
+const VALUE_SCALE: f32 = 0.7;
+
+/// Where the expected value's box goes, its top in screen px: just above the mark (`above`, the mark's top), or just
+/// below it (`below`, the mark's bottom) when a box `height` high above it would leave the game (whose top is
+/// `game_top`).
+pub fn value_top(above: f32, below: f32, height: f32, game_top: f32) -> f32 {
+    if above - height >= game_top { above - height } else { below }
+}
+
+/// The mark for target `[x, y, half_w, half_h, unit]` (see [`Mark::show`]): its pixels (see [`paint`]) and left,
+/// top, width and height in screen px.
+pub fn mark_bitmap([x, y, half_w, half_h, unit]: [f32; 5], style: Style) -> (Vec<u8>, [i32; 4]) {
+    let (stroke, _) = style.terms();
+    let right = half_w + side(stroke, unit);
+    let (above, below) = reach(half_h, unit, style);
+    let (width, height) = ((2.0 * right).ceil() as i32, (above + below).ceil() as i32);
+    let (left, top) = ((x - right).round() as i32, (y - above).round() as i32);
+    let pixels = paint((width as usize, height as usize), (x - left as f32, y - top as f32), (half_w, half_h), unit, style);
+    (pixels, [left, top, width, height])
+}
+
 /// The mark window; hidden until [`Mark::show`], destroyed on drop.
 pub struct Mark {
     hwnd: HWND,
@@ -158,16 +194,7 @@ impl Mark {
         if self.drawn == Some(want) {
             return false;
         }
-        let (half_w, half_h) = (half_w * scale, half_h * scale);
-        let (stroke, arrow) = style.terms();
-        // The padded box plus the stroke and glow on every side, the arrow
-        // above, and 2 px slack.
-        let side = (PAD + stroke / 2.0 + GLOW) * unit + 2.0;
-        let (right, below) = (half_w + side, half_h + side);
-        let above = below + (ARROW_GAP + ARROW_H * arrow) * unit;
-        let (width, height) = ((2.0 * right).ceil() as i32, (above + below).ceil() as i32);
-        let (left, top) = ((x - right).round() as i32, (y - above).round() as i32);
-        let pixels = paint((width as usize, height as usize), (x - left as f32, y - top as f32), (half_w, half_h), unit, style);
+        let (pixels, [left, top, width, height]) = mark_bitmap([x, y, half_w * scale, half_h * scale, unit], style);
         let Some((pixels, [left, top, width, height])) = clipped(&pixels, [left, top, width, height], clip) else {
             return t < 1.0;
         };
@@ -183,6 +210,12 @@ impl Mark {
 
     pub fn shown(&self) -> bool {
         self.drawn.is_some()
+    }
+
+    /// The target the mark holds while on show, `[x, y, half_w, half_h, unit]` in screen px: where it was first
+    /// marked when read again a few px off (see [`same_target`]), so what goes with it does not move either.
+    pub fn spot(&self) -> Option<[f32; 5]> {
+        self.drawn.and(self.target).map(|(spot, _, _)| spot)
     }
 
     /// Where the mark sits on the game, in the game frame's px: its centre,
@@ -267,9 +300,8 @@ impl Drop for Mark {
 /// until [`Notice::show`], destroyed on drop.
 pub struct Notice {
     hwnd: HWND,
-    /// What the window shows: the text, its centre's x and top in screen px,
-    /// and the unit.
-    drawn: Option<(String, [i32; 4])>,
+    /// What the window shows: the text, and where (see [`Notice::place`]).
+    drawn: Option<(String, [i32; 5])>,
     /// The text's and rim's colour.
     colour: [u8; 3],
 }
@@ -293,17 +325,37 @@ impl Notice {
         Some(Notice { hwnd: overlay_window()?, drawn: None, colour: GREEN })
     }
 
+    /// A hidden window for the advised move's expected value on the game, green as the mark (see
+    /// [`Notice::show_value`]).
+    pub fn value() -> Option<Notice> {
+        Notice::badge()
+    }
+
     /// Shows `text` centred on `x` with its box's top at `top`, in physical
     /// screen px, `unit` screen px per reference px, wrapped to lines at
     /// most `max_width` px wide; drawn again only when one of them changes.
     pub fn show(&mut self, text: &str, x: f32, top: f32, unit: f32, max_width: f32) {
-        let key = [x.round() as i32, top.round() as i32, (unit * 1000.0).round() as i32, max_width.round() as i32];
+        let key = [x.round() as i32, top.round() as i32, 0, (unit * 1000.0).round() as i32, max_width.round() as i32];
+        let colour = self.colour;
+        self.place(text, key, || notice_bitmap(text, unit, max_width, colour, x, |_| top));
+    }
+
+    /// Shows the expected value `text` (see [`value_bitmap`]) centred on `x`, just above the mark whose top and bottom
+    /// are `reach` (see [`reach`]), or below it when there is no room above in the game (whose top is `game_top`);
+    /// screen px, `unit` screen px per reference px. Drawn again only when one of them changes.
+    pub fn show_value(&mut self, text: &str, x: f32, reach: (f32, f32), game_top: f32, unit: f32) {
+        let key = [x.round() as i32, reach.0.round() as i32, reach.1.round() as i32, (unit * 1000.0).round() as i32, game_top.round() as i32];
+        self.place(text, key, || value_bitmap(text, x, reach, game_top, unit));
+    }
+
+    /// Puts `bitmap()` (premultiplied BGRA pixels and their left, top, width and height in screen px) on the window,
+    /// unless `text` is already on show placed as `key`.
+    fn place(&mut self, text: &str, key: [i32; 5], bitmap: impl FnOnce() -> Option<(Vec<u8>, [i32; 4])>) {
         if self.drawn.as_ref().is_some_and(|(t, k)| t == text && *k == key) {
             return;
         }
-        let Some((pixels, width, height)) = dpi_aware(|| paint_notice(text, unit, max_width.round() as i32, self.colour)) else { return };
-        let left = (x - width as f32 / 2.0).round() as i32;
-        if dpi_aware(|| update(self.hwnd, &pixels, width, height, left, top.round() as i32)) {
+        let Some((pixels, [left, top, width, height])) = bitmap() else { return };
+        if dpi_aware(|| update(self.hwnd, &pixels, width, height, left, top)) {
             self.drawn = Some((text.to_string(), key));
             // SAFETY: a window this notice made.
             unsafe {
@@ -350,6 +402,20 @@ fn dib_info(width: i32, height: i32) -> BITMAPINFO {
         },
         ..Default::default()
     }
+}
+
+/// A notice's bitmap (see [`paint_notice`]) centred on `x` with its top at `top(height)`: its pixels and left, top,
+/// width and height in screen px.
+fn notice_bitmap(text: &str, unit: f32, max_width: f32, colour: [u8; 3], x: f32, top: impl Fn(f32) -> f32) -> Option<(Vec<u8>, [i32; 4])> {
+    let (pixels, width, height) = dpi_aware(|| paint_notice(text, unit, max_width.round() as i32, colour))?;
+    Some((pixels, [(x - width as f32 / 2.0).round() as i32, top(height as f32).round() as i32, width, height]))
+}
+
+/// The expected value's bitmap (see [`Notice::show_value`]): green as the mark, its text [`VALUE_SCALE`] of the
+/// notice's, centred on `x` and placed by [`value_top`].
+pub fn value_bitmap(text: &str, x: f32, (above, below): (f32, f32), game_top: f32, unit: f32) -> Option<(Vec<u8>, [i32; 4])> {
+    let unit = unit * VALUE_SCALE;
+    notice_bitmap(text, unit, 600.0 * unit, GREEN, x, |height| value_top(above, below, height, game_top))
 }
 
 /// The notice for `text` at `unit` screen px per reference px, its box at
@@ -527,6 +593,73 @@ mod tests {
         let glow = at(318, 250);
         assert!(glow[3] > 0 && glow[3] < 255 && glow[1] > glow[2], "the glow outside a side: {glow:?}");
         assert_eq!(at(340, 250), [0; 4], "past the glow");
+    }
+
+    /// The value sits just above the mark (its arrow included), and below it when that would leave the game's top;
+    /// [`reach`] is where the mark's own bitmap ends.
+    #[test]
+    fn the_value_sits_above_the_mark_or_below() {
+        let (u, half_h) = (4.0 / 3.0, 85.0 * 4.0 / 3.0);
+        for style in [Style::Plain, Style::Loud] {
+            let (above, below) = reach(half_h, u, style);
+            let (_, [_, top, _, height]) = mark_bitmap([1000.0, 800.0, 100.0, half_h, u], style);
+            assert!((800.0 - above - top as f32).abs() <= 0.5, "the mark's top");
+            assert!((top + height) as f32 >= 800.0 + below - 0.5 && (top + height) as f32 <= 800.0 + below + 1.0, "the mark's bottom");
+            assert!(above > below, "the arrow is above");
+        }
+        // Room above: the value's box ends where the mark begins.
+        assert_eq!(value_top(500.0, 900.0, 30.0, 0.0), 470.0);
+        assert_eq!(value_top(500.0, 900.0, 30.0, 470.0), 470.0);
+        // None above (a target at the game's top): under the mark.
+        assert_eq!(value_top(500.0, 900.0, 30.0, 480.0), 900.0);
+    }
+
+    /// Not a check: the picture of the mark and the expected value as the overlay windows put them over the game,
+    /// for a look without the game (the windows themselves are never in a capture). Run by hand with `--ignored` and
+    /// ASCENDANT_OVERLAY_SHOT=`frame|x,y,half_w,half_h|text|plain or loud|out.png`: a saved frame (a run folder's
+    /// frame-*.jpg), the target in its px (the run log's `mark_at`, or a Vorax `marks` box), the value as the window
+    /// writes it. The same bitmaps and placement as on screen ([`mark_bitmap`], [`value_bitmap`], [`reach`]), cut
+    /// around the target.
+    #[test]
+    #[ignore]
+    fn overlay_shot() {
+        let Ok(spec) = std::env::var("ASCENDANT_OVERLAY_SHOT") else { return };
+        let parts: Vec<&str> = spec.split('|').collect();
+        let [frame, at, text, style, out] = parts[..] else { panic!("frame|x,y,half_w,half_h|text|style|out.png") };
+        let mut img = crate::reader::load_image_raw(std::path::Path::new(frame)).unwrap();
+        let at: Vec<f32> = at.split(',').map(|v| v.trim().parse().unwrap()).collect();
+        let style = if style == "loud" { Style::Loud } else { Style::Plain };
+        let unit = img.h as f32 / 1080.0;
+        let over = |img: &mut crate::reader::Rgba, pixels: &[u8], [left, top, width, _]: [i32; 4]| {
+            for (i, px) in pixels.as_chunks::<4>().0.iter().enumerate() {
+                let (x, y) = (left + i as i32 % width, top + i as i32 / width);
+                if x < 0 || y < 0 || x as usize >= img.w || y as usize >= img.h {
+                    continue;
+                }
+                let k = (y as usize * img.w + x as usize) * 4;
+                let keep = 1.0 - f32::from(px[3]) / 255.0;
+                for (c, src) in [px[2], px[1], px[0]].into_iter().enumerate() {
+                    img.data[k + c] = (f32::from(src) + f32::from(img.data[k + c]) * keep).round().min(255.0) as u8;
+                }
+            }
+        };
+        let (pixels, rect) = mark_bitmap([at[0], at[1], at[2], at[3], unit], style);
+        over(&mut img, &pixels, rect);
+        let (above, below) = reach(at[3], unit, style);
+        let (value, [vl, vt, vw, vh]) = value_bitmap(text, at[0], (at[1] - above, at[1] + below), 0.0, unit).unwrap();
+        over(&mut img, &value, [vl, vt, vw, vh]);
+        // Cut around the mark and the value, with some of the game about them.
+        let margin = (120.0 * unit) as i32;
+        let x0 = (rect[0].min(vl) - margin).max(0) as usize;
+        let y0 = (rect[1].min(vt) - margin).max(0) as usize;
+        let x1 = ((rect[0] + rect[2]).max(vl + vw) + margin).min(img.w as i32) as usize;
+        let y1 = ((rect[1] + rect[3]).max(vt + vh) + margin).min(img.h as i32) as usize;
+        let mut cut = crate::reader::Rgba { w: x1 - x0, h: y1 - y0, data: Vec::with_capacity((x1 - x0) * (y1 - y0) * 4) };
+        for y in y0..y1 {
+            cut.data.extend_from_slice(&img.data[(y * img.w + x0) * 4..(y * img.w + x1) * 4]);
+        }
+        crate::reader::save_png(std::path::Path::new(out), &cut).unwrap();
+        println!("{out}: {}x{}, value box at ({vl}, {vt}) {vw}x{vh}, mark at {rect:?}", cut.w, cut.h);
     }
 
     /// The notice's rim is opaque gold, its box dark and see-through, and

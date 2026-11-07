@@ -49,10 +49,6 @@ pub const REPO: &str = "DiepBlood/tli-ascendant";
 /// The latest release, as the GitHub API gives it.
 const LATEST: &str = "https://api.github.com/repos/DiepBlood/tli-ascendant/releases/latest";
 
-/// The releases page: the fallback for a verified release's page link (`Release::page`). The app no longer opens it:
-/// "What's new" shows the verified notes inside the window (ui.rs `whats_new_window`).
-pub const RELEASES_PAGE: &str = "https://github.com/DiepBlood/tli-ascendant/releases";
-
 /// The release's exe asset (the name the release script uploads).
 const UPSTREAM_ASSET: &str = "Ascendant.exe";
 
@@ -291,8 +287,6 @@ pub struct Asset {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Release {
     pub version: [u64; 3],
-    /// The release's web page (always under [`RELEASES_PAGE`]).
-    pub page: String,
     /// The release notes as plain text, from the signed RELEASE-NOTES.txt ([`NOTES`]) through [`plain_notes`];
     /// empty until [`check_with`] has verified them (never the GitHub release body).
     pub notes: String,
@@ -433,10 +427,8 @@ pub fn parse_release(json: &str) -> Result<(Release, Asset), String> {
     if exe.digest.is_none() {
         return Err(trf!("GitHub gives no SHA-256 digest for {}", UPSTREAM_ASSET));
     }
-    // The release's page link, kept to this repo's own release pages (the app shows the signed notes instead of it).
-    let page = root["html_url"].as_str().filter(|p| p.starts_with(&format!("{RELEASES_PAGE}/"))).unwrap_or(RELEASES_PAGE).to_string();
     let notes = asset(NOTES)?;
-    Ok((Release { version, page, notes: String::new(), exe, sums: asset(SUMS)?, sig: asset(SIG)?, signed: None }, notes))
+    Ok((Release { version, notes: String::new(), exe, sums: asset(SUMS)?, sig: asset(SIG)?, signed: None }, notes))
 }
 
 /// The first `lines` lines of `notes`, and whether there was more.
@@ -711,11 +703,6 @@ pub fn load_notes_in(dir: &Path, running: &str) -> Option<SavedNotes> {
 /// the player already dismissed (`seen`, by its "x" or by playing a game since).
 pub fn show_updated(saved: Option<&SavedNotes>, running: &str, seen: &str) -> bool {
     saved.is_some_and(|s| s.version == running && s.version != seen)
-}
-
-/// The release page of version `version` ("X.Y.Z").
-pub fn release_page(version: &str) -> String {
-    format!("{RELEASES_PAGE}/tag/v{version}")
 }
 
 /// Where an update is, for the window to show; stored in an [`AtomicU8`] the update's thread sets.
@@ -1384,7 +1371,6 @@ mod tests {
     fn parse_release_json() {
         let (r, notes) = parse_release(&json("v1.2.0", &sha(EXE_BYTES), 35)).unwrap();
         assert_eq!((r.version, r.exe.size, r.version_text(), r.signed), ([1, 2, 0], 35, "1.2.0".to_string(), None));
-        assert_eq!(r.page, "https://github.com/DiepBlood/tli-ascendant/releases/tag/v1.2.0");
         assert_eq!((r.exe.url.as_str(), r.sums.url.as_str(), r.sig.url.as_str(), notes.url.as_str()), (EXE_URL, SUMS_URL, SIG_URL, NOTES_URL));
         // The release body is never taken: notes come only from the signed file, after verification.
         assert_eq!(r.notes, "");
@@ -1392,9 +1378,6 @@ mod tests {
         assert!(parse_release(&full.replace("\"SHA256SUMS.txt.sig\"", "\"other.sig\"")).unwrap_err().contains(SIG));
         assert!(parse_release(&full.replace("\"Ascendant.exe\"", "\"warden.exe\"")).is_err());
         assert!(parse_release(&full.replace("\"RELEASE-NOTES.txt\"", "\"notes.md\"")).unwrap_err().contains(NOTES));
-        // A release page elsewhere is never opened: the releases page is used instead.
-        let (r, _) = parse_release(&full.replace("https://github.com/DiepBlood/tli-ascendant/releases/tag", "file:///C:/x")).unwrap();
-        assert_eq!(r.page, RELEASES_PAGE);
     }
 
     #[test]
@@ -1842,7 +1825,6 @@ mod tests {
         let saved = SavedNotes { version: "1.2.0".into(), notes: NOTES_SHOWN.into() };
         assert_eq!(load_notes_in(&dir, "1.2.0"), Some(saved.clone()));
         assert_eq!(load_notes_in(&dir, "1.1.0"), None, "for another version");
-        assert_eq!(release_page("1.2.0"), "https://github.com/DiepBlood/tli-ascendant/releases/tag/v1.2.0");
         let write = |version: &str, notes: &str| std::fs::write(dir.join(SAVED_NOTES), serde_json::json!({"version": version, "notes": notes}).to_string()).unwrap();
         // Hidden and control characters are dropped as from a release.
         write("1.2.0", "\u{FEFF}- one\u{202E}\r\n- two\u{7}\u{200B}");

@@ -11,7 +11,7 @@
 
 use super::capture::{Event, Watcher, capture, game_in_front, game_rect};
 use super::gamelog::Signal;
-use super::mark::{self, Mark};
+use super::mark::{self, Mark, Notice};
 use super::session::Session;
 use super::settings::Settings;
 use super::theme::{self, ACCENT, DIVIDER, MUTED, Verdict};
@@ -41,6 +41,9 @@ pub struct VoraxView {
     /// The boxes over the game, created only when first needed. Does not share ui.rs's `mark`: Tartarus's
     /// `clicked` and `forget_clicks` are tied to that one.
     marks: Vec<Mark>,
+    /// The advised option's expected final activity on the game, above the first box (see [`advised_k`]), made
+    /// when first needed.
+    value: Option<Notice>,
     /// The capture window changed during Vorax mode: handed to [`Session::log_window`] on return to Tartarus.
     window: Option<String>,
     /// The content last written to the `vorax_view` row, see [`VoraxView::log_marks`].
@@ -78,7 +81,7 @@ impl VoraxView {
     pub fn new(settings: &Settings, ctx: egui::Context) -> VoraxView {
         let mut session = VoraxSession::new(Config::from_settings(settings));
         session.on_progress(move || ctx.request_repaint());
-        VoraxView { session, marks: Vec::new(), window: None, last_view: None, hidden: None, preview: false, preview_battle: None, preview_result: None, dismissed: None, latest_window: None }
+        VoraxView { session, marks: Vec::new(), value: None, window: None, last_view: None, hidden: None, preview: false, preview_battle: None, preview_result: None, dismissed: None, latest_window: None }
     }
 
     /// Test only (called only when ui.rs reads the environment variable ASCENDANT_PREVIEW_VORAX): enters Vorax mode
@@ -276,7 +279,7 @@ impl VoraxView {
     /// Called by ui.rs on every tick outside Vorax mode: if boxes are still drawn, take them all down (e.g. leftovers
     /// after leaving). Does nothing when the boxes are already hidden.
     pub fn hide_marks(&mut self) {
-        if self.marks.iter().any(Mark::shown) {
+        if self.marks.iter().any(Mark::shown) || self.value.as_ref().is_some_and(Notice::shown) {
             self.hide_all();
         }
     }
@@ -284,6 +287,9 @@ impl VoraxView {
     /// Take down all boxes and write one empty marks row (not written when identical to the previous row).
     fn hide_all(&mut self) {
         self.marks.iter_mut().for_each(Mark::hide);
+        if let Some(v) = &mut self.value {
+            v.hide();
+        }
         // This is taking the boxes down on leaving Vorax mode, not hidden by show_marks.
         self.hidden = None;
         self.log_marks(vorax_session::now_ms());
@@ -335,11 +341,15 @@ impl VoraxView {
     /// Draw the boxes over the game according to `View::boxes`, with the same coordinate conversion as ui.rs's
     /// `mark_spot`: frame pixels plus the top-left of the game client area, `unit = height / 1080`, cropped to the
     /// game's extent. Everything is hidden when there are no boxes, the setting turns marks off, or the game is not
-    /// in the foreground.
+    /// in the foreground. With "Show the expected value on the game" on, the advised option's expected final activity
+    /// ([`advised_k`], the number the panel shows) goes just above the first box (the card or the reroll), whether
+    /// the boxes are on or not; it goes with the boxes, and when the advice is stale.
     fn show_marks(&mut self, ctx: &egui::Context, settings: &Settings) {
         let title = &settings.window_title;
-        let boxes = &self.session.view().boxes;
-        let wanted = settings.highlight && !boxes.is_empty();
+        let view = self.session.view();
+        let boxes = &view.boxes;
+        let value = if settings.show_value { advised_k(view, self.always_take()) } else { None };
+        let wanted = !boxes.is_empty() && (settings.highlight || value.is_some());
         // While boxes are to be drawn, look again every 50 ms whether or not the game is in the foreground, so window
         // moves and the game returning to the foreground are followed (same as highlight in ui.rs).
         if wanted {
@@ -358,27 +368,50 @@ impl VoraxView {
         };
         let Some(rect @ [left, top, _, height]) = rect else {
             self.marks.iter_mut().for_each(Mark::hide);
+            if let Some(v) = &mut self.value {
+                v.hide();
+            }
             return;
         };
         let unit = height as f32 / 1080.0;
-        while self.marks.len() < boxes.len() {
-            let Some(m) = Mark::new() else { break };
-            self.marks.push(m);
+        let style = |b: &vorax_session::MarkBox| match b.style {
+            BoxStyle::Plain => mark::Style::Plain,
+            BoxStyle::Loud => mark::Style::Loud,
+        };
+        if settings.highlight {
+            while self.marks.len() < boxes.len() {
+                let Some(m) = Mark::new() else { break };
+                self.marks.push(m);
+            }
         }
         for (k, m) in self.marks.iter_mut().enumerate() {
-            match boxes.get(k) {
+            match boxes.get(k).filter(|_| settings.highlight) {
                 Some(b) => {
                     let (x, y, half_w, half_h) = b.at;
-                    let style = match b.style {
-                        BoxStyle::Plain => mark::Style::Plain,
-                        BoxStyle::Loud => mark::Style::Loud,
-                    };
                     // While a box is zooming in, redraw on every tick.
-                    if m.show([left as f32 + x, top as f32 + y, half_w, half_h, unit], style, rect) {
+                    if m.show([left as f32 + x, top as f32 + y, half_w, half_h, unit], style(b), rect) {
                         ctx.request_repaint();
                     }
                 }
                 None => m.hide(),
+            }
+        }
+        match (value, boxes.first()) {
+            (Some(text), Some(b)) => {
+                if self.value.is_none() {
+                    self.value = Notice::value();
+                }
+                if let Some(v) = &mut self.value {
+                    let (x, y, _, half_h) = b.at;
+                    let (x, y) = (left as f32 + x, top as f32 + y);
+                    let (above, below) = mark::reach(half_h, unit, style(b));
+                    v.show_value(&text, x, (y - above, y + below), top as f32, unit);
+                }
+            }
+            _ => {
+                if let Some(v) = &mut self.value {
+                    v.hide();
+                }
             }
         }
     }
@@ -433,11 +466,17 @@ impl VoraxView {
             }
             None => self.session.view(),
         };
+        let always = self.always_take();
         if compact {
-            compact_body(v, ui);
+            compact_body(v, ui, always);
         } else {
-            draw_panel(v, ui);
+            draw_panel(v, ui, always);
         }
+    }
+
+    /// The advice on show is a card always taken (see [`always_taken`]), from the advice for the board on show.
+    fn always_take(&self) -> bool {
+        always_taken(self.session.state().map(|x| x.hand.as_slice()), self.session.advice().map(|a| &a.best))
     }
 
     /// The header of line 1 in the compact version, `渴血 · 第 R 回合 / 13` (Vorax, round R of 13): ui.rs merges it
@@ -467,7 +506,7 @@ impl VoraxView {
 /// unreadable, i.e. nothing with advice or ranking, each block still keeps its usual place and is just left blank.
 /// The column widths of the top three are computed once at the start from the panel width ([`Cols`]), shared by the
 /// header and every row, so they align at window width 200 too.
-pub fn draw_panel(v: &View, ui: &mut egui::Ui) {
+pub fn draw_panel(v: &View, ui: &mut egui::Ui, always: bool) {
     // Column spacing 4 (narrower than the default), so the name column gets a bit more room at window width 200.
     let cols = Cols::new(ui.available_width(), 4.0);
     let head = match v.round {
@@ -491,7 +530,7 @@ pub fn draw_panel(v: &View, ui: &mut egui::Ui) {
     ui.add_space(4.0);
     advice_card(ui, v);
     let rows = advice_rows(v);
-    ranking_rows(ui, &cols, rows, v.stale);
+    ranking_rows(ui, &cols, rows, v.stale, always);
     rest_line(ui, rows);
     ui.add_space(4.0);
     tanks(ui, &v.tanks, 6);
@@ -521,7 +560,7 @@ pub fn draw_panel(v: &View, ui: &mut egui::Ui) {
 /// ranking, board read), which expand below when clicked (scrollable when expanded; the `＋／－` after a link means
 /// collapsed / expanded, since Microsoft JhengHei UI has no glyph for symbols like ▸). The credit line is only in
 /// "About". Every block has a fixed height, same as the full version.
-pub fn draw_panel_compact(v: &View, ui: &mut egui::Ui) {
+pub fn draw_panel_compact(v: &View, ui: &mut egui::Ui, always: bool) {
     let (head, rerolls) = (head_text(v), rerolls_text(v));
     let h = ui.text_style_height(&egui::TextStyle::Small);
     ui.horizontal(|ui| {
@@ -529,7 +568,7 @@ pub fn draw_panel_compact(v: &View, ui: &mut egui::Ui) {
         ui.allocate_ui_with_layout(Vec2::new(w * 0.45, h), Layout::left_to_right(Align::Center), |ui| theme::line(ui, &head, MUTED));
         theme::line_aligned(ui, &rerolls, MUTED, true);
     });
-    compact_body(v, ui);
+    compact_body(v, ui, always);
 }
 
 /// The Vorax header `渴血 · 第 R 回合 / 13` (Vorax, round R of 13).
@@ -554,7 +593,7 @@ fn rerolls_text(v: &View) -> String {
 /// Below line 1 of the compact version: the activity progress bar, the advice card (only the large text and the
 /// label) and two small lines right under the card (reason first, then the solve note), two columns (top three /
 /// tanks and instruments), the warning area, and the two expand links.
-fn compact_body(v: &View, ui: &mut egui::Ui) {
+fn compact_body(v: &View, ui: &mut egui::Ui, always: bool) {
     let target = ::vorax::value::TARGET;
     match v.ultimate {
         Some(ultimate) => {
@@ -612,7 +651,7 @@ fn compact_body(v: &View, ui: &mut egui::Ui) {
             ui.allocate_ui_with_layout(Vec2::new(left_w, 0.0), Layout::top_down(Align::Min), |ui| {
                 ui.set_width(left_w);
                 let cols = Cols::new(left_w, 4.0);
-                ranking_rows(ui, &cols, rows, v.stale);
+                ranking_rows(ui, &cols, rows, v.stale, always);
                 rest_line(ui, rows);
             });
             let right_w = ui.available_width();
@@ -627,7 +666,7 @@ fn compact_body(v: &View, ui: &mut egui::Ui) {
         held_row(ui, &v.held, &rerolls_text(v));
     } else {
         let cols = Cols::new(width, 4.0);
-        ranking_rows(ui, &cols, rows, v.stale);
+        ranking_rows(ui, &cols, rows, v.stale, always);
         rest_line(ui, rows);
         tanks(ui, &v.tanks, 3);
         held_row(ui, &v.held, &rerolls_text(v));
@@ -812,7 +851,7 @@ fn rest_line(ui: &mut egui::Ui, rows: &[AdviceRow]) {
 /// For each of ranks 4-6: (rank, name, `94% 812k`).
 fn rest_entries(rows: &[AdviceRow]) -> Vec<(usize, String, String)> {
     let shown = shown_rows(rows);
-    (0..rows.len()).filter(|k| !shown.contains(k)).take(3).map(|k| (k + 1, rows[k].label.clone(), format!("{} {}", chance(&rows[k]), short_k(rows[k].mean.round() as i64)))).collect()
+    (0..rows.len()).filter(|k| !shown.contains(k)).take(3).map(|k| (k + 1, rows[k].label.clone(), format!("{} {}", chance(&rows[k]), mean_k(&rows[k])))).collect()
 }
 
 fn rest_text(rows: &[AdviceRow]) -> String {
@@ -1228,13 +1267,13 @@ fn progress(ui: &mut egui::Ui, title: &str, share: f32, text: String, colour: Co
 /// no meaning, so only numbers are written): rank, name, chance to reach 840k, average score (expected score, written
 /// as `812k` by short_k). Ranked by average score. The header and the three rows are always drawn (blank rows pad it
 /// when there are fewer than three).
-fn ranking_rows(ui: &mut egui::Ui, cols: &Cols, rows: &[AdviceRow], stale: bool) {
+fn ranking_rows(ui: &mut egui::Ui, cols: &Cols, rows: &[AdviceRow], stale: bool, always: bool) {
     let shown = shown_rows(rows);
     // The number columns use the width actually needed (the wider of the value and the column header), and the rest
     // goes to the name column.
     let width_of = |text: &str, style: egui::TextStyle| ui.painter().layout_no_wrap(text.to_string(), style.resolve(ui.style()), Color32::WHITE).size().x;
     let reach_w = shown.iter().map(|&k| width_of(&chance(&rows[k]), egui::TextStyle::Body)).fold(width_of(tr("Reach 840k"), egui::TextStyle::Small), f32::max) + 2.0;
-    let mean_w = shown.iter().map(|&k| width_of(&short_k(rows[k].mean.round() as i64), egui::TextStyle::Body)).fold(width_of(tr("Average"), egui::TextStyle::Small).max(width_of("888k", egui::TextStyle::Body)), f32::max) + 2.0;
+    let mean_w = shown.iter().map(|&k| width_of(&row_mean(&rows[k], always), egui::TextStyle::Body)).fold(width_of(tr("Average"), egui::TextStyle::Small).max(width_of("888k", egui::TextStyle::Body)), f32::max) + 2.0;
     let total = cols.rank + cols.label + cols.reach + cols.mean;
     let cols = &Cols { label: (total - cols.rank - reach_w - mean_w).max(20.0), reach: reach_w, mean: mean_w, ..*cols };
     let blanks = shown.len()..TOP_ROWS;
@@ -1262,7 +1301,7 @@ fn ranking_rows(ui: &mut egui::Ui, cols: &Cols, rows: &[AdviceRow], stale: bool)
     for k in shown {
         let r = &rows[k];
         let name = fit_option(ui, &r.label, cols.label, &body);
-        let (label, reach, mean) = (RichText::new(name), RichText::new(chance(r)), RichText::new(short_k(r.mean.round() as i64)));
+        let (label, reach, mean) = (RichText::new(name), RichText::new(chance(r)), RichText::new(row_mean(r, always)));
         let (label, reach, mean) = if stale {
             (label.color(STALE), reach.color(STALE), mean.color(STALE))
         } else if r.best {
@@ -1401,6 +1440,42 @@ fn fitted_line(ui: &mut egui::Ui, text: &str, colour: Color32) {
     theme::lines(ui, text, colour, rows);
 }
 
+/// An option's expected final activity as the panel writes it (`812k`, see [`short_k`]); a dash for one the solver
+/// did not play out (see [`played_out`]).
+fn mean_k(r: &AdviceRow) -> String {
+    if played_out(r) { short_k(r.mean.round() as i64) } else { "\u{2014}".to_string() }
+}
+
+/// Whether the solver gave the option a value: a card always taken (a Xenopanacea, a Holy Water rite) is advised
+/// without a playout, with no chance and a mean of 0, which is no value.
+fn played_out(r: &AdviceRow) -> bool {
+    r.reached.is_some() || r.mean != 0.0
+}
+
+/// Whether the advice `best`, on the hand `hand` (the cards' English names), is a card the solver always takes by its
+/// rule (`is_always_take`: a Xenopanacea, a Holy Water rite, a Dissection), advised without a playout (no end
+/// reached). Its value is that rule, not a number: the panel and the value on the game write "Always take".
+fn always_taken(hand: Option<&[String]>, best: Option<&::vorax::advisor::Best>) -> bool {
+    let (Some(hand), Some(::vorax::advisor::Best::Card(r))) = (hand, best) else { return false };
+    r.end.is_none() && hand.get(r.index).is_some_and(|name| ::vorax::advisor::is_always_take(name))
+}
+
+/// A top-three row's value cell: "Always take" for the advised card when it is always taken (`always`), else its
+/// expected final activity ([`mean_k`]).
+fn row_mean(r: &AdviceRow, always: bool) -> String {
+    if always && r.best { tr("Always take").to_string() } else { mean_k(r) }
+}
+
+/// The advised option's value as the panel writes it ([`row_mean`]), for the value on the game: "Always take" for a
+/// card always taken (`always`), else its expected final activity; None when the advice is stale (the last usable
+/// one, greyed out), there are no boxes, no row is the advised one, or it has no value.
+fn advised_k(view: &View, always: bool) -> Option<String> {
+    if view.stale || view.boxes.is_empty() {
+        return None;
+    }
+    view.advice.as_ref()?.rows.iter().find(|r| r.best).filter(|r| always || played_out(r)).map(|r| row_mean(r, always))
+}
+
 /// Number abbreviation: 1234 → "1.2k", 88128 → "88k", 840000 → "840k", 1250000 → "1.25M".
 fn short_k(n: i64) -> String {
     let a = n.unsigned_abs();
@@ -1434,6 +1509,59 @@ fn grouped(n: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The value on the game is the advised row's value as the panel's top three writes it (the same `row_mean`), not
+    /// the first row's; none when the advice is stale, there is no box, or no advice. A card always taken by the
+    /// solver's rule writes "Always take" in both; a card with no value that is not that rule writes nothing on the
+    /// game and a dash in the panel.
+    #[test]
+    fn the_value_on_the_game_is_the_panels_number() {
+        let row = |mean: f64, best: bool| AdviceRow { label: String::new(), mean, reached: Some(0.4), refresh: false, best };
+        let rows = vec![row(812_400.0, false), row(694_600.0, true), row(600_000.0, false)];
+        let mut view = View {
+            advice: Some(crate::vorax::AdviceRows { headline: String::new(), note: None, rows: rows.clone(), method: String::new(), unknown: vec![] }),
+            boxes: vec![vorax_session::MarkBox { what: "card 2".into(), at: (1416.0, 1140.0, 110.0, 185.0), style: BoxStyle::Plain }],
+            ..View::default()
+        };
+        assert_eq!(advised_k(&view, false).as_deref(), Some("695k"));
+        // The panel's own cell for that row.
+        assert_eq!(advised_k(&view, false), Some(row_mean(&rows[1], false)));
+        view.stale = true;
+        assert_eq!(advised_k(&view, false), None, "stale advice");
+        assert_eq!(advised_k(&view, true), None, "stale, even always taken");
+        view.stale = false;
+        view.boxes.clear();
+        assert_eq!(advised_k(&view, false), None, "no box (the gate after a confirm)");
+        assert_eq!(advised_k(&View::default(), false), None, "no advice");
+        // A card always taken is advised without a playout (no chance, mean 0): "Always take" on the game and in the
+        // panel's cell for it.
+        let taken = AdviceRow { label: String::new(), mean: 0.0, reached: None, refresh: false, best: true };
+        view.boxes = vec![vorax_session::MarkBox { what: "card 1".into(), at: (1205.0, 1140.0, 110.0, 185.0), style: BoxStyle::Plain }];
+        view.advice = Some(crate::vorax::AdviceRows { headline: String::new(), note: None, rows: vec![taken.clone()], method: String::new(), unknown: vec![] });
+        assert_eq!(advised_k(&view, true).as_deref(), Some(tr("Always take")));
+        assert_eq!(row_mean(&taken, true), tr("Always take"));
+        // The same row without that rule: no value, a dash in the panel.
+        assert_eq!(advised_k(&view, false), None);
+        assert_eq!(row_mean(&taken, false), "\u{2014}");
+        // A value worked out as 0 is a value, not the rule.
+        let zero = AdviceRow { label: String::new(), mean: 0.0, reached: Some(0.0), refresh: false, best: true };
+        assert_eq!(row_mean(&zero, false), "0");
+    }
+
+    /// "Always take" goes by the solver's rule on the advised card's name, advised without a playout; not by a mean
+    /// of 0.
+    #[test]
+    fn always_taken_goes_by_the_rule() {
+        use ::vorax::advisor::{Best, End, Ranked};
+        let hand: Vec<String> = ["Xenopanacea", "Bone Salve"].map(String::from).to_vec();
+        let card = |index: usize, end: Option<End>| Best::Card(Ranked { index, targets: vec![], value: 0.0, end, no_effect: None });
+        assert!(always_taken(Some(hand.as_slice()), Some(&card(0, None))));
+        assert!(!always_taken(Some(hand.as_slice()), Some(&card(1, None))), "not an always-take card");
+        assert!(!always_taken(Some(hand.as_slice()), Some(&card(0, Some(End { activity: 0.0, reached: 0.0 })))), "played out");
+        assert!(!always_taken(Some(hand.as_slice()), Some(&Best::Refresh)));
+        assert!(!always_taken(None, Some(&card(0, None))), "no board for the advice");
+        assert!(!always_taken(Some(hand.as_slice()), None));
+    }
 
     #[test]
     fn numbers_are_grouped_by_thousands() {

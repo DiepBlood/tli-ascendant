@@ -4,7 +4,7 @@
 //! vorax_view.rs are kept (to match the game).
 
 use crate::lang::{tr, trf};
-use eframe::egui::{self, Color32, CornerRadius, Frame, Margin, Pos2, Rect, Response, Role, RichText, Sense, Stroke, StrokeKind, TextStyle, TextWrapMode, Ui, Vec2, Widget, WidgetInfo, WidgetText};
+use eframe::egui::{self, Color32, CornerRadius, FontId, Frame, Margin, Pos2, Rect, Response, Role, RichText, Sense, Stroke, StrokeKind, TextStyle, TextWrapMode, Ui, Vec2, Widget, WidgetInfo, WidgetText};
 use std::time::{Duration, Instant};
 
 /// The smallest size of self-drawn text (FontId::proportional) (font spec point 2): cell numbers, badges, the auto
@@ -334,14 +334,34 @@ pub fn chip(ui: &mut Ui, text: RichText) -> Response {
 /// Key-cap tag: monospace text, a rounded outline, and a thickened bottom edge like a keycap. Display only.
 pub fn keycap(ui: &mut Ui, text: &str) -> Response {
     let text = if text.trim().is_empty() { "—" } else { text.trim() };
-    let galley = WidgetText::from(RichText::new(text).small().monospace().color(TEXT)).into_galley(ui, Some(TextWrapMode::Truncate), ui.available_width().max(24.0) - 10.0, TextStyle::Small);
-    let size = galley.size() + Vec2::new(10.0, 5.0);
+    keycap_text(ui, RichText::new(text).small().monospace().color(TEXT))
+}
+
+/// The key cap of a hotkey being recorded: `text` ("Press a key...", or why the key was refused) in `colour`, in the
+/// ordinary font (it may be Chinese), truncated to the room left. The same height as [`keycap`], so the row does not
+/// move when recording starts or ends.
+pub fn keycap_prompt(ui: &mut Ui, text: &str, colour: Color32) -> Response {
+    keycap_text(ui, RichText::new(text).small().color(colour))
+}
+
+/// The height of a key cap: the taller of the small monospace and small ordinary text, plus its padding, whatever
+/// the text in it.
+fn keycap_height(ui: &Ui) -> f32 {
+    let small = TextStyle::Small.resolve(ui.style());
+    let mono = FontId::monospace(small.size);
+    ui.ctx().fonts_mut(|f| f.row_height(&small).max(f.row_height(&mono))) + 5.0
+}
+
+fn keycap_text(ui: &mut Ui, text: RichText) -> Response {
+    let galley = WidgetText::from(text).into_galley(ui, Some(TextWrapMode::Truncate), ui.available_width().max(24.0) - 10.0, TextStyle::Small);
+    let size = Vec2::new(galley.size().x + 10.0, keycap_height(ui));
     let (rect, response) = ui.allocate_exact_size(size, Sense::hover());
     let p = ui.painter();
     p.rect_filled(rect, 4.0, Color32::from_rgb(0x2a, 0x2f, 0x3a));
     p.rect_stroke(rect, 4.0, Stroke::new(1.0, BAR_IDLE), StrokeKind::Inside);
     p.line_segment([rect.left_bottom() + Vec2::new(3.0, -1.0), rect.right_bottom() + Vec2::new(-3.0, -1.0)], Stroke::new(1.5, Color32::from_rgb(0x12, 0x14, 0x18)));
-    p.galley(rect.min + Vec2::new(5.0, 2.0), galley, TEXT);
+    let y = ((rect.height() - galley.size().y - 1.0) / 2.0).max(0.0);
+    p.galley(rect.min + Vec2::new(5.0, y), galley, TEXT);
     response
 }
 

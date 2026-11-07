@@ -99,6 +99,8 @@ pub const TEXT: &[(&str, &str)] = &[
     ("How far behind the first; grey means within the simulation error, so either is about the same", "和第一名差多少；灰色表示在模擬誤差內，選哪個都差不多"),
     ("Reach 840k", "達 840k"),
     ("Average", "平均"),
+    // Vorax: a card the solver always takes by its rule, in place of its value (top three, value on the game).
+    ("Always take", "必拿"),
     ("The chance that the final Ultimate Activity reaches 840k", "最終活性達 840k 的機率"),
     ("The average final Ultimate Activity, counting nothing above 840k; ranked by this", "最終活性的平均，超過 840k 的部分不算；排名照這個"),
     // Layout (settings page) and the compact layout.
@@ -214,7 +216,19 @@ pub const TEXT: &[(&str, &str)] = &[
     ("Chain order: {}", "連吃順序：{}"),
     ("Warden's Treasure, {} left with this one: the Crimson Wine's tiers are on the board.", "典獄長的珍藏還有 {} 次（含這次）：已把赤色佳釀的升階套用到盤面。"),
     ("The next Warden's Treasure: the Crimson Wine advised before it raised every inmate below Legendary one tier on the board. If you took another gift, check it with View Prison Status.", "下一次典獄長的珍藏：已依建議的赤色佳釀，把盤面上低於傳奇的囚犯都升一階。如果你選的是別的寶物，請用「查看監獄狀態」確認。"),
-    ("Such as F8, Ctrl+Shift+R or Alt+5", "例如 F8、Ctrl+Shift+R 或 Alt+5"),
+    // Recording a hotkey: "Change", then the key pressed.
+    ("Click, then press the new key", "按一下，再按下新的按鍵"),
+    ("Press a key...", "請按下按鍵…"),
+    ("Press the new key, or Esc to cancel", "請按下新的按鍵，或按 Esc 取消"),
+    ("Use F1 to F24, or a letter or digit with Ctrl or Alt", "請用 F1～F24，或 Ctrl／Alt 加字母或數字"),
+    ("{} alone would get in the way of typing: add Ctrl or Alt", "單獨的 {} 會干擾打字：請加上 Ctrl 或 Alt"),
+    // The same refusals, short, for the key cap of a narrow window.
+    ("Not a key for a hotkey", "這個鍵不能當快捷鍵"),
+    ("Used by copy and paste", "複製貼上用的鍵"),
+    ("It would take copy, cut or paste from every program", "會佔用所有程式的複製／剪下／貼上"),
+    ("{} needs Ctrl/Alt", "{} 需 Ctrl/Alt"),
+    ("Already the {} key", "已是{}鍵"),
+    ("{} is taken by another program", "{} 已被其他程式佔用"),
     ("Game window", "遊戲視窗"),
     ("Used when no torchlight_infinite.exe window is found: a part of the game window's title", "找不到 torchlight_infinite.exe 視窗時使用：遊戲視窗標題的一部分"),
     ("Playouts", "模擬次數"),
@@ -222,6 +236,8 @@ pub const TEXT: &[(&str, &str)] = &[
     ("Place by the game panels", "放在遊戲面板旁"),
     ("Move this window under the game's instrument panel when the game is first found, until you move it yourself; Ascendant then opens where you left it. Turning this on forgets that place", "第一次找到遊戲時，把此視窗移到遊戲刑具面板下方，直到你自己移動它；之後 Ascendant 會在你留下的位置開啟。開啟此選項會忘記那個位置"),
     ("Highlight where to click", "標示要點擊的位置"),
+    ("Show the expected value on the game", "在遊戲上顯示期望值"),
+    ("Shows the advised move's expected value just above where to click on the game (Tartarus: expected loot, Vorax: expected final activity), in small text. Clicks go through it to the game", "在遊戲上要點擊的位置正上方，以小字顯示建議選項的期望值（塔羅斯：預期收容；渴血：預期最終活性）。點擊會穿透它傳到遊戲"),
     ("Opacity", "不透明度"),
     // The click-through light in the navigation rail (no hotkey since 1.0.2).
     ("Through", "穿透"),

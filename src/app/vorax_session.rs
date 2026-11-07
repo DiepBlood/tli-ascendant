@@ -40,6 +40,11 @@
 //! - [`VoraxSession::note_other_signal`]: hand it any log signal other than `Signal::Vorax` received while
 //!   in Vorax mode (only Tartarus has those); returns `Left` to mean it is treated as having left Vorax
 //!   (deadlock guard).
+// Private builds only: whole frames of the English client as samples (roadmap item 17, `vorax_samples.rs`).
+#[cfg(feature = "dev-samples")]
+#[path = "vorax_samples.rs"]
+pub(crate) mod samples;
+
 use super::runlog::{RunLog, timestamp};
 use super::settings::Settings;
 use super::vorax_learn::Learn;
@@ -1542,6 +1547,13 @@ pub struct VoraxSession {
     learn: Learn,
     /// Enter the mode only on a Traditional Chinese client (unit tests turn this off, so the global language setting is not touched).
     require_zh: bool,
+    /// Private builds only: on another client language with observe mode on, the game is entered to save whole
+    /// frames and nothing is read ([`samples::Samples`]).
+    #[cfg(feature = "dev-samples")]
+    samples: Option<samples::Samples>,
+    /// Unit tests: the client language seen by `require_zh` (None: the global setting).
+    #[cfg(test)]
+    test_zh: Option<bool>,
     /// Instrument reroll counts seen at the start of recent games, oldest first ([`OPENINGS_FILE`]).
     openings: Vec<i32>,
     /// The last finished game ([`VoraxSession::last_game`]).
@@ -1592,6 +1604,10 @@ impl VoraxSession {
             battle: BattleRun::default(),
             learn,
             require_zh: true,
+            #[cfg(feature = "dev-samples")]
+            samples: None,
+            #[cfg(test)]
+            test_zh: None,
             openings,
             last_game: None,
             ui_scale: None,
@@ -1779,6 +1795,35 @@ impl VoraxSession {
         change
     }
 
+    /// The client is Traditional Chinese (the interface language, which follows the game client); unit tests set it
+    /// with `test_zh` instead of the global language setting.
+    fn client_zh(&self) -> bool {
+        #[cfg(test)]
+        if let Some(zh) = self.test_zh {
+            return zh;
+        }
+        crate::lang::zh()
+    }
+
+    /// Another client language: private builds with observe mode on enter the game anyway, to save whole frames as
+    /// samples ([`samples::Samples`]); the status still says the advice reads the Traditional Chinese client only.
+    /// Other builds never do.
+    #[cfg(feature = "dev-samples")]
+    fn start_samples(&mut self) -> bool {
+        if !(self.config.learn || self.config.observe) || self.log.is_none() {
+            self.samples = None;
+            return false;
+        }
+        // A sampler kept from a pause goes on with its counts (see `new_game`).
+        self.samples.get_or_insert_with(samples::Samples::default);
+        true
+    }
+
+    #[cfg(not(feature = "dev-samples"))]
+    fn start_samples(&mut self) -> bool {
+        false
+    }
+
     fn switch(&mut self, to: Mode, why: &str, lookback: bool, at: i64) -> ModeChange {
         self.switch_on(to, why, lookback, at, None)
     }
@@ -1799,10 +1844,15 @@ impl VoraxSession {
             if !self.config.enabled {
                 return ModeChange::None;
             }
-            if self.require_zh && !crate::lang::zh() {
+            if self.require_zh && !self.client_zh() && !self.start_samples() {
                 self.view.blocked = Some(NOT_ZH.to_string());
                 self.bump();
                 return ModeChange::None;
+            }
+            // A Traditional Chinese client (or the check off) reads as usual: no samples.
+            #[cfg(feature = "dev-samples")]
+            if !self.require_zh || self.client_zh() {
+                self.samples = None;
             }
             match self.paused.take() {
                 Some(p) if takes_back(&p, cue) => self.resume_paused(p, at, cue),
@@ -1826,11 +1876,25 @@ impl VoraxSession {
                 }
                 None => self.new_game(at, true),
             }
+            // Collecting samples: said under the note that the advice reads the Traditional Chinese client only,
+            // set here since a new game and a resume both reset the view.
+            #[cfg(feature = "dev-samples")]
+            if self.samples.is_some() {
+                self.view.blocked = Some(format!("{NOT_ZH}
+{}", samples::NOTE));
+                self.bump();
+            }
         }
         if to == Mode::Board && cue == Some(Cue::Page(Page::Main, PageState::Run)) {
             self.game.board_run = true;
         }
         self.mode = to;
+        // Leaving keeps the sampler: a pause, or the surgery page closed and opened to skip an animation, is the same
+        // game; its counts start over only with a new game ([`VoraxSession::new_game`]).
+        #[cfg(feature = "dev-samples")]
+        if let Some(s) = &mut self.samples {
+            s.mode(to, at);
+        }
         self.log_event("vorax_mode", at, json!({ "from": from, "to": to, "cue": why, "lookback": lookback }));
         // Entering the mode (a new game's folder, or a paused game's taken back): the UI scale in use goes in again.
         if entering {
@@ -1899,6 +1963,10 @@ impl VoraxSession {
         self.resumed = None;
         self.folder_pending = false;
         self.learn.new_game();
+        #[cfg(feature = "dev-samples")]
+        if let Some(s) = &mut self.samples {
+            *s = samples::Samples::default();
+        }
         if folder && let Some(log) = &mut self.log {
             log.new_run();
         }
@@ -2069,6 +2137,10 @@ impl VoraxSession {
     }
 
     fn board_cue(&mut self, cue: Cue, at: i64) {
+        #[cfg(feature = "dev-samples")]
+        if let Some(s) = &mut self.samples {
+            s.cue(cue, at);
+        }
         // The second Dealt line in the same millisecond is the same deal and is not counted separately.
         let repeat = cue == Cue::Dealt && self.game.last_dealt == Some(at);
         if matches!(cue, Cue::Synced | Cue::Reroll { .. } | Cue::Confirm | Cue::Picked | Cue::Dealt) && !repeat {
@@ -2321,6 +2393,14 @@ impl VoraxSession {
             return;
         }
         self.clock = self.clock.max(at_ms);
+        // Collecting samples: the frame may be saved, and is never read.
+        #[cfg(feature = "dev-samples")]
+        if let Some(s) = &mut self.samples {
+            if let Some(log) = &mut self.log {
+                s.frame(&mut self.learn, log, &frame, at_ms, self.mode);
+            }
+            return;
+        }
         if self.mode == Mode::Battle {
             self.battle_frame(frame, at_ms);
             return;
@@ -5419,6 +5499,88 @@ mod tests {
         assert_eq!((&row["chosen"]["card"], &row["chosen"]["how"]), (&json!(2), &json!("tooltip")));
         assert_eq!(row["chosen"]["tanks"], json!([0]));
         assert_eq!(row["missing"], json!([]));
+    }
+
+    /// A session on another client language than Traditional Chinese with observe mode on and a log folder.
+    fn english_observing(tag: &str) -> (VoraxSession, PathBuf) {
+        let root = std::env::temp_dir().join(format!("ascendant-vorax-samples-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let mut s = session();
+        (s.require_zh, s.test_zh) = (true, Some(false));
+        s.configure(Config { log_root: Some(root.clone()), observe: true, ..s.config.clone() });
+        (s, root)
+    }
+
+    /// Every file under `dir` whose name starts with `prefix`.
+    fn files_named(dir: &std::path::Path, prefix: &str) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                out.extend(files_named(&p, prefix));
+            } else if p.file_name().is_some_and(|n| n.to_string_lossy().starts_with(prefix)) {
+                out.push(p);
+            }
+        }
+        out
+    }
+
+    /// Private builds only, entered as the game log enters it: an English client with observe mode on enters the
+    /// game to save frames and reads none (no `vorax_read`, no advice), the note shows under NOT_ZH; the surgery
+    /// page closed and opened again (the skip-animation pattern, a pause and a resume) keeps the game's counts and
+    /// its last frame, so the same screen is not saved again; a deal makes the next new screen a key frame.
+    #[cfg(feature = "dev-samples")]
+    #[test]
+    fn samples_save_frames_and_read_nothing() {
+        use PageState::{Destory, Run};
+        let (mut s, root) = english_observing("on");
+        let note = |s: &VoraxSession| s.view().blocked.as_deref().is_some_and(|b| b.contains(NOT_ZH) && b.contains(samples::NOTE));
+        assert_eq!(s.note_cue(page(Page::Main, Run), Some(1_000)), ModeChange::Entered);
+        assert!(note(&s), "{:?}", s.view().blocked);
+        let frame = |v: u8| Rgba { w: 64, h: 36, data: vec![v; 64 * 36 * 4] };
+        s.read(frame(10), 2_000, "auto");
+        assert_eq!(s.note_cue(page(Page::Main, Destory), Some(2_200)), ModeChange::Left);
+        assert_eq!(s.note_cue(page(Page::Main, Run), Some(2_400)), ModeChange::Entered);
+        assert!(note(&s), "the note again after the resume");
+        s.read(frame(10), 4_500, "auto");
+        s.read(frame(200), 4_600, "auto");
+        s.board_cue(Cue::Dealt, 5_000);
+        s.read(frame(120), 5_300, "auto");
+        s.read(frame(60), 5_700, "auto");
+        assert!(s.view().advice.is_none());
+        s.log().unwrap().wait();
+        assert_eq!(files_named(&root, samples::PREFIX).len(), 3);
+        let rows = rows_of(s, &root);
+        assert!(kinds(&rows, "vorax_read").is_empty() && kinds(&rows, "vorax_advice").is_empty());
+        let saved = kinds(&rows, samples::EVENT);
+        let got: Vec<(&str, i64)> = saved.iter().map(|r| (r["why"].as_str().unwrap_or(""), r["index"].as_i64().unwrap_or(0))).collect();
+        // 2.0 s the first frame; after the resume 4.5 s is the same screen as the last saved (not again), 4.6 s a new
+        // one 2.6 s after it (index 2: the count went on); 5.3 s too early after the deal and inside the spacing;
+        // 5.7 s the hand.
+        assert_eq!(got, [("interval", 1), ("interval", 2), ("hand", 3)]);
+        // Observe modes off: not entered, nothing saved.
+        let (mut s, root) = english_observing("off");
+        s.configure(Config { observe: false, learn: false, ..s.config.clone() });
+        assert_eq!(s.note_cue(page(Page::Main, Run), Some(1_000)), ModeChange::None);
+        assert_eq!(s.view().blocked.as_deref(), Some(NOT_ZH));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Without the feature (the public build), as in 1.0.2: an English client with observe mode on and a log folder
+    /// does not enter the game, shows NOT_ZH alone, and saves nothing.
+    #[cfg(not(feature = "dev-samples"))]
+    #[test]
+    fn an_english_client_saves_nothing_without_the_feature() {
+        use PageState::Run;
+        let (mut s, root) = english_observing("public");
+        assert_eq!(s.note_cue(page(Page::Main, Run), Some(1_000)), ModeChange::None);
+        assert_eq!(s.view().blocked.as_deref(), Some(NOT_ZH));
+        s.read(Rgba { w: 64, h: 36, data: vec![10; 64 * 36 * 4] }, 2_000, "auto");
+        assert!(!s.active());
+        assert!(files_named(&root, "sample").is_empty());
+        let logs = files_named(&root, "log.jsonl");
+        assert!(logs.iter().all(|l| std::fs::read_to_string(l).is_ok_and(|t| !t.contains("vorax_sample"))), "{logs:?}");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// The tooltip's card held in place of a raised card (the new icon has no template) leaves a `vorax_pick_fallback`
