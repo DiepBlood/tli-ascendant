@@ -414,20 +414,267 @@ pub struct Extra {
     pub differs: Vec<(String, String, String)>,
 }
 
-/// Tartarus' suspicious moments:
+// ───────────────────────── Tartarus: normal passing states (1.0.2) ─────────────────────────
+
+/// A kind of Tartarus log line that is a normal passing state of the reader or the game, not a suspicious moment:
+/// the session shows the last reading, or reads once more, until the screen settles. Such lines are only counted, in
+/// one line of report.txt with no images ([`TartarusMoments::summary`]); a run with more of one kind than its
+/// [`Calm::limit`] lists that kind once, P3, as unusually many.
+pub struct Calm {
+    /// Its name in the summary line (English, translated with [`tr`]).
+    pub label: &'static str,
+    /// Its lines' English sentences (`{}` stands for any text), matched in English and in Chinese ([`is_line`]).
+    pub lines: &'static [&'static str],
+    /// The Chinese older builds logged for its lines, since changed in the table (`{}` stands for any text): runs
+    /// logged before the change are matched by it as it was.
+    pub legacy: &'static [&'static str],
+    /// Only on a read whose screen is Unknown (a board read between two steps); on a decision screen the same line
+    /// is a failure and stays a moment.
+    pub unknown_only: bool,
+    /// The most of it a normal run has: the 95th percentile of its count over the 30 newest finished runs on
+    /// 2026-11-07 (2026-11-04 to 11-06, tmp_png\v102\moments-stats.txt), at least [`CALM_FLOOR`].
+    pub limit: usize,
+}
+
+/// No kind of normal passing state is unusual this few times in a run, whatever its percentile.
+pub const CALM_FLOOR: usize = 3;
+
+/// The normal passing states, each with why it is not suspicious. Up to 1.0.1 each was a moment of its own (a miss
+/// P2, a read warning P3) with 4 to 7 images: in 2026-11-06_16-17-31 they were 15 of its 35 moments, and the
+/// low-confidence warnings ([`LOW_CONFIDENCE`]) 9 more.
+pub const CALM: [Calm; 13] = [
+    // The session holds a changed board for one more read before it advises on it (session.rs CHANGED): every move's
+    // result is read this way.
+    Calm { label: "board changed, read again to confirm", lines: &["The board changed: reading it again to confirm."], legacy: &[], unknown_only: false, limit: 51 },
+    // A game dialog over the prison (a reward, a confirmation): the last reading stays until the player closes it.
+    Calm { label: "popup over the game", lines: &["A popup covers the game: showing the last reading."], legacy: &[], unknown_only: false, limit: 40 },
+    // The day banner and the other screens between the prison's steps: nothing to read, the last reading stays.
+    Calm { label: "prison board off screen", lines: &["The prison board is not on screen: showing the last reading."], legacy: &[], unknown_only: false, limit: 22 },
+    // The bite's animation: the target screen catches up within session.rs BITE_SHOWS (1.5 s).
+    Calm { label: "last bite not drawn yet", lines: &["The board does not show the last bite yet: showing the last reading."], legacy: &[], unknown_only: false, limit: 29 },
+    // A Replace's flash and fade-in: the new inmate shows about 0.45 s after the click (session.rs REPLACE_SHOWS).
+    Calm { label: "replaced inmate not drawn yet", lines: &["The new inmate is not on show yet: showing the last reading."], legacy: &[], unknown_only: false, limit: 19 },
+    // The day-break effects: the board is held at most session.rs DAY_SHOWS (1 s).
+    Calm { label: "new day not drawn yet", lines: &["The new day is not on the board yet: showing the last reading."], legacy: &[], unknown_only: false, limit: 3 },
+    // The board, the decision cards or an offer fading in after a screen change (session.rs FADING, CARDS_FADING,
+    // OFFER_PARTIAL); a short offer read the same for OFFER_STEADY stands.
+    Calm {
+        label: "screen still coming in",
+        lines: &[
+            "The board is still coming in: showing the last reading.",
+            "The decision cards are still coming in: showing the last reading.",
+            "The offer is still coming in: showing the last reading.",
+        ],
+        legacy: &[],
+        unknown_only: false,
+        limit: 2,
+    },
+    // A Warden's Treasure or instrument pick covers the board by design: its cells come from the last board read.
+    // Until 2026-11-04 its Chinese was another (the backups' zh_tw.rs; git's history starts after it).
+    Calm {
+        label: "pick covering the board",
+        lines: &["The pick covers the board: the cells are from the last board read (day {})."],
+        legacy: &["選擇畫面蓋住了盤面：牢房取自上次讀到的盤面（第 {} 天）。"],
+        unknown_only: false,
+        limit: 144,
+    },
+    // The pick screens cover the days counter: the count from the last read stands.
+    Calm { label: "days counter covered", lines: &["The days counter is hidden: {} day(s) until Riot kept from the last read."], legacy: &[], unknown_only: false, limit: 116 },
+    // A board read between two steps (Unknown screen: the destination cards or decision buttons are not up yet), on
+    // which no advice is given. On a patrol screen the same lines are a failure, so only on Unknown.
+    Calm {
+        label: "board read between steps",
+        lines: &[
+            "No destination cards or decision buttons on screen: take the screenshot when they show.",
+            "Mark today's doors: tick them under \u{201c}Select a Destination\u{201d}, or select a cell and press Today's door.",
+        ],
+        legacy: &[],
+        unknown_only: true,
+        limit: 184,
+    },
+    // The mouse over a cell shows the game's tooltip: the cells under it keep the last board read.
+    Calm { label: "tooltip over cells", lines: &["A tooltip covers {}: {} kept from the last board read."], legacy: &[], unknown_only: false, limit: 3 },
+    // The eater still changes after its bite (up to 2.8 s, session.rs NO_ADVICE_NOTICE): the targets the game marks
+    // stand in, and the board is read again once the screen stops.
+    Calm {
+        label: "eater still changing after its bite",
+        lines: &[
+            "The eater in cell {} still changes after its bite: taken as the {} the targets the game marks call for, until it reads.",
+            "The eater in cell {} has nothing to Consume on the board read, but the game marks targets: it may still be changing after its bite, and the board is read again once the screen stops. If this stays, check the eater and the marked cells.",
+        ],
+        legacy: &[],
+        unknown_only: false,
+        limit: 9,
+    },
+    // Screens with nothing to solve: the run's theme scroll, and the wait after the run.
+    Calm {
+        label: "screen with nothing to solve",
+        lines: &["The run's theme: {}.", "The run's theme: {}. Nothing to solve on this screen.", "The run is over: waiting for the next run."],
+        legacy: &[],
+        unknown_only: false,
+        limit: 0,
+    },
+];
+
+/// The reader's low-confidence warnings ("... (confidence 0.xx)"): the read went on with its best guess. One on a
+/// read between steps (Unknown screen, no advice given) or on a single read is a frame caught mid-animation or a
+/// cell in passing, and the next reads settle it. Such a warning is a moment only when it persists, [`LOW_STREAK`]
+/// reads in a row on a decision screen, or when a very low one ([`VERY_LOW`]) is followed by another reading of its
+/// cell on the same screen and day: the guess was wrong while it showed. The last one is the warden's.
+const LOW_CONFIDENCE: [&str; 7] = [
+    "Check cell {}: read as {} (confidence {}).",
+    "Check cell {}: {} marker read with confidence {}.",
+    "Check cell {}: the glow behind the locked door read as {} (confidence {}).",
+    "Check cell {}: beast read as {} (confidence {}).",
+    "Check cell {}: rarity read as {} (confidence {}).",
+    "Check cell {}: read as an empty cell (confidence {}).",
+    "Check the warden: read at cell {} (confidence {}).",
+];
+/// Reads in a row a low-confidence warning of the same cell must be in to persist.
+const LOW_STREAK: usize = 2;
+/// A confidence this low that the next read contradicts is a moment (the reader warns below 0.3; a quarter of the
+/// warnings in the 30 runs were 0.05 or lower, half 0.16 or lower).
+const VERY_LOW: f32 = 0.1;
+/// The summary's name for the low-confidence warnings left out.
+const LOW_LABEL: &str = "low-confidence cell reads (between steps, or not repeated)";
+
+/// A low-confidence warning's sentence (index in [`LOW_CONFIDENCE`]) and cell (index in the model's cells; None
+/// for the warden).
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct LowKey {
+    sentence: usize,
+    cell: Option<usize>,
+}
+
+/// A read's low-confidence warning: its key, confidence and text.
+type LowWarning = (LowKey, f32, String);
+
+/// Whether `text` fits `template`: its fixed parts in order, the first at the start and the last at the end, any
+/// text for each `{}` or `{N}` (templates here have no literal braces).
+fn fits(text: &str, template: &str) -> bool {
+    let mut parts: Vec<&str> = Vec::new();
+    let mut rest = template;
+    while let Some(open) = rest.find('{') {
+        let Some(close) = rest[open..].find('}') else { break };
+        parts.push(&rest[..open]);
+        rest = &rest[open + close + 1..];
+    }
+    parts.push(rest);
+    if parts.len() == 1 {
+        return text == template;
+    }
+    let (first, last) = (parts[0], parts[parts.len() - 1]);
+    if text.len() < first.len() + last.len() || !text.starts_with(first) || !text.ends_with(last) {
+        return false;
+    }
+    let mut middle = &text[first.len()..text.len() - last.len()];
+    for p in &parts[1..parts.len() - 1] {
+        match middle.find(p) {
+            Some(i) => middle = &middle[i + p.len()..],
+            None => return false,
+        }
+    }
+    true
+}
+
+/// Whether a logged line is the English sentence `en` (with its `{}` filled), in English or in Chinese: the log keeps
+/// the language the window had then, so lines are told apart by their English key, never by the Chinese alone.
+fn is_line(text: &str, en: &'static str) -> bool {
+    Lang::ALL.iter().any(|&l| fits(text, lang::tr_in(l, en)))
+}
+
+/// The normal passing state (index in [`CALM`]) a miss line or read warning is, if any. `unknown`: on a read whose
+/// screen is Unknown.
+fn calm_kind(text: &str, unknown: bool) -> Option<usize> {
+    CALM.iter().position(|c| (unknown || !c.unknown_only) && (c.lines.iter().any(|l| is_line(text, l)) || c.legacy.iter().any(|l| fits(text, l))))
+}
+
+/// A low-confidence warning's key and confidence (its last number), if `text` is one.
+fn low_confidence(text: &str) -> Option<(LowKey, f32)> {
+    let sentence = LOW_CONFIDENCE.iter().position(|t| is_line(text, t))?;
+    let numbers: Vec<&str> = text.split(|c: char| !(c.is_ascii_digit() || c == '.')).map(|s| s.trim_matches('.')).filter(|s| !s.is_empty()).collect();
+    let confidence = numbers.last()?.parse().ok()?;
+    let cell = match sentence == LOW_CONFIDENCE.len() - 1 {
+        true => None,
+        false => Some(numbers.first()?.parse::<usize>().ok()?.checked_sub(1)?),
+    };
+    Some((LowKey { sentence, cell }, confidence))
+}
+
+/// Whether `next`, the read after `read`, on the same screen and day, has the key's cell (or the warden) otherwise.
+fn flipped(read: &Value, next: Option<&Value>, key: LowKey) -> bool {
+    let Some(next) = next else { return false };
+    if next["screen"] != read["screen"] || next["model"]["day"] != read["model"]["day"] {
+        return false;
+    }
+    let (a, b) = match key.cell {
+        Some(n) => (&read["model"]["cells"][n], &next["model"]["cells"][n]),
+        None => (&read["model"]["warden"], &next["model"]["warden"]),
+    };
+    !a.is_null() && !b.is_null() && a != b
+}
+
+/// Tartarus' suspicious moments, and the normal passing states left out of them.
+#[derive(Clone, Debug, Default)]
+pub struct TartarusMoments {
+    pub moments: Vec<Moment>,
+    /// The lines left out: the [`CALM`] kinds not unusually many, in its order, then the low-confidence warnings
+    /// ([`LOW_LABEL`]); kinds with none are not there.
+    pub quiet: Vec<Quiet>,
+    /// Each [`CALM`] kind's count in the run, listed as unusual or not.
+    pub counts: Vec<usize>,
+}
+
+/// A kind of line left out of the moments: its label, count, and the `at` of its first and last line (UTC), so
+/// the developer can still find them in log.jsonl.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Quiet {
+    pub label: &'static str,
+    pub n: usize,
+    pub first: String,
+    pub last: String,
+}
+
+impl TartarusMoments {
+    /// report.txt's line for the lines left out, or None when there are none: each kind with its count and the
+    /// times of its first and last line, as the moments list shows them.
+    pub fn summary(&self) -> Option<String> {
+        let total: usize = self.quiet.iter().map(|q| q.n).sum();
+        let items: Vec<String> = self.quiet.iter().map(|q| trf!("{} {} times ({} to {})", tr(q.label), q.n, clock(&q.first), clock(&q.last))).collect();
+        (total > 0).then(|| trf!("Also {} normal passing states not listed (no images): {}.", total, items.join(tr(", "))))
+    }
+}
+
+/// Tartarus' suspicious moments (1.0.2):
 /// - `edit` (cells, markers, instruments or theme corrected by hand): P1.
 /// - `miss` (a read that failed on a screen other than Unknown): reported once per screen and line, with a count, P2.
 ///   Unknown means the reader saw no prison screen at all (town, loading), which is no failure.
 /// - Read warnings (a `read`'s warnings and problems): the same text with other numbers counts once, with a count, P3.
+/// - Misses and read warnings that are a normal passing state ([`CALM`]) are not moments: they are counted in
+///   [`TartarusMoments::quiet`]; a kind over its [`Calm::limit`] in the run is listed once, P3, as unusually many.
+/// - Low-confidence warnings ([`LOW_CONFIDENCE`]): P3 once per cell and sentence, only when they persist or a very
+///   low one is contradicted by the next read; the others are counted in `quiet`.
 /// - A move made against the advice (the move `audit` infers): P2.
 /// - The review's largest loss, each issue of a failed run check, and crash.log's crashes during the run: P1.
-pub fn tartarus_moments(text: &str, extra: &Extra) -> Vec<Moment> {
+pub fn tartarus_moments(text: &str, extra: &Extra) -> TartarusMoments {
     let rows = rows(text);
     let mut out = Vec::new();
     let moment = |r: &Row, reason: String, priority: u8| Moment { ms: r.ms, at: at(&r.v), reason, priority, files: Vec::new(), battle: false };
     // (screen, line) -> (index of the first line, count)
     let mut misses: Vec<(String, String, usize, usize)> = Vec::new();
     let mut warns: Vec<(String, String, usize, usize)> = Vec::new();
+    // Each CALM kind: (count, index of its first line, that line's text, index of its last line).
+    let mut calm: Vec<(usize, usize, String, usize)> = vec![(0, 0, String::new(), 0); CALM.len()];
+    let note = |calm: &mut [(usize, usize, String, usize)], k: usize, i: usize, line: &str| {
+        let c = &mut calm[k];
+        if c.0 == 0 {
+            (c.1, c.2) = (i, line.to_string());
+        }
+        c.0 += 1;
+        c.3 = i;
+    };
+    // Each read line: its index and its low-confidence warnings (key, confidence, text).
+    let mut reads: Vec<(usize, Vec<LowWarning>)> = Vec::new();
     for (i, r) in rows.iter().enumerate() {
         match kind(&r.v) {
             "edit" => {
@@ -447,20 +694,40 @@ pub fn tartarus_moments(text: &str, extra: &Extra) -> Vec<Moment> {
                     continue;
                 }
                 let line = r.v["line"].as_str().unwrap_or("").to_string();
+                if let Some(k) = calm_kind(&line, false) {
+                    note(&mut calm, k, i, &line);
+                    continue;
+                }
                 match misses.iter_mut().find(|(s, l, _, _)| s.as_str() == screen && l.as_str() == line) {
                     Some(m) => m.3 += 1,
                     None => misses.push((screen.to_string(), line, i, 1)),
                 }
             }
             "read" => {
+                let unknown = r.v["screen"].as_str().unwrap_or("Unknown") == "Unknown";
                 let texts = r.v["warnings"].as_array().into_iter().flatten().chain(r.v["problems"].as_array().into_iter().flatten()).filter_map(|w| w.as_str());
+                // A kind counts once per line (a read between steps has both of its sentences).
+                let mut kinds: Vec<usize> = Vec::new();
+                let mut lows = Vec::new();
                 for w in texts {
+                    if let Some(k) = calm_kind(w, unknown) {
+                        if !kinds.contains(&k) {
+                            kinds.push(k);
+                            note(&mut calm, k, i, w);
+                        }
+                        continue;
+                    }
+                    if let Some((key, confidence)) = low_confidence(w) {
+                        lows.push((key, confidence, w.to_string()));
+                        continue;
+                    }
                     let p = pattern(w);
                     match warns.iter_mut().find(|(k, _, _, _)| *k == p) {
                         Some(m) => m.3 += 1,
                         None => warns.push((p, w.to_string(), i, 1)),
                     }
                 }
+                reads.push((i, lows));
             }
             _ => {}
         }
@@ -470,6 +737,57 @@ pub fn tartarus_moments(text: &str, extra: &Extra) -> Vec<Moment> {
     }
     for (_, text, i, n) in warns {
         out.push(moment(&rows[i], trf!("Read warning: {} ({} times this run)", text, n), 3));
+    }
+    // Low-confidence warnings: (key, index of the line, text, why it is listed) for the keys listed, at their first
+    // line that qualifies; the count is every warning of the key in the run.
+    let mut listed: Vec<(LowKey, usize, String, String)> = Vec::new();
+    for (j, (i, lows)) in reads.iter().enumerate() {
+        let read = &rows[*i].v;
+        let unknown = read["screen"].as_str().unwrap_or("Unknown") == "Unknown";
+        for (key, confidence, w) in lows {
+            let has = |k: usize| reads[k].1.iter().any(|l| l.0 == *key);
+            let (mut a, mut b) = (j, j);
+            while a > 0 && has(a - 1) {
+                a -= 1;
+            }
+            while b + 1 < reads.len() && has(b + 1) {
+                b += 1;
+            }
+            let why = if unknown {
+                None
+            } else if b - a + 1 >= LOW_STREAK {
+                Some(trf!("in {} reads in a row", b - a + 1))
+            } else if *confidence < VERY_LOW && flipped(read, reads.get(j + 1).map(|n| &rows[n.0].v), *key) {
+                Some(tr("very low, and the next read differs").to_string())
+            } else {
+                None
+            };
+            if let Some(why) = why
+                && !listed.iter().any(|l| l.0 == *key)
+            {
+                listed.push((*key, *i, w.clone(), why));
+            }
+        }
+    }
+    let all_lows = || reads.iter().flat_map(|r| r.1.iter());
+    for (key, i, text, why) in &listed {
+        let n = all_lows().filter(|l| l.0 == *key).count();
+        out.push(moment(&rows[*i], trf!("Read warning: {} ({}; {} times this run)", text, why, n), 3));
+    }
+    // The low-confidence warnings left out: their reads (index of the line, once per warning).
+    let low_quiet: Vec<usize> = reads.iter().flat_map(|(i, lows)| lows.iter().filter(|l| !listed.iter().any(|x| x.0 == l.0)).map(move |_| *i)).collect();
+    let mut quiet = Vec::new();
+    let span = |label: &'static str, n: usize, first: usize, last: usize| Quiet { label, n, first: at(&rows[first].v), last: at(&rows[last].v) };
+    for (k, (n, i, first, last)) in calm.iter().enumerate() {
+        let limit = CALM[k].limit.max(CALM_FLOOR);
+        if *n > limit {
+            out.push(moment(&rows[*i], trf!("Unusually many ({}): {} ({} times this run, normally at most {})", tr(CALM[k].label), first, n, limit), 3));
+        } else if *n > 0 {
+            quiet.push(span(CALM[k].label, *n, *i, *last));
+        }
+    }
+    if let (Some(&first), Some(&last)) = (low_quiet.first(), low_quiet.last()) {
+        quiet.push(span(LOW_LABEL, low_quiet.len(), first, last));
     }
     let row_at = |when: &str| super::latency::log_millis(when).map(|ms| Row { ms, v: serde_json::json!({ "at": when }) });
     for (read_at, advised, made) in &extra.differs {
@@ -499,7 +817,7 @@ pub fn tartarus_moments(text: &str, extra: &Extra) -> Vec<Moment> {
         }
     }
     out.sort_by_key(|m| m.ms);
-    out
+    TartarusMoments { moments: out, quiet, counts: calm.iter().map(|c| c.0).collect() }
 }
 
 /// A run check issue's day: "Day 12: ..." or `第 12 天：...` (by the current language's sentence start).
@@ -1307,6 +1625,8 @@ pub struct Prepared {
     pub level: (usize, u8),
     /// Extra notes (a review skipped for another language...).
     pub notes: Vec<String>,
+    /// Tartarus' normal passing states left out of the moments, in one line ([`TartarusMoments::summary`]).
+    pub quiet: Option<String>,
 }
 
 /// What to export.
@@ -1466,12 +1786,14 @@ pub fn prepare(req: &Request, cancel: &AtomicBool, status: &dyn Fn(String)) -> R
     let run = req.dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     let mut notes = Vec::new();
     status(tr("Picking the suspicious moments...").to_string());
-    let (moments, shots) = match req.game {
+    let (moments, quiet, shots) = match req.game {
         Game::Tartarus => {
             let extra = tartarus_extra(req, &text, cancel, status, &mut notes);
-            (tartarus_moments(&text, &extra), tartarus_shots(&req.dir, &text))
+            let found = tartarus_moments(&text, &extra);
+            let quiet = found.summary();
+            (found.moments, quiet, tartarus_shots(&req.dir, &text))
         }
-        Game::Vorax => (vorax_moments(&text), vorax_shots(&req.dir, &text)),
+        Game::Vorax => (vorax_moments(&text), None, vorax_shots(&req.dir, &text)),
     };
     check()?;
     let steps = steps(req.game, &text);
@@ -1529,6 +1851,7 @@ pub fn prepare(req: &Request, cancel: &AtomicBool, status: &dyn Fn(String)) -> R
             removed: removed.clone(),
             level: (k, drop),
             notes: notes.clone(),
+            quiet: quiet.clone(),
         };
         let report = scrub_text(&report_text(&prepared, &level, &facts), &scrub, &mut Removed::default());
         files.insert(0, ("log.jsonl".to_string(), log.clone().into_bytes()));
@@ -1577,6 +1900,9 @@ fn report_text(p: &Prepared, level: &Level, (game_lang, ocr, size): &(String, St
         if *skipped {
             line(format!("   {}", tr("Some images of this moment were left out: they may show personal information.")));
         }
+    }
+    if let Some(quiet) = &p.quiet {
+        line(quiet.clone());
     }
     line(String::new());
     line(tr("Removed before packing:").to_string());
@@ -2179,6 +2505,9 @@ mod tests {
             line(json!({"at": t("15:37.000"), "kind": "edit", "cell": 5, "edit": "Sealed"})),
             line(json!({"at": t("15:38.000"), "kind": "edit", "tools": ["chains", "axe"]})),
             line(json!({"at": t("15:39.000"), "kind": "edit", "theme": "Sewer"})),
+            // Normal passing states: counted, never a moment of their own.
+            line(json!({"at": t("15:40.000"), "kind": "miss", "screen": "Patrol", "line": "The board changed: reading it again to confirm.", "frame": null})),
+            line(json!({"at": t("15:41.000"), "kind": "read", "screen": "TreasurePick", "warnings": ["The pick covers the board: the cells are from the last board read (day 4)."], "problems": [], "model": {"day": 4}})),
             line(json!({"at": t("15:50.000"), "kind": "run_end", "vaulted": 3})),
         ]
         .join("\n");
@@ -2190,9 +2519,17 @@ mod tests {
             crashes: vec![(start + 10_000, "thread 'main': boom".into()), (start - 999_999, "old".into())],
             differs: vec![(t("15:36.000"), "Go to 04".into(), "Go to 06".into())],
         };
-        let m = tartarus_moments(&log, &extra);
+        let found = tartarus_moments(&log, &extra);
+        let m = &found.moments;
         let reasons: Vec<&str> = m.iter().map(|m| m.reason.as_str()).collect();
         let has = |s: &str| reasons.iter().filter(|r| r.contains(s)).count();
+        // The normal passing states are only in the summary line.
+        assert_eq!((has("board changed"), has("pick covers")), (0, 0), "{reasons:#?}");
+        assert_eq!(
+            found.summary().as_deref(),
+            Some("Also 2 normal passing states not listed (no images): board changed, read again to confirm 1 times (21:15:40 to 21:15:40), pick covering the board 1 times (21:15:41 to 21:15:41).")
+        );
+        assert_eq!(m.len(), 11, "{reasons:#?}");
         // An Unknown screen's miss does not count; Patrol's line is reported once, with 2.
         assert_eq!(has("Read failed"), 1, "{reasons:#?}");
         assert!(reasons.iter().any(|r| r.starts_with("Read failed (Patrol): doors not up yet (2 times")));
@@ -2215,6 +2552,151 @@ mod tests {
         let p = |s: &str| m.iter().find(|x| x.reason.contains(s)).unwrap().priority;
         assert_eq!((p("Manual"), p("Read failed"), p("Read warning"), p("differs"), p("Largest"), p("Run check"), p("crash")), (1, 2, 3, 2, 1, 1, 1));
         assert!(m.windows(2).all(|w| w[0].ms <= w[1].ms));
+    }
+
+    /// The index in CALM of the kind with this label.
+    fn calm(label: &str) -> usize {
+        CALM.iter().position(|c| c.label == label).unwrap()
+    }
+
+    /// Normal passing states are counted, in either language, and never listed; a between-steps line counts only on
+    /// an Unknown screen, and once per read; an Unknown screen's miss is not counted at all.
+    #[test]
+    fn normal_passing_states_are_not_moments() {
+        crate::lang::set(Lang::En);
+        let miss = |s: &str, screen: &str, text: &str| line(json!({"at": t(s), "kind": "miss", "screen": screen, "line": text, "frame": null}));
+        let read = |s: &str, screen: &str, warnings: Value, problems: Value| line(json!({"at": t(s), "kind": "read", "screen": screen, "warnings": warnings, "problems": problems, "model": {"day": 2}}));
+        let between = "No destination cards or decision buttons on screen: take the screenshot when they show.";
+        let doors = "Mark today's doors: tick them under \u{201c}Select a Destination\u{201d}, or select a cell and press Today's door.";
+        let log = [
+            miss("10:00.000", "Patrol", "The board changed: reading it again to confirm."),
+            miss("10:01.000", "Manage", "盤面有變化：再讀一次確認。"),
+            miss("10:02.000", "Unknown", "The board changed: reading it again to confirm."),
+            miss("10:03.000", "Popup", "彈出視窗蓋住了遊戲：顯示上次的讀取。"),
+            miss("10:04.000", "Theme", "本局主題：濫權。"),
+            read("10:05.000", "Unknown", json!([between]), json!([doors])),
+            read("10:06.000", "TreasurePick", json!(["選單蓋住盤面：牢房用上次讀到的（第 2 天）", "The days counter is hidden: 9 day(s) until Riot kept from the last read."]), json!([])),
+            // On a patrol screen the doors not read are a failure.
+            read("10:07.000", "Patrol", json!([between]), json!([])),
+            // The pick's Chinese as builds up to 2026-11-04 logged it.
+            read("10:08.000", "InstrumentPick", json!(["選擇畫面蓋住了盤面：牢房取自上次讀到的盤面（第 2 天）。"]), json!([])),
+            line(json!({"at": t("10:30.000"), "kind": "run_end"})),
+        ]
+        .join("\n");
+        let found = tartarus_moments(&log, &Extra::default());
+        let reasons: Vec<&str> = found.moments.iter().map(|m| m.reason.as_str()).collect();
+        assert_eq!(reasons, vec![format!("Read warning: {between} (1 times this run)").as_str()]);
+        let n = |label: &str| found.counts[calm(label)];
+        assert_eq!(
+            (n("board changed, read again to confirm"), n("popup over the game"), n("screen with nothing to solve"), n("board read between steps"), n("pick covering the board"), n("days counter covered")),
+            (2, 1, 1, 1, 2, 1)
+        );
+        assert_eq!(
+            found.summary().as_deref(),
+            Some(
+                "Also 8 normal passing states not listed (no images): board changed, read again to confirm 2 times (21:10:00 to 21:10:01), popup over the game 1 times (21:10:03 to 21:10:03), pick covering the board 2 times (21:10:06 to 21:10:08), days counter covered 1 times (21:10:06 to 21:10:06), board read between steps 1 times (21:10:05 to 21:10:05), screen with nothing to solve 1 times (21:10:04 to 21:10:04)."
+            )
+        );
+        // Nothing left out: no line.
+        assert_eq!(TartarusMoments::default().summary(), None);
+    }
+
+    /// A kind over its limit in a run is listed once, P3, at its first line, and leaves the summary; at the limit it
+    /// stays quiet.
+    #[test]
+    fn unusually_many_normal_states_are_listed_once() {
+        crate::lang::set(Lang::En);
+        let day = calm("new day not drawn yet");
+        let popup = calm("popup over the game");
+        let (day_limit, popup_limit) = (CALM[day].limit.max(CALM_FLOOR), CALM[popup].limit.max(CALM_FLOOR));
+        let mut log = Vec::new();
+        for k in 0..=day_limit {
+            log.push(line(json!({"at": t(&format!("20:{:02}.000", k)), "kind": "miss", "screen": "Patrol", "line": "The new day is not on the board yet: showing the last reading."})));
+        }
+        for k in 0..popup_limit {
+            log.push(line(json!({"at": t(&format!("21:{:02}.{:03}", k / 1000, k % 1000)), "kind": "miss", "screen": "Popup", "line": "A popup covers the game: showing the last reading."})));
+        }
+        let found = tartarus_moments(&log.join("\n"), &Extra::default());
+        assert_eq!(found.moments.len(), 1, "{:#?}", found.moments);
+        let m = &found.moments[0];
+        assert_eq!(
+            m.reason,
+            format!("Unusually many (new day not drawn yet): The new day is not on the board yet: showing the last reading. ({} times this run, normally at most {day_limit})", day_limit + 1)
+        );
+        assert_eq!((m.priority, m.at.as_str()), (3, t("20:00.000").as_str()));
+        assert_eq!(found.quiet, vec![Quiet { label: "popup over the game", n: popup_limit, first: t("21:00.000"), last: t(&format!("21:00.{:03}", popup_limit - 1)) }]);
+        assert_eq!((found.counts[day], found.counts[popup]), (day_limit + 1, popup_limit));
+    }
+
+    /// Low-confidence warnings are moments only on a decision screen, when the same cell and sentence repeat in
+    /// consecutive reads or a very low one is contradicted by the next read of the same screen and day.
+    #[test]
+    fn low_confidence_warnings_need_to_repeat_or_flip() {
+        crate::lang::set(Lang::En);
+        let read = |s: &str, screen: &str, warning: &str, cells: Value| line(json!({"at": t(s), "kind": "read", "screen": screen, "warnings": [warning], "problems": [], "model": {"day": 3, "cells": cells}}));
+        let rat = |tier: i64| json!({"kind": "inmate", "beast": "rat", "tier": tier});
+        let cells = |n: usize, cell: Value| {
+            let mut c = vec![json!({"kind": "sealed"}); 16];
+            c[n] = cell;
+            Value::Array(c)
+        };
+        let log = [
+            // Once, and the next read has another warning: quiet.
+            read("30:00.000", "Patrol", "Check cell 05: beast read as Normal Lion (confidence 0.20).", cells(4, rat(0))),
+            // Two reads in a row: listed once.
+            read("30:01.000", "Patrol", "Check cell 07: read as open (confidence 0.25).", cells(6, rat(0))),
+            read("30:02.000", "Patrol", "Check cell 07: read as open (confidence 0.22).", cells(6, rat(0))),
+            // Very low, and the next read of the screen and day differs: listed.
+            read("30:03.000", "Manage", "Check cell 09: rarity read as Magic Rat (confidence 0.05).", cells(8, rat(1))),
+            // Very low, but the next read is another screen: quiet.
+            read("30:04.000", "Manage", "Check cell 10: rarity read as Magic Rat (confidence 0.05).", cells(9, rat(1))),
+            read("30:05.000", "Patrol", "Check cell 11: rarity read as Rare Rat (confidence 0.29).", cells(9, rat(2))),
+            // Between steps (Unknown) in a row: quiet.
+            read("30:06.000", "Unknown", "Check cell 03: read as locked (confidence 0.01).", cells(2, rat(0))),
+            read("30:07.000", "Unknown", "Check cell 03: read as locked (confidence 0.02).", cells(2, rat(0))),
+            // Logged in Chinese, in a row: listed.
+            read("30:08.000", "Patrol", "檢查牢房 12：囚犯讀為普通狂獅（信心 0.10）。", cells(11, rat(0))),
+            read("30:09.000", "Patrol", "檢查牢房 12：囚犯讀為普通狂獅（信心 0.12）。", cells(11, rat(0))),
+        ]
+        .join("\n");
+        let found = tartarus_moments(&log, &Extra::default());
+        let reasons: Vec<&str> = found.moments.iter().map(|m| m.reason.as_str()).collect();
+        assert_eq!(
+            reasons,
+            vec![
+                "Read warning: Check cell 07: read as open (confidence 0.25). (in 2 reads in a row; 2 times this run)",
+                "Read warning: Check cell 09: rarity read as Magic Rat (confidence 0.05). (very low, and the next read differs; 1 times this run)",
+                "Read warning: 檢查牢房 12：囚犯讀為普通狂獅（信心 0.10）。 (in 2 reads in a row; 2 times this run)",
+            ]
+        );
+        assert!(found.moments.iter().all(|m| m.priority == 3));
+        // Cells 05, 10, 11 and the two between steps.
+        assert_eq!(found.quiet, vec![Quiet { label: LOW_LABEL, n: 5, first: t("30:00.000"), last: t("30:07.000") }]);
+    }
+
+    /// Every sentence the rules match has its Chinese, and a filled sentence fits its template in either language.
+    #[test]
+    fn calm_and_low_confidence_sentences_match_both_languages() {
+        for en in CALM.iter().flat_map(|c| c.lines.iter()).chain(LOW_CONFIDENCE.iter()) {
+            assert_ne!(lang::tr_in(Lang::ZhTw, en), *en, "{en} has no Chinese");
+        }
+        for label in CALM.iter().map(|c| c.label).chain([LOW_LABEL]) {
+            assert_ne!(lang::tr_in(Lang::ZhTw, label), label, "{label} has no Chinese");
+        }
+        assert!(fits("Check cell 05: read as open (confidence 0.20).", LOW_CONFIDENCE[0]));
+        assert!(!fits("Check cell 05: read as open (confidence 0.20)", LOW_CONFIDENCE[0]));
+        assert!(fits("檢查典獄長：讀在 07 號（信心 0.15）。", lang::tr_in(Lang::ZhTw, LOW_CONFIDENCE[6])));
+        assert_eq!(low_confidence("檢查典獄長：讀在 07 號（信心 0.15）。"), Some((LowKey { sentence: 6, cell: None }, 0.15)));
+        assert_eq!(low_confidence("Check cell 12: beast read as Normal Lion (confidence 0.03)."), Some((LowKey { sentence: 3, cell: Some(11) }, 0.03)));
+        // The rarity warning is not the beast one, though both end alike.
+        assert_eq!(low_confidence("檢查牢房 02：稀有度讀為普通狂獅（信心 0.23）。").map(|l| l.0.sentence), Some(4));
+        assert_eq!(calm_kind("暴動倒數被遮住：沿用上次讀到的距離暴動 16 天。", false), Some(calm("days counter covered")));
+        assert_eq!(calm_kind("The prison board is not on screen: showing the last reading.", false), Some(calm("prison board off screen")));
+        assert_eq!(calm_kind("Read 2 of the 3 instruments on offer.", false), None);
+        // The legacy Chinese of the pick still matches; another sentence that starts alike does not.
+        let pick = Some(calm("pick covering the board"));
+        assert_eq!(calm_kind("選擇畫面蓋住了盤面：牢房取自上次讀到的盤面（第 19 天）。", false), pick);
+        assert_eq!(calm_kind("選擇畫面蓋住了盤面，之前也沒讀過盤面：假設為開局。", false), None);
     }
 
     /// An export belongs to its run: once another run (or an unfinished one, or none) is to be exported, an export

@@ -194,11 +194,23 @@ const LOG_CHECK: Duration = Duration::from_secs(2);
 /// `title` (any case), else the first whose title contains it, leaving out
 /// this process's windows and console windows.
 fn find(title: &str) -> Option<HWND> {
+    let search = search(title);
+    search.game.or(search.exact).or(search.partial)
+}
+
+/// The windows [`find`] picks from for `title`.
+fn search(title: &str) -> Search {
     let mut search = Search { needle: title.to_lowercase(), game: None, exact: None, partial: None };
     // SAFETY: the callback only touches `search`, which outlives the call. EnumWindows
     // reports an error when the callback stops early, which is how the game's window ends it.
     let _ = unsafe { EnumWindows(Some(visit), LPARAM(&mut search as *mut Search as isize)) };
-    search.game.or(search.exact).or(search.partial)
+    search
+}
+
+/// The id of the game's process ([`GAME_EXE`]) when its window is found; a window matched only by its title does not
+/// count. Used to tell whether the game runs as administrator (see [`super::elevation`]).
+pub fn game_pid() -> Option<u32> {
+    search(GAME_EXE).game.map(window_pid)
 }
 
 /// The window `find` picks for `title`, or why there is none.

@@ -537,6 +537,9 @@ fn card_effect(x: i32, dy: i32, half: i32) -> Rect {
 
 /// A card whose type text is at least this much higher than usual counts as raised: raised is about 40 pixels.
 const RAISED_DY: i32 = -20;
+/// Higher than this (closer to zero) is only a shallow raise: what the card at the other end reads while the
+/// hovered card's type text is hidden (see [`hover_fixes`]; all such reads were 20 to 23 high).
+const SHALLOW_RAISE_DY: i32 = -26;
 
 /// A card-name character is about 22.8 pixels wide (2560x1440).
 const CHAR_W: f32 = 22.8;
@@ -1271,6 +1274,12 @@ fn read_text(img: &Rgba, text: Text) -> Reading {
         return reading;
     };
     reading.cards = read_cards(&text, category, &anchors, &tooltip);
+    // A tooltip naming an instrument already held is that icon's tooltip, not the card's (the mouse on the icons
+    // at the top right): a name taken from it is dropped.
+    for c in reading.cards.iter_mut().filter(|c| c.how == Some(How::Tooltip) && c.id.is_some() && reading.held.iter().any(|h| h.id == c.id)) {
+        (c.index, c.id, c.en, c.zh, c.how) = (None, None, None, None, None);
+        c.why = Some("提示框是已持有的用具，不拿來補卡名".into());
+    }
     if reading.cards.is_empty() {
         // Only the card in use is still glowing (a potion taking effect, or after a protocol is confirmed).
         reading.kind = Kind::Resolving;
@@ -1767,6 +1776,46 @@ fn fan_fill(found: &[Slot]) -> Option<(Vec<Slot>, Vec<usize>)> {
     Some((five, guessed))
 }
 
+/// Fixes from the left tooltip (`tip`, the card it names; `tip_fits`, per card, the tooltip's card when it fits
+/// that card) once every card was read ([`read_cards`]).
+pub(crate) fn hover_fixes(cards: &mut [Card], tip: Option<usize>, tip_fits: &[Option<usize>]) {
+    // Exactly one card unread and the left tooltip names a card that no other card is and that fits this one
+    // (archetype suffix, kit size, rarity at the bottom): the mouse is on it, and its name is the tooltip's
+    // (2026-11-06_21-42-03 round 8: the hand dealt with the mouse already on the golden `清疽油膏`, its name read as
+    // `主月` and the advice held back 1.1 s). Its type text must have been read, so that `tip_fits` checked the
+    // rarity printed at the bottom against the tooltip's card (that 清疽油膏 read `稀有藥劑`; in the saved games 11
+    // of the 12 cards this names had their type text read, and with none read only the archetype suffix is checked).
+    let unread: Vec<usize> = (0..cards.len()).filter(|&k| cards[k].index.is_none()).collect();
+    if let ([k], Some(i)) = (&unread[..], tip)
+        && tip_fits[*k] == Some(i)
+        && !cards[*k].raw_type.trim().is_empty()
+        && !cards.iter().any(|c| c.index == Some(i))
+    {
+        cards[*k].set(i, How::Tooltip);
+        cards[*k].why = None;
+    }
+    // Three cards, one at an end with its type text unread (the picked card grows and covers it) and the card at the
+    // other end read raised but shallow: that raise is not a pick. In the saved games up to 2026-11-06_21-42-03 the
+    // far card read 20 to 23 high in all 17 such reads where the tooltip named the covered card, and the pick was
+    // recorded as the far card (21-42-03 rounds 6 and 8: `細肢藥粉-骨衛兵` hovered and taken, `細肢藥粉-蠱蟲` and
+    // `活殖藥粉` recorded); with no tooltip the same (2026-11-06_14-06-38 round 1, log lines 29 to 35: `異種激素`
+    // covered and taken, the board went from three tanks to six, `祛異藥粉` at the far end 21 high and recorded).
+    // The depth alone tells nothing (a hovered card itself reads 21 to 25 high hundreds of times), so only the far
+    // end is cleared, never the card the tooltip names (a hovered far card read 36 to 44 high, 4 reads).
+    if cards.len() == 3 {
+        let untyped: Vec<usize> = (0..3).filter(|&k| cards[k].raw_type.trim().is_empty()).collect();
+        if let [e] = untyped[..]
+            && e != 1
+        {
+            let far = 2 - e;
+            let hovered = tip.is_some_and(|i| cards[far].index == Some(i));
+            if !hovered && cards[far].raised && cards[far].dy > SHALLOW_RAISE_DY {
+                cards[far].raised = false;
+            }
+        }
+    }
+}
+
 /// Read the choice cards: first the cards found through the type text, then cards whose type text is covered
 /// are filled in at default positions.
 fn read_cards(text: &Text, category: Category, anchors: &[(i32, i32, String)], tooltip: &str) -> Vec<Card> {
@@ -1864,6 +1913,8 @@ fn read_cards(text: &Text, category: Category, anchors: &[(i32, i32, String)], t
     let effects = text.batch(&slots.iter().map(|(x, dy, _)| (card_effect(*x, *dy, half), 2.0)).collect::<Vec<_>>());
     let tip = match_name(tooltip, category, false, None, None).filter(|(_, how)| *how == How::Name).map(|(i, _)| i);
     let mut cards = Vec::new();
+    // Per card: the tooltip's card when it fits this card (see the tooltip fill after the loop).
+    let mut tip_fits: Vec<Option<usize>> = Vec::new();
     for (k, (x, dy, type_text)) in slots.iter().enumerate() {
         let effect = joined(&effects[k]);
         let (type_cat, type_rarity) = type_of(type_text);
@@ -1933,8 +1984,10 @@ fn read_cards(text: &Text, category: Category, anchors: &[(i32, i32, String)], t
         if type_cat.is_some_and(|c| c != category) {
             card.why = Some(format!("類型字「{type_text}」和標題不符"));
             cards.push(card);
+            tip_fits.push(None);
             continue;
         }
+        tip_fits.push(tip.filter(|&i| verify(i, "").is_ok()));
         // Try every way of reading: the cards matched must agree (different reads matching different cards
         // counts as unknown), an exact name is preferred; when none works, report the most informative reason.
         let results: Vec<Result<(usize, How), String>> = tries.iter().map(|t| attempt(t)).collect();
@@ -1980,6 +2033,7 @@ fn read_cards(text: &Text, category: Category, anchors: &[(i32, i32, String)], t
             c.why = Some("位置是推出來的，讀到的卡名和鄰卡相同".into());
         }
     }
+    hover_fixes(&mut cards, tip, &tip_fits);
     // Fewer than two card names were read (except the single card of a tutorial game): most likely a resolve
     // animation, not a choice screen.
     let named = cards.iter().filter(|c| c.index.is_some() || norm(&c.raw_name).chars().count() >= 2).count();
@@ -2003,6 +2057,73 @@ impl Card {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// [`hover_fixes`] on the reads of the 2026-11-06_21-42-03 game: round 6 (log line 265, `細肢藥粉-骨衛兵`
+    /// hovered with its type text unread, `細肢藥粉-蠱蟲` at the other end 23 high) and round 8 (line 296, the hovered
+    /// `清疽油膏` read as `主月`).
+    #[test]
+    fn hover_fixes_name_the_hovered_card_and_drop_a_shallow_raise() {
+        let idx = |en: &str| names().cards.iter().position(|n| n.en == en).unwrap();
+        let card = |en: Option<&str>, x: i32, dy: i32, raw_type: &str| {
+            let mut c = Card { category: Category::Potion, index: None, id: None, en: None, zh: None, how: None, raw_name: String::new(), raw_type: raw_type.into(), raw_effect: String::new(), why: Some("卡名讀不到".into()), x, dy, raised: dy <= RAISED_DY };
+            if let Some(en) = en {
+                c.set(idx(en), How::Name);
+                c.why = None;
+            }
+            c
+        };
+        let raised = |cards: &[Card]| cards.iter().map(|c| c.raised).collect::<Vec<_>>();
+        let round6 = |dy0: i32| vec![card(Some("Slender-Limb Powder - Pest"), 1204, dy0, "普 通 藥 劑"), card(Some("Anesthetic Tincture - Agito"), 1416, -3, "普 劑"), card(Some("Slender-Limb Powder - Bone Sentry"), 1629, 0, "")];
+        let hovered = Some(idx("Slender-Limb Powder - Bone Sentry"));
+        let mut cards = round6(-23);
+        hover_fixes(&mut cards, hovered, &[None, None, None]);
+        assert_eq!(raised(&cards), [false, false, false]);
+        // A card picked before the mouse moved on reads about 37 high: it stays raised.
+        let mut cards = round6(-37);
+        hover_fixes(&mut cards, hovered, &[None, None, None]);
+        assert_eq!(raised(&cards), [true, false, false]);
+        // The covered card's type text read: nothing is changed.
+        let mut cards = round6(-23);
+        cards[2].raw_type = "普 通 藥 劑".into();
+        hover_fixes(&mut cards, hovered, &[None, None, None]);
+        assert_eq!(raised(&cards), [true, false, false]);
+        // No tooltip (2026-11-06_14-06-38 line 35): cleared too; the far card itself hovered: kept.
+        let mut cards = round6(-23);
+        hover_fixes(&mut cards, None, &[None, None, None]);
+        assert_eq!(raised(&cards), [false, false, false]);
+        let mut cards = round6(-23);
+        hover_fixes(&mut cards, Some(idx("Slender-Limb Powder - Pest")), &[None, None, None]);
+        assert_eq!(raised(&cards), [true, false, false]);
+        // The middle card's type text unread: no far end to tell.
+        let mut cards = round6(-23);
+        (cards[1].raw_type, cards[2].raw_type) = (String::new(), "普 通 藥 劑".into());
+        hover_fixes(&mut cards, None, &[None, None, None]);
+        assert_eq!(raised(&cards), [true, false, false]);
+
+        // Round 8: the one unread card takes the tooltip's name when it fits it.
+        let cleansing = idx("Cleansing Ointment");
+        let round8 = || vec![card(Some("Vivigenic Powder"), 1204, 0, "魔 法 藥 劑"), card(None, 1416, 0, "稀 有 藥 劑"), card(Some("Slender-Limb Powder - Bone Sentry"), 1629, 0, "")];
+        let mut cards = round8();
+        hover_fixes(&mut cards, Some(cleansing), &[None, Some(cleansing), None]);
+        assert_eq!((cards[1].en.as_deref(), cards[1].how, cards[1].why.as_deref()), (Some("Cleansing Ointment"), Some(How::Tooltip), None));
+        // Not when it does not fit that card, when its type text was not read (no rarity to check), when the
+        // tooltip's card is another card, or with two cards unread.
+        let mut cards = round8();
+        hover_fixes(&mut cards, Some(cleansing), &[None, None, None]);
+        assert_eq!(cards[1].en, None);
+        let mut cards = round8();
+        cards[1].raw_type = String::new();
+        hover_fixes(&mut cards, Some(cleansing), &[None, Some(cleansing), None]);
+        assert_eq!(cards[1].en, None);
+        let vivigenic = idx("Vivigenic Powder");
+        let mut cards = round8();
+        hover_fixes(&mut cards, Some(vivigenic), &[None, Some(vivigenic), None]);
+        assert_eq!(cards[1].en, None);
+        let mut cards = round8();
+        cards[0] = card(None, 1204, 0, "魔 法 藥 劑");
+        hover_fixes(&mut cards, Some(cleansing), &[None, Some(cleansing), None]);
+        assert_eq!((cards[0].en.as_deref(), cards[1].en.as_deref()), (None, None));
+    }
 
     /// Inferring the fifth card when only four of the potion kit (large) were found: the four-card samples of
     /// 2026-11-03 (the positions where the type text was first read; the center of some partial type texts is

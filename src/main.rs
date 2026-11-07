@@ -24,7 +24,16 @@ fn main() -> ExitCode {
     note_panics();
     #[cfg(windows)]
     unthrottle();
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    #[allow(unused_mut)]
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    // Started again as administrator (the status bar's "Restart as administrator", or "Start as administrator" in
+    // Settings): wait for the copy that started this one to save and close first, so its hotkeys are free and its
+    // settings saved, and never start again from here (see app::elevation).
+    #[cfg(windows)]
+    if let Some((pid, by)) = ascendant::app::elevation::take_after(&mut args) {
+        ascendant::app::elevation::mark_relaunched(by);
+        ascendant::app::elevation::wait_for_exit(pid);
+    }
     let result = match args.as_slice() {
         [] => gui(None),
         [cmd, frame] if cmd == "open" => gui(Some(Path::new(frame))),

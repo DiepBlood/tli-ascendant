@@ -21,7 +21,8 @@
 //! of the board page and the Vorax panel keep a fixed position and height, so a screen change only swaps
 //! content; the warning area is fixed at two lines with a flicker guard ([`theme::notes`]).
 
-use super::capture::{Event, Watcher, capture, game_in_front, game_rect, on_screen};
+use super::capture::{Event, Watcher, capture, game_in_front, game_pid, game_rect, on_screen};
+use super::elevation;
 use super::mark::{self, Mark, Notice};
 use super::gamelog::{self, Fill};
 use super::hotkey::{Hotkey, parse};
@@ -109,22 +110,21 @@ enum Tab {
     Settings,
 }
 
-/// Which global hotkey: read now, or turn auto read or click-through on or off.
+/// Which global hotkey: read now, or turn auto read on or off. Click-through has no hotkey since 1.0.2: the
+/// navigation rail's "Through" light turns it on and off (its clicks stay in the window, see [`widget_rects`]).
 #[derive(Clone, Copy, PartialEq)]
 enum Which {
     Read,
     Auto,
-    Through,
 }
 
 impl Which {
-    const ALL: [Which; 3] = [Which::Read, Which::Auto, Which::Through];
+    const ALL: [Which; 2] = [Which::Read, Which::Auto];
 
     fn name(self) -> &'static str {
         match self {
             Which::Read => "read",
             Which::Auto => "auto read",
-            Which::Through => "click-through",
         }
     }
 
@@ -133,7 +133,6 @@ impl Which {
         match self {
             Which::Read => &mut settings.read_hotkey,
             Which::Auto => &mut settings.auto_hotkey,
-            Which::Through => &mut settings.through_hotkey,
         }
     }
 }
@@ -151,11 +150,10 @@ pub struct AscendantApp {
     session: Session,
     settings: Settings,
     ctx: egui::Context,
-    /// The read, auto read and click-through hotkeys, indexed by [`Which`].
-    keys: [Key; 3],
-    /// Clicks on the window's empty parts pass to the one under it. Saved
-    /// (`Settings::click_through`), but Ascendant opens with it on only when the
-    /// click-through key, the way to turn it off, registered.
+    /// The read and auto read hotkeys, indexed by [`Which`].
+    keys: [Key; 2],
+    /// Clicks on the window's empty parts pass to the one under it. Saved (`Settings::click_through`) and restored at
+    /// start: the rail's "Through" light, which always takes clicks, turns it off.
     click_through: bool,
     /// The thread that lets those clicks through, while `click_through` is on.
     through: Option<ClickThrough>,
@@ -322,6 +320,15 @@ pub struct AscendantApp {
     /// For testing (only when the environment variable ASCENDANT_PREVIEW_SCROLL=bottom is set): scroll the tab
     /// to the very bottom, used to capture the lower half of the settings page.
     preview_bottom: bool,
+    /// For testing (ASCENDANT_PREVIEW_SCROLL=hotkeys): keep the settings page scrolled to the "Advice and controls"
+    /// group (the hotkeys); with ASCENDANT_PREVIEW_MEASURE the measure line also gives where that group is, from the
+    /// content's top (`marks`), to compare the page with and without the administrator notice.
+    preview_hotkeys: bool,
+    /// For testing (ASCENDANT_PREVIEW_SCROLL=<points>): the page scrolled that far down, to capture a long page
+    /// (Settings) from top to bottom in parts.
+    preview_scroll_y: Option<f32>,
+    /// The settings page's positions for the measure line (see `preview_hotkeys`).
+    preview_marks: String,
     /// For testing (only when the environment variable ASCENDANT_PREVIEW_MEASURE is set): write the content
     /// height of the scroll area into this file every frame.
     preview_measure: Option<PathBuf>,
@@ -355,6 +362,23 @@ pub struct AscendantApp {
     ocr_result: Option<(OcrLang, OcrInstall)>,
     /// For previews (ASCENDANT_PREVIEW_NO_OCR): as if no OCR language were installed, the system's OCR untouched.
     preview_no_ocr: bool,
+    /// Whether the game runs with more rights than Ascendant (then the hotkeys do nothing while it is in front).
+    rights: elevation::GameRights,
+    /// "Restart as administrator" waiting for Windows' prompt (see [`elevation::relaunch`]).
+    relaunching: Option<Receiver<elevation::Relaunch>>,
+    /// The player answered No to Windows' prompt (from the notice, or "Start as administrator" at start): the
+    /// status bar's administrator notice says so.
+    relaunch_declined: bool,
+    /// The administrator notice's "x": not shown again while Ascendant stays open (not saved).
+    elevated_dismissed: bool,
+    /// For previews (ASCENDANT_PREVIEW_ELEVATED=1, or =declined: as if the game ran as administrator; =0: as if it
+    /// did not): in place of what [`elevation::GameRights`] found.
+    preview_elevated: Option<bool>,
+    /// For previews (ASCENDANT_PREVIEW_AUTO_WAITING=<text>): the status bar's "Auto read waiting" item with that
+    /// text, with auto read off (the game is not captured), to show the "+N" colour of a plain item.
+    preview_auto_waiting: Option<String>,
+    /// For previews (ASCENDANT_PREVIEW_STATUS_OPEN=1): the floating list of the administrator notice's text kept open.
+    preview_status_open: bool,
 }
 
 impl AscendantApp {
@@ -382,7 +406,6 @@ impl AscendantApp {
             keys: [
                 Key { text: settings.read_hotkey.clone(), ..Key::default() },
                 Key { text: settings.auto_hotkey.clone(), ..Key::default() },
-                Key { text: settings.through_hotkey.clone(), ..Key::default() },
             ],
             click_through: false,
             through: None,
@@ -459,6 +482,9 @@ impl AscendantApp {
             compact: None,
             rescaled: None,
             preview_bottom: false,
+            preview_hotkeys: false,
+            preview_scroll_y: None,
+            preview_marks: String::new(),
             preview_measure: None,
             preview_tooltip: false,
             preview_tooltip_progress: false,
@@ -471,6 +497,13 @@ impl AscendantApp {
             ocr_installing: None,
             ocr_result: None,
             preview_no_ocr: false,
+            rights: elevation::GameRights::current(),
+            relaunching: None,
+            relaunch_declined: false,
+            elevated_dismissed: false,
+            preview_elevated: None,
+            preview_auto_waiting: None,
+            preview_status_open: false,
         };
         app.set_text_scale(&cc.egui_ctx, app.settings.font_scale);
         // Previews (ASCENDANT_PREVIEW_UPDATE, ASCENDANT_PREVIEW_UPDATED) inject the update state instead and never ask
@@ -486,9 +519,21 @@ impl AscendantApp {
                 Err(e) => app.error = Some(e),
             }
         }
-        app.click_through = app.settings.click_through && app.keys[Which::Through as usize].hotkey.is_some();
+        app.click_through = app.settings.click_through;
         if let Some(p) = preload {
             app.read_png(p);
+        }
+        // "Start as administrator" tried at start and this copy carried on: declined at Windows' prompt (the notice says
+        // so) or failed.
+        match elevation::at_start() {
+            Some(elevation::Relaunch::Cancelled) => app.relaunch_declined = true,
+            Some(elevation::Relaunch::Failed(e)) => app.error = Some(trf!("Could not restart as administrator: {}", e)),
+            Some(elevation::Relaunch::Started) | None => {}
+        }
+        // Started again as administrator under another Windows account (one answered at Windows' prompt): that
+        // account's settings and run logs are in use, which the player would otherwise not see.
+        if elevation::other_account() {
+            app.error = Some(tr("Ascendant was started again as another Windows account, so that account's settings and run logs are in use. To use your own, close it and start Ascendant yourself").to_string());
         }
         // The test entry point goes last: without auto read, watch() forces Vorax mode off, so the Vorax
         // preview has to come after it.
@@ -962,6 +1007,8 @@ impl AscendantApp {
         lang::set(language);
         self.settings.language = language.key().to_string();
         self.ocr_problem = if self.preview_no_ocr { ocr::problem_with(None) } else { ocr::problem() };
+        // The runs the Run tab kept were settled in the language before: settled again when picked.
+        self.review.language_changed();
         self.session.solve();
         self.save();
     }
@@ -1181,6 +1228,43 @@ impl AscendantApp {
         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
     }
 
+    /// Whether the game runs with more rights than Ascendant (see [`elevation::GameRights`]), or a preview says so.
+    fn game_higher(&self) -> bool {
+        self.preview_elevated.unwrap_or_else(|| self.rights.higher())
+    }
+
+    /// "Restart as administrator": Windows asks the player on a background thread (the window keeps drawing).
+    fn start_relaunch(&mut self, ctx: &egui::Context) {
+        if self.relaunching.is_some() {
+            return;
+        }
+        self.relaunch_declined = false;
+        let (tx, rx) = mpsc::channel();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(elevation::relaunch());
+            ctx.request_repaint();
+        });
+        self.relaunching = Some(rx);
+    }
+
+    /// Takes how "Restart as administrator" went: the copy as administrator started, so this one saves and closes
+    /// (the copy waits for that); declined at Windows' prompt, so this one keeps running and says so; or an error.
+    fn poll_relaunch(&mut self, ctx: &egui::Context) {
+        let Some(rx) = &self.relaunching else { return };
+        let out = match rx.try_recv() {
+            Ok(out) => out,
+            Err(TryRecvError::Empty) => return,
+            Err(TryRecvError::Disconnected) => elevation::Relaunch::Failed(tr("the restart stopped unexpectedly").to_string()),
+        };
+        self.relaunching = None;
+        match out {
+            elevation::Relaunch::Started => self.close(ctx),
+            elevation::Relaunch::Cancelled => self.relaunch_declined = true,
+            elevation::Relaunch::Failed(e) => self.error = Some(trf!("Could not restart as administrator: {}", e)),
+        }
+    }
+
     /// Turns run log sharing on or off. Turning it on sends the runs from now
     /// on, and makes the install id the first time.
     fn set_sharing(&mut self, on: bool) {
@@ -1330,18 +1414,24 @@ impl AscendantApp {
         }
     }
 
-    /// All status bar states, in priority order: error, click-through on, game log light red, notice, progress full,
-    /// auto read waiting, run check.
+    /// All status bar states, in priority order: error, game log light red, the game run as administrator, notice,
+    /// progress full, auto read waiting, run check. Click-through is not one: the rail's "Through" light shows it.
     fn status_items(&self) -> Vec<StatusItem> {
         let mut items = Vec::new();
         if let Some(e) = &self.error {
             items.push(StatusItem::Error(e.clone()));
         }
-        if self.click_through {
-            items.push(StatusItem::Through(trf!("Click-through is on: press {} to turn it off", self.settings.through_hotkey), self.settings.through_hotkey.clone()));
-        }
         if let Some(alert) = log_alert(self.log_status().as_ref()) {
             items.push(StatusItem::Log(alert.to_string()));
+        }
+        if elevation::notify(self.game_higher(), self.rights.own_elevated(), self.elevated_dismissed, self.relaunch_declined) {
+            let (auto, read) = (&self.settings.auto_hotkey, &self.settings.read_hotkey);
+            let text = if self.relaunch_declined {
+                trf!("Cancelled: Ascendant still runs without administrator rights, so {} and {} still do nothing while the game is in front", auto, read)
+            } else {
+                trf!("The game runs as administrator: {} and {} do nothing while the game is in front", auto, read)
+            };
+            items.push(StatusItem::Notice(NoticeKind::Elevated { text, waiting: self.relaunching.is_some() }));
         }
         if let Some(n) = self.notice() {
             items.push(StatusItem::Notice(n));
@@ -1351,9 +1441,7 @@ impl AscendantApp {
             let v = (item.value)(&charges).unwrap_or_default();
             items.push(StatusItem::Charge(trf!("{} full {}/{}", tr(item.name), v, item.max)));
         }
-        if self.settings.auto_read
-            && let Some(s) = &self.auto_status
-        {
+        if let Some(s) = self.auto_status.as_ref().filter(|_| self.settings.auto_read).or(self.preview_auto_waiting.as_ref()) {
             items.push(StatusItem::Auto(trf!("Auto read waiting: {}", s)));
         }
         if let Some(h) = &self.session.health {
@@ -1383,23 +1471,15 @@ impl AscendantApp {
             ui.spacing_mut().item_spacing.x = 4.0;
             if items.len() > 1 {
                 let all: Vec<String> = items.iter().map(StatusItem::text).collect();
-                let more = ui.add(egui::Button::new(RichText::new(format!("\u{ff0b}{}", items.len() - 1)).small().color(ACCENT)).small()).on_hover_text(all.join("\n"));
-                let (popup_w, popup_h) = popup_limits(ui.ctx());
-                egui::Popup::menu(&more).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).width(popup_w.min(width)).show(|ui| {
-                    egui::ScrollArea::vertical().max_height(popup_h).show(ui, |ui| {
-                        for (k, item) in items.iter().enumerate() {
-                            if k > 0 {
-                                ui.separator();
-                            }
-                            if let Some(a) = status_detail(ui, item) {
-                                act = Some(a);
-                            }
-                        }
-                    });
-                });
+                // Coloured by the most serious of the items it folds away (see `more_colour`).
+                let colour = more_colour(&items[1..]);
+                let more = ui.add(egui::Button::new(RichText::new(format!("\u{ff0b}{}", items.len() - 1)).small().color(colour)).small()).on_hover_text(all.join("\n"));
+                if let Some(a) = status_popup(&more, &items, width, false) {
+                    act = Some(a);
+                }
             }
             if let Some(StatusItem::Notice(kind)) = items.first()
-                && let Some(a) = notice_buttons(ui, kind, true)
+                && let Some(a) = notice_buttons(ui, kind, true, width < NARROW_STATUS)
             {
                 act = Some(a);
             }
@@ -1429,6 +1509,16 @@ impl AscendantApp {
                     StatusItem::Notice(NoticeKind::Update { notes, .. } | NoticeKind::Updated { notes, .. }) if !notes.is_empty() => {
                         theme::line_tip(ui, &text, &format!("{}\n\n{}", first.text(), notes_in(notes, lang::lang().key())), first.colour(), head.is_some());
                     }
+                    // The game run as administrator: a click on the text floats out the whole list, as "+N" does,
+                    // with all of the notice's buttons ("Always" too, which a narrow line leaves out) and its whole
+                    // text. The list floats over the page, so nothing moves.
+                    StatusItem::Notice(NoticeKind::Elevated { .. }) => {
+                        let tip = format!("{}\n{}", first.text(), tr("Click for all of its buttons"));
+                        let r = theme::line_tip(ui, &text, &tip, first.colour(), head.is_some());
+                        if let Some(a) = status_popup(&r, &items, width, self.preview_status_open) {
+                            act = Some(a);
+                        }
+                    }
                     // The game log light is red: the reminder, its note and a click that opens Settings.
                     StatusItem::Log(alert) => {
                         let tip = format!("{alert}\n{}\n{}", tr(LOG_NOTE), tr("Click to open Settings"));
@@ -1453,6 +1543,13 @@ impl AscendantApp {
             Some(NoticeAct::WhatsNew(pending)) => self.whats_new = Some(WhatsNew::new(pending)),
             Some(NoticeAct::Settings) => self.set_tab(Tab::Settings),
             Some(NoticeAct::Dismiss) => self.seen_updated(),
+            Some(NoticeAct::Relaunch) => self.start_relaunch(ui.ctx()),
+            Some(NoticeAct::RelaunchAlways) => {
+                self.settings.start_as_admin = true;
+                self.save();
+                self.start_relaunch(ui.ctx());
+            }
+            Some(NoticeAct::DismissElevated) => self.elevated_dismissed = true,
             None => {}
         }
     }
@@ -1468,6 +1565,9 @@ enum NoticeKind {
     Update { version: String, notes: String, history: bool, updating: Option<update::Step>, checking: bool },
     /// An update installed this version: its version and the notes kept from its verified release.
     Updated { version: String, notes: String },
+    /// The game runs with more rights than Ascendant, so the hotkeys do nothing while it is in front (or starting again
+    /// as administrator was just declined): the text, and whether Windows' prompt is waiting for an answer.
+    Elevated { text: String, waiting: bool },
 }
 
 /// The action of a notice button, run after the status bar is drawn (the state is borrowed while drawing).
@@ -1483,13 +1583,17 @@ enum NoticeAct {
     Settings,
     /// The "x" of "Updated to X.Y.Z": not shown again.
     Dismiss,
+    /// Start again as administrator, this once.
+    Relaunch,
+    /// Turn on "Start as administrator" and start again as administrator now.
+    RelaunchAlways,
+    /// The "x" of the administrator notice: not shown again while Ascendant stays open.
+    DismissElevated,
 }
 
 /// One item of the status bar (see [`AscendantApp::status_items`]).
 enum StatusItem {
     Error(String),
-    /// Full text, and the click-through hotkey (the short form shows only the hotkey).
-    Through(String, String),
     Notice(NoticeKind),
     /// The game log light is red: the reminder (see [`log_alert`]).
     Log(String),
@@ -1500,11 +1604,10 @@ enum StatusItem {
 }
 
 impl StatusItem {
-    /// Short form for line 1 of the compact layout: click-through shows only the hotkey and auto read shows
-    /// only "waiting"; the rest is the same as [`StatusItem::text`].
+    /// Short form for line 1 of the compact layout: auto read shows only "waiting"; the rest is the same as
+    /// [`StatusItem::text`].
     fn short(&self) -> String {
         match self {
-            StatusItem::Through(_, key) => trf!("Click-through {}", key),
             StatusItem::Auto(_) => tr("Auto read waiting").to_string(),
             StatusItem::Log(_) => tr("Game log: see Settings").to_string(),
             _ => self.text(),
@@ -1513,7 +1616,7 @@ impl StatusItem {
 
     fn text(&self) -> String {
         match self {
-            StatusItem::Error(t) | StatusItem::Through(t, _) | StatusItem::Auto(t) | StatusItem::Charge(t) | StatusItem::Log(t) => t.clone(),
+            StatusItem::Error(t) | StatusItem::Auto(t) | StatusItem::Charge(t) | StatusItem::Log(t) => t.clone(),
             StatusItem::Notice(NoticeKind::Install) => {
                 // When updates are off (`update::ENABLED`) an install no longer brings updates, so the hint
                 // does not mention them.
@@ -1523,6 +1626,7 @@ impl StatusItem {
             StatusItem::Notice(NoticeKind::Update { updating: Some(step), .. }) => tr(step.text()).to_string(),
             StatusItem::Notice(NoticeKind::Update { version, .. }) => trf!("Ascendant {} is available", version),
             StatusItem::Notice(NoticeKind::Updated { version, .. }) => trf!("Updated to {}", version),
+            StatusItem::Notice(NoticeKind::Elevated { text, .. }) => text.clone(),
             StatusItem::Health { summary, .. } => summary.clone(),
         }
     }
@@ -1530,24 +1634,86 @@ impl StatusItem {
     fn colour(&self) -> Color32 {
         match self {
             StatusItem::Error(_) | StatusItem::Charge(_) | StatusItem::Log(_) => theme::ERROR,
+            StatusItem::Notice(NoticeKind::Elevated { .. }) => theme::WARN,
             StatusItem::Notice(_) => theme::TEXT,
-            StatusItem::Through(..) | StatusItem::Auto(_) => MUTED,
+            StatusItem::Auto(_) => MUTED,
             StatusItem::Health { issues, .. } if issues.is_empty() => theme::GOOD,
             StatusItem::Health { .. } => theme::WARN,
         }
     }
+
+    /// How serious the item is, for the colour of the status bar's "+N": 2 an error, 1 something for the player to
+    /// see to (the game log light red, the game run as administrator, progress full, a run check with issues), 0 the
+    /// rest.
+    fn severity(&self) -> u8 {
+        match self {
+            StatusItem::Error(_) => 2,
+            StatusItem::Log(_) | StatusItem::Charge(_) | StatusItem::Notice(NoticeKind::Elevated { .. }) => 1,
+            StatusItem::Health { issues, .. } if !issues.is_empty() => 1,
+            StatusItem::Notice(_) | StatusItem::Auto(_) | StatusItem::Health { .. } => 0,
+        }
+    }
 }
 
+/// The colour of the status bar's "+N": the most serious of the items it folds away (`folded`, all but the one on
+/// show), red for an error, yellow for something to see to, blue for the rest.
+fn more_colour(folded: &[StatusItem]) -> Color32 {
+    match folded.iter().map(StatusItem::severity).max() {
+        Some(2) => theme::ERROR,
+        Some(1) => theme::WARN,
+        _ => ACCENT,
+    }
+}
+
+/// The status bar's floating list of every item (`items`), each with its full text and buttons, opened by a click on
+/// `anchor` ("+N", or the administrator notice's text) and closed by a click outside; at most `width` wide. `open`
+/// keeps it open (previews). It floats over the page, so nothing below moves. The action of a button pressed in it.
+fn status_popup(anchor: &egui::Response, items: &[StatusItem], width: f32, open: bool) -> Option<NoticeAct> {
+    let (popup_w, popup_h) = popup_limits(&anchor.ctx);
+    let mut act = None;
+    let mut popup = egui::Popup::menu(anchor).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).width(popup_w.min(width));
+    if open {
+        popup = popup.open_memory(egui::SetOpenCommand::Bool(true));
+    }
+    popup.show(|ui| {
+        egui::ScrollArea::vertical().max_height(popup_h).show(ui, |ui| {
+            for (k, item) in items.iter().enumerate() {
+                if k > 0 {
+                    ui.separator();
+                }
+                if let Some(a) = status_detail(ui, item) {
+                    act = Some(a);
+                }
+            }
+        });
+    });
+    act
+}
+
+/// Below this width (points) the status bar's line leaves out a notice's buttons that are also elsewhere (see
+/// [`notice_spare`]), so the notice's text is not cut to nothing.
+const NARROW_STATUS: f32 = 340.0;
+
 /// Small button of a notice. With `rtl` it is drawn in a right-to-left layout (the rightmost first) and the
-/// left-to-right order of the buttons stays the same.
-fn notice_buttons(ui: &mut egui::Ui, kind: &NoticeKind, rtl: bool) -> Option<NoticeAct> {
+/// left-to-right order of the buttons stays the same; `narrow` (the status bar's line, narrow) leaves out the spare
+/// ones (they stay in the floating list and Settings).
+fn notice_buttons(ui: &mut egui::Ui, kind: &NoticeKind, rtl: bool, narrow: bool) -> Option<NoticeAct> {
     let mut buttons = notice_choices(kind);
+    if narrow {
+        buttons.retain(|(_, _, a)| !notice_spare(a));
+    }
     if rtl {
         buttons.reverse();
     }
     let mut act = None;
     for (text, enabled, a) in buttons {
-        if ui.add_enabled(enabled, egui::Button::new(RichText::new(text).small()).small()).clicked() {
+        // On the status bar's one line a long label gives way to a short one; the hover has the whole of it.
+        let shown = if rtl { notice_short(&a).map_or(text.clone(), str::to_string) } else { text.clone() };
+        let mut r = ui.add_enabled(enabled, egui::Button::new(RichText::new(shown).small()).small());
+        if let Some(hover) = notice_hover(&a) {
+            r = r.on_hover_text(format!("{text}\n{hover}"));
+        }
+        if r.clicked() {
             act = Some(a);
         }
     }
@@ -1571,6 +1737,37 @@ fn notice_choices(kind: &NoticeKind) -> Vec<(String, bool, NoticeAct)> {
         }
         // The version just installed: its notes are the newest of the history.
         NoticeKind::Updated { notes, .. } => vec![(tr("What's new").into(), !notes.is_empty(), NoticeAct::WhatsNew(None)), ("\u{d7}".into(), true, NoticeAct::Dismiss)],
+        // Off while Windows' prompt waits for an answer, so one click starts one copy.
+        NoticeKind::Elevated { waiting, .. } => vec![
+            (tr("Restart as administrator").into(), !waiting, NoticeAct::Relaunch),
+            (tr("Always").into(), !waiting, NoticeAct::RelaunchAlways),
+            ("\u{d7}".into(), true, NoticeAct::DismissElevated),
+        ],
+    }
+}
+
+/// Whether a notice button can be left out of a narrow status bar line: "Always" of the administrator notice. It stays
+/// in the floating list that a click on the notice's text opens (or "+N", see [`status_popup`]), and it is the switch
+/// "Start as administrator" in Settings too.
+fn notice_spare(act: &NoticeAct) -> bool {
+    matches!(act, NoticeAct::RelaunchAlways)
+}
+
+/// A notice button's short label for the status bar's one line, when its label is long.
+fn notice_short(act: &NoticeAct) -> Option<&'static str> {
+    match act {
+        NoticeAct::Relaunch => Some(tr("Restart")),
+        _ => None,
+    }
+}
+
+/// What a notice button does, for its hover, when its label does not say it all.
+fn notice_hover(act: &NoticeAct) -> Option<&'static str> {
+    match act {
+        NoticeAct::Relaunch => Some(tr("Windows asks for administrator permission, then Ascendant starts again as administrator and this window closes; the settings are kept")),
+        NoticeAct::RelaunchAlways => Some(tr("Turns on Start as administrator in Settings and restarts as administrator now; Windows asks at every start")),
+        NoticeAct::DismissElevated => Some(tr("Not shown again while Ascendant stays open")),
+        _ => None,
     }
 }
 
@@ -1607,7 +1804,7 @@ impl WhatsNew {
 /// cover, so they are as trusted as the program and a fresh install sees the whole history. A new version adds its
 /// file here.
 const RELEASE_NOTES: &[(&str, &str)] =
-    &[("1.0.1", include_str!("../../data/release-notes/1.0.1.txt")), ("1.0.0", include_str!("../../data/release-notes/1.0.0.txt"))];
+    &[("1.0.2", include_str!("../../data/release-notes/1.0.2.txt")), ("1.0.1", include_str!("../../data/release-notes/1.0.1.txt")), ("1.0.0", include_str!("../../data/release-notes/1.0.0.txt"))];
 
 /// Which of the versions "What's new" lists (in its order, each with whether it is a release not installed yet) starts
 /// unfolded: the release not installed yet when there is one, else the `running` version, else the newest.
@@ -1728,7 +1925,7 @@ fn status_detail(ui: &mut egui::Ui, item: &StatusItem) -> Option<NoticeAct> {
             {
                 notes_label(ui, notes);
             }
-            ui.horizontal(|ui| notice_buttons(ui, kind, false)).inner
+            ui.horizontal(|ui| notice_buttons(ui, kind, false, false)).inner
         }
         StatusItem::Health { issues, .. } => {
             for issue in issues {
@@ -1974,14 +2171,14 @@ impl eframe::App for AscendantApp {
         self.remember_position(ctx);
         self.poll_update(ctx);
         self.poll_ocr_install();
+        self.poll_relaunch(ctx);
+        // The game's rights: looked up every few seconds, each game process judged once (see GameRights).
+        self.rights.poll(Instant::now(), game_pid, elevation::probe);
         if self.keys[Which::Read as usize].pressed.swap(false, Ordering::SeqCst) {
             self.read_now();
         }
         if self.keys[Which::Auto as usize].pressed.swap(false, Ordering::SeqCst) {
             self.set_auto_read(!self.settings.auto_read);
-        }
-        if self.keys[Which::Through as usize].pressed.swap(false, Ordering::SeqCst) {
-            self.set_click_through(!self.click_through && self.keys[Which::Through as usize].hotkey.is_some());
         }
         if let Some(hwnd) = own_window(frame) {
             self.see_through = see_through(hwnd, self.settings.opacity, self.click_through, self.see_through);
@@ -2166,7 +2363,11 @@ impl eframe::App for AscendantApp {
             // the board page grew and shrank the window automatically to fit the whole board, so the window
             // jumped whenever the screen changed (patrol, manage, Vorax) (the user chose no auto resizing on
             // 2026-11-05).
-            let scrolled = egui::ScrollArea::vertical().show(ui, |ui| {
+            let mut area = egui::ScrollArea::vertical();
+            if let Some(y) = self.preview_scroll_y {
+                area = area.vertical_scroll_offset(y);
+            }
+            let scrolled = area.show(ui, |ui| {
                 match self.tab {
                     Tab::Board if self.vorax.showing() => self.vorax.panel(ui, compact),
                     Tab::Board => self.board_tab(ui, compact, page_h),
@@ -2183,7 +2384,7 @@ impl eframe::App for AscendantApp {
             // prove the content fits and there is no scrollbar.
             if let Some(path) = &self.preview_measure {
                 let prepare = self.review.report.prepare_top.map_or_else(|| "none".to_string(), |y| format!("{y:.1}"));
-                let text = format!("compact={compact} content_h={:.1} view_h={:.1} page_h={page_h:.1} prepare_y={prepare}\n", scrolled.content_size.y, scrolled.inner_rect.height());
+                let text = format!("compact={compact} content_h={:.1} view_h={:.1} page_h={page_h:.1} prepare_y={prepare}{}\n", scrolled.content_size.y, scrolled.inner_rect.height(), self.preview_marks);
                 let _ = std::fs::write(path, text);
             }
         });
@@ -2206,10 +2407,10 @@ impl eframe::App for AscendantApp {
 impl AscendantApp {
     /// Left navigation rail: the App icon at the very top, then the three tab buttons Board, Run and Settings
     /// (the selected one in the primary colour, the Board button with a small yellow dot for the warning
-    /// count); at the very bottom the Read and Auto buttons and the game log light (see [`log_lamp`]), with a spinner
-    /// above them while reading.
+    /// count); at the very bottom, from the top, the click-through light, the game log light (see [`log_lamp`]), the
+    /// Auto and the Read buttons, with a spinner above them while reading.
     fn rail(&mut self, ui: &mut egui::Ui) {
-        let (mut read, mut auto) = (false, false);
+        let (mut read, mut auto, mut through) = (false, false, false);
         let size = Vec2::new(RAIL - 8.0, 24.0);
         ui.vertical_centered(|ui| {
             ui.spacing_mut().item_spacing.y = 6.0;
@@ -2266,6 +2467,14 @@ impl AscendantApp {
             if log_button(ui, Vec2::new(size.x, 30.0), log_lamp(status.as_ref())).on_hover_text(log_hover(status.as_ref())).clicked() {
                 self.set_tab(Tab::Settings);
             }
+            // The click-through light, right above the game log light: green while on, a click turns it on or off.
+            // Its clicks stay in the window while click-through is on, as every widget's do (see `widget_rects`).
+            let hover = if self.click_through {
+                tr("Click-through is on: clicks on this window's empty parts go to the game behind it. Click here to turn it off")
+            } else {
+                tr("Click-through is off. Click here to turn it on: clicks on this window's empty parts then go to the game behind it, while its buttons and cells still take them")
+            };
+            through = through_button(ui, Vec2::new(size.x, 30.0), self.click_through).on_hover_text(hover).clicked();
             // The spinner's slot is always reserved, so the buttons do not jump when reading starts or ends.
             let (rect, _) = ui.allocate_exact_size(Vec2::splat(14.0), Sense::hover());
             if self.session.scanning() || self.vorax.busy() {
@@ -2277,6 +2486,9 @@ impl AscendantApp {
         }
         if auto {
             self.set_auto_read(!self.settings.auto_read);
+        }
+        if through {
+            self.set_click_through(!self.click_through);
         }
     }
 
@@ -2727,7 +2939,7 @@ impl AscendantApp {
         self.review.block_drawn(width, block.response.rect.height());
         if let Some(dir) = block.inner {
             // Settled again the way it was: the picked run as a pick, else the game's own automatic settlement.
-            if !self.review.again() {
+            if !self.review.again(&dir) {
                 match self.review.kind() {
                     RunKind::Tartarus => self.start_settle(dir, None),
                     RunKind::Vorax => self.start_vorax_settle(dir, None, None),
@@ -2968,12 +3180,15 @@ impl AscendantApp {
         }
     }
 
-    /// Settings page: groups "Read", "Window", "Hotkeys", "Other", and "About" at the very bottom. Checkboxes
-    /// become switches, hotkeys are shown as a key-cap label plus a "Change" button; each setting's original
-    /// saving and recomputation are unchanged.
+    /// Settings page, by what each setting is about: "Game" (what Ascendant reads: language, game window, game log, OCR),
+    /// "Advice and controls" (the mark on the game, the hotkeys, starting as administrator), "Window", "Logs and
+    /// reports", "Updates", "Advanced" (playouts, install, restore defaults) and "About" at the very bottom. Checkboxes
+    /// become switches, hotkeys are shown as a key-cap label plus a "Change" button; each setting's own saving,
+    /// recomputation and hover text are unchanged by where it sits. A run is exported from the Run tab only.
     fn settings_section(&mut self, ui: &mut egui::Ui) {
         let mut open = false;
-        theme::heading(ui, tr("Reading"));
+        let top = ui.cursor().top();
+        theme::heading(ui, tr("Game"));
         theme::group_frame().show(ui, |ui| {
             ui.set_width(ui.available_width());
             row(ui, "Language / 語言", |ui| {
@@ -3011,63 +3226,72 @@ impl AscendantApp {
                 }
             });
             self.game_log_row(ui);
-            row(ui, tr("Playouts"), |ui| {
-                let r = ui.add(egui::DragValue::new(&mut self.settings.rollouts).range(50..=5000).speed(10)).on_hover_text(tr("Per option, for each solve"));
-                if r.drag_stopped() || (r.changed() && !r.dragged()) {
-                    self.session.rollouts = self.settings.rollouts;
-                    self.session.solve();
-                    self.save();
-                }
-            });
-            let mut log = self.settings.run_log;
-            let runs = settings::app_dir().map_or_else(String::new, |d| d.join("runs").display().to_string());
-            let hover = trf!("Keep each run's reads, advice and corrections, with the frames read, in {}", runs);
-            if ui.add(Switch::new(&mut log, tr("Keep a run log"))).on_hover_text(hover).changed() {
-                self.settings.run_log = log;
-                self.session.log = log.then(RunLog::in_appdata).flatten();
-                if let Some(w) = &self.watcher {
-                    w.observe(self.settings.observe && log);
-                }
-                self.save();
-            }
-            let mut observe = self.settings.observe;
-            let hover = tr("Also keeps about 25 game frames a second in each run's folder while the prison shows (about 250 MB a run), to review how a run looked as it was played");
-            if ui.add_enabled(self.settings.run_log, Switch::new(&mut observe, tr("Observe mode"))).on_hover_text(hover).changed() {
-                self.settings.observe = observe;
-                if let Some(w) = &self.watcher {
-                    w.observe(observe && self.settings.run_log);
-                }
-                self.save();
-            }
-            let mut keep_all = self.settings.keep_all_logs;
-            let hover = tr("Off: Tartarus and Vorax each keep only their newest 10 finished games (with screenshots); older logs are deleted automatically. On: every log and screenshot is kept and never deleted automatically, so watch your free disk space");
-            if ui.add(Switch::new(&mut keep_all, tr("Keep all run logs"))).on_hover_text(hover).changed() {
-                self.settings.keep_all_logs = keep_all;
-                super::runlog::set_keep_all(keep_all);
-                self.save();
-            }
-            open = ui.button(tr("Open screenshot...")).clicked();
             // OCR languages: both can be installed, Traditional Chinese (the main one) first.
             self.ocr_install_ui(ui, &[OcrLang::ZhTw, OcrLang::EnUs]);
         });
-        theme::heading(ui, tr("Window"));
-        theme::group_frame().show(ui, |ui| {
+        theme::heading(ui, tr("Advice and controls"));
+        let controls = theme::group_frame().show(ui, |ui| {
             ui.set_width(ui.available_width());
-            let mut place = self.settings.auto_place;
-            let hover = tr("Move this window under the game's instrument panel when the game is first found, until you move it yourself; Ascendant then opens where you left it. Turning this on forgets that place");
-            if ui.add(Switch::new(&mut place, tr("Place by the game panels"))).on_hover_text(hover).changed() {
-                self.settings.auto_place = place;
-                if place {
-                    self.settings.window_pos = None;
-                }
-                self.save();
-            }
             let mut highlight = self.settings.highlight;
             let hover = tr("Marks on the game the cell, card or button to click for the advised move. Clicks go through it to the game");
             if ui.add(Switch::new(&mut highlight, tr("Highlight where to click"))).on_hover_text(hover).changed() {
                 self.settings.highlight = highlight;
                 self.save();
             }
+            for (which, label) in [(Which::Read, tr("Read key")), (Which::Auto, tr("Auto read key"))] {
+                // The right side is left for the "Change" button and a key-cap label at least KEYCAP_MIN wide,
+                // so on a narrow window the start of the key name (such as `Ctrl+…`) is still visible.
+                let change = egui::WidgetText::from(RichText::new(tr("Change")).small()).into_galley(ui, None, f32::INFINITY, egui::TextStyle::Small).size().x;
+                let keep = change + ui.spacing().button_padding.x * 2.0 + ui.spacing().item_spacing.x + KEYCAP_MIN;
+                row_with(ui, label, keep, |ui| {
+                    let hint = tr("Such as F8, Ctrl+Shift+R or Alt+5");
+                    if self.editing_key == Some(which) {
+                        let text = &mut self.keys[which as usize].text;
+                        let r = ui.add(egui::TextEdit::singleline(text).desired_width(ui.available_width().min(100.0))).on_hover_text(hint);
+                        if std::mem::take(&mut self.key_focus) {
+                            r.request_focus();
+                        }
+                        // Apply on losing focus (Enter, Esc or a click elsewhere), the same as the original
+                        // input box.
+                        if r.lost_focus() {
+                            self.editing_key = None;
+                            self.apply_hotkey(which);
+                        }
+                    } else {
+                        if ui.small_button(tr("Change")).on_hover_text(hint).clicked() {
+                            // When "Change" of this row is pressed while another row is being edited: that
+                            // row's input box is not drawn this frame, so it never receives the focus loss;
+                            // apply it for that row first.
+                            if let Some(other) = self.editing_key.filter(|&o| o != which) {
+                                self.apply_hotkey(other);
+                            }
+                            self.editing_key = Some(which);
+                            self.key_focus = true;
+                        }
+                        // On a narrow window the key name is truncated: the hover tooltip shows the full key.
+                        let key = &self.keys[which as usize].text;
+                        theme::keycap(ui, key).on_hover_text(format!("{key}\n{hint}"));
+                    }
+                });
+            }
+            // Always shown, so nothing moves; the status bar's notice tells when it is needed.
+            let mut admin = self.settings.start_as_admin;
+            let hover = trf!("Windows asks for confirmation at every start. Only needed when the game runs as administrator and you need {} and {}", self.settings.auto_hotkey, self.settings.read_hotkey);
+            if ui.add(Switch::new(&mut admin, tr("Start as administrator"))).on_hover_text(hover).changed() {
+                self.settings.start_as_admin = admin;
+                self.save();
+            }
+        });
+        if self.preview_hotkeys {
+            controls.response.scroll_to_me(Some(Align::TOP));
+        }
+        if self.preview_measure.is_some() {
+            let (r, at) = (controls.response.rect, ui.cursor().top());
+            self.preview_marks = format!(" marks: controls_group_y={:.1}..{:.1} after_controls_y={:.1}", r.top() - top, r.bottom() - top, at - top);
+        }
+        theme::heading(ui, tr("Window"));
+        theme::group_frame().show(ui, |ui| {
+            ui.set_width(ui.available_width());
             row(ui, tr("Layout"), |ui| {
                 let current = layout_pref(&self.settings.layout);
                 let mut picked = current;
@@ -3115,93 +3339,90 @@ impl AscendantApp {
                     self.save();
                 }
             });
-            let key = self.keys[Which::Through as usize].hotkey.is_some();
-            let hover = trf!("Clicks on this window's empty parts go through to the game; its buttons and cells still take them. {} turns it on or off, and Ascendant opens as you left it", self.settings.through_hotkey);
-            let mut through = self.click_through;
-            let r = ui.add_enabled(key, Switch::new(&mut through, tr("Click-through"))).on_hover_text(hover).on_disabled_hover_text(tr("Set a working click-through key first"));
-            if r.changed() {
-                self.set_click_through(through);
+            let mut place = self.settings.auto_place;
+            let hover = tr("Move this window under the game's instrument panel when the game is first found, until you move it yourself; Ascendant then opens where you left it. Turning this on forgets that place");
+            if ui.add(Switch::new(&mut place, tr("Place by the game panels"))).on_hover_text(hover).changed() {
+                self.settings.auto_place = place;
+                if place {
+                    self.settings.window_pos = None;
+                }
+                self.save();
             }
         });
-        theme::heading(ui, tr("Hotkeys"));
+        theme::heading(ui, tr("Logs and reports"));
         theme::group_frame().show(ui, |ui| {
             ui.set_width(ui.available_width());
-            for (which, label) in [(Which::Read, tr("Read key")), (Which::Auto, tr("Auto read key")), (Which::Through, tr("Click-through key"))] {
-                // The right side is left for the "Change" button and a key-cap label at least KEYCAP_MIN wide,
-                // so on a narrow window the start of the key name (such as `Ctrl+…`) is still visible.
-                let change = egui::WidgetText::from(RichText::new(tr("Change")).small()).into_galley(ui, None, f32::INFINITY, egui::TextStyle::Small).size().x;
-                let keep = change + ui.spacing().button_padding.x * 2.0 + ui.spacing().item_spacing.x + KEYCAP_MIN;
-                row_with(ui, label, keep, |ui| {
-                    let hint = tr("Such as F8, Ctrl+Shift+R or Alt+5");
-                    if self.editing_key == Some(which) {
-                        let text = &mut self.keys[which as usize].text;
-                        let r = ui.add(egui::TextEdit::singleline(text).desired_width(ui.available_width().min(100.0))).on_hover_text(hint);
-                        if std::mem::take(&mut self.key_focus) {
-                            r.request_focus();
-                        }
-                        // Apply on losing focus (Enter, Esc or a click elsewhere), the same as the original
-                        // input box.
-                        if r.lost_focus() {
-                            self.editing_key = None;
-                            self.apply_hotkey(which);
-                        }
-                    } else {
-                        if ui.small_button(tr("Change")).on_hover_text(hint).clicked() {
-                            // When "Change" of this row is pressed while another row is being edited: that
-                            // row's input box is not drawn this frame, so it never receives the focus loss;
-                            // apply it for that row first.
-                            if let Some(other) = self.editing_key.filter(|&o| o != which) {
-                                self.apply_hotkey(other);
-                            }
-                            self.editing_key = Some(which);
-                            self.key_focus = true;
-                        }
-                        // On a narrow window the key name is truncated: the hover tooltip shows the full key.
-                        let key = &self.keys[which as usize].text;
-                        theme::keycap(ui, key).on_hover_text(format!("{key}\n{hint}"));
-                    }
-                });
+            let mut log = self.settings.run_log;
+            let runs = settings::app_dir().map_or_else(String::new, |d| d.join("runs").display().to_string());
+            let hover = trf!("Keep each run's reads, advice and corrections, with the frames read, in {}", runs);
+            if ui.add(Switch::new(&mut log, tr("Keep a run log"))).on_hover_text(hover).changed() {
+                self.settings.run_log = log;
+                self.session.log = log.then(RunLog::in_appdata).flatten();
+                if let Some(w) = &self.watcher {
+                    w.observe(self.settings.observe && log);
+                }
+                self.save();
+            }
+            let mut keep_all = self.settings.keep_all_logs;
+            let hover = tr("Off: Tartarus and Vorax each keep only their newest 10 finished games (with screenshots); older logs are deleted automatically. On: every log and screenshot is kept and never deleted automatically (except empty folders from opening and closing Ascendant without any read), so watch your free disk space");
+            if ui.add(Switch::new(&mut keep_all, tr("Keep all run logs"))).on_hover_text(hover).changed() {
+                self.settings.keep_all_logs = keep_all;
+                super::runlog::set_keep_all(keep_all);
+                self.save();
+            }
+            let mut observe = self.settings.observe;
+            let hover = tr("Also keeps about 25 game frames a second in each run's folder while the prison shows (about 250 MB a run), to review how a run looked as it was played");
+            if ui.add_enabled(self.settings.run_log, Switch::new(&mut observe, tr("Observe mode"))).on_hover_text(hover).changed() {
+                self.settings.observe = observe;
+                if let Some(w) = &self.watcher {
+                    w.observe(observe && self.settings.run_log);
+                }
+                self.save();
+            }
+            open = ui.button(tr("Open screenshot...")).clicked();
+            if !self.path.is_empty() {
+                ui.add(egui::Label::new(RichText::new(&self.path).small().color(MUTED)).wrap());
+            }
+            // When upload is off (`share::ENABLED`) its option is not shown, so that whoever gets this exe does not
+            // think ticking it does something.
+            if share::ENABLED {
+                let mut share = self.settings.share_logs == Some(true);
+                let hover = tr("Sends each finished run's log to warden.arcasti.dev to improve Ascendant: no screenshots, no window titles");
+                let r = ui.add_enabled(self.settings.run_log, Switch::new(&mut share, tr("Share run logs"))).on_hover_text(hover).on_disabled_hover_text(hover);
+                if r.changed() {
+                    self.set_sharing(share);
+                }
+                if let Some(e) = &self.upload_error {
+                    ui.small(RichText::new(trf!("Run log upload failed: {}", e)).color(MUTED));
+                }
             }
         });
         let install = !self.installed && self.current.is_some();
         if update::ENABLED {
             self.update_section(ui);
         }
-        // The "Other" group always has "Restore defaults", so it is always shown.
-        {
-            theme::heading(ui, tr("Other"));
-            theme::group_frame().show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                // When upload and update check are off (`share::ENABLED`, `update::ENABLED`) their options are
-                // not shown, so that whoever gets this exe does not think ticking them does something.
-                if share::ENABLED {
-                    let mut share = self.settings.share_logs == Some(true);
-                    let hover = tr("Sends each finished run's log to warden.arcasti.dev to improve Ascendant: no screenshots, no window titles");
-                    let r = ui.add_enabled(self.settings.run_log, Switch::new(&mut share, tr("Share run logs"))).on_hover_text(hover).on_disabled_hover_text(hover);
-                    if r.changed() {
-                        self.set_sharing(share);
-                    }
-                    if let Some(e) = &self.upload_error {
-                        ui.small(RichText::new(trf!("Run log upload failed: {}", e)).color(MUTED));
-                    }
-                }
-                if install {
-                    let hover = if update::ENABLED { "Start menu and desktop shortcuts and updates, for this Windows user" } else { "Start menu and desktop shortcuts, for this Windows user" };
-                    if ui.button(tr("Install")).on_hover_text(tr(hover)).clicked() {
-                        self.install(ui.ctx());
-                    }
-                }
-                if !self.path.is_empty() {
-                    ui.add(egui::Label::new(RichText::new(&self.path).small().color(MUTED)).wrap());
-                }
-                if ui.button(tr("Export a run...")).on_hover_text(tr("Opens the Run tab: pick a run at the top, then pack its log and screenshots into a zip for a bug report")).clicked() {
-                    self.set_tab(Tab::Run);
-                }
-                if ui.button(tr("Restore defaults")).on_hover_text(tr("Asks first. The language and the install are kept; saved run logs are not deleted")).clicked() {
-                    self.restoring = true;
+        // The "Advanced" group always has "Restore defaults", so it is always shown.
+        theme::heading(ui, tr("Advanced"));
+        theme::group_frame().show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            row(ui, tr("Playouts"), |ui| {
+                let r = ui.add(egui::DragValue::new(&mut self.settings.rollouts).range(50..=5000).speed(10)).on_hover_text(tr("Per option, for each solve"));
+                if r.drag_stopped() || (r.changed() && !r.dragged()) {
+                    self.session.rollouts = self.settings.rollouts;
+                    self.session.solve();
+                    self.save();
                 }
             });
-        }
+            if install {
+                let hover = if update::ENABLED { "Start menu and desktop shortcuts and updates, for this Windows user" } else { "Start menu and desktop shortcuts, for this Windows user" };
+                if ui.button(tr("Install")).on_hover_text(tr(hover)).clicked() {
+                    self.install(ui.ctx());
+                }
+            }
+            if ui.button(tr("Restore defaults")).on_hover_text(tr("Asks first. The language and the install are kept; saved run logs are not deleted")).clicked() {
+                self.restoring = true;
+            }
+        });
         theme::heading(ui, tr("About"));
         theme::group_frame().show(ui, |ui| {
             ui.set_width(ui.available_width());
@@ -3526,6 +3747,8 @@ impl AscendantApp {
             _ => {}
         }
         self.preview_bottom = std::env::var("ASCENDANT_PREVIEW_SCROLL").is_ok_and(|v| v == "bottom");
+        self.preview_hotkeys = std::env::var("ASCENDANT_PREVIEW_SCROLL").is_ok_and(|v| v == "hotkeys");
+        self.preview_scroll_y = std::env::var("ASCENDANT_PREVIEW_SCROLL").ok().and_then(|v| v.parse::<f32>().ok());
         self.preview_measure = std::env::var_os("ASCENDANT_PREVIEW_MEASURE").map(PathBuf::from);
         self.preview_tooltip = std::env::var("ASCENDANT_PREVIEW_TOOLTIP").is_ok_and(|v| v == "1");
         self.preview_tooltip_progress = std::env::var("ASCENDANT_PREVIEW_TOOLTIP").is_ok_and(|v| v == "progress");
@@ -3581,6 +3804,14 @@ impl AscendantApp {
         // For testing (ASCENDANT_PREVIEW_TOOLTIP=card): always show the advice card tooltip, see board_tab.
         self.preview_tooltip_card = std::env::var("ASCENDANT_PREVIEW_TOOLTIP").is_ok_and(|v| v == "card");
         self.preview_charges = std::env::var("ASCENDANT_PREVIEW_CHARGES").ok().map(|v| preview_charges(&v));
+        // ASCENDANT_PREVIEW_ELEVATED=1: as if the game ran as administrator (the status bar's notice); =declined: as after
+        // the player declined Windows' prompt of "Restart as administrator"; =0: as if the game did not, whatever runs.
+        if let Ok(v) = std::env::var("ASCENDANT_PREVIEW_ELEVATED") {
+            self.preview_elevated = Some(v != "0");
+            self.relaunch_declined = v == "declined";
+        }
+        self.preview_auto_waiting = std::env::var("ASCENDANT_PREVIEW_AUTO_WAITING").ok();
+        self.preview_status_open = std::env::var("ASCENDANT_PREVIEW_STATUS_OPEN").is_ok_and(|v| v == "1");
         self.restoring = std::env::var("ASCENDANT_PREVIEW_RESTORE").is_ok_and(|v| v == "1");
         self.tools_open = std::env::var("ASCENDANT_PREVIEW_TOOLS").is_ok_and(|v| v == "1");
         // ASCENDANT_PREVIEW_NO_OCR=1: as if this computer had no OCR language (the system's OCR is not removed),
@@ -3743,7 +3974,7 @@ impl AscendantApp {
         }
     }
 
-    /// Restore defaults (which fields are kept: see [`restored`]), effective immediately: the three hotkeys
+    /// Restore defaults (which fields are kept: see [`restored`]), effective immediately: the two hotkeys
     /// are registered again, click-through is turned off, and the auto read and capture window title,
     /// run log, rollout count and font size are applied and then saved; opacity is applied by `logic` every
     /// frame. The window size and position return to the defaults only on the next launch (296×520, placed by
@@ -3751,7 +3982,7 @@ impl AscendantApp {
     fn restore_defaults(&mut self, ctx: &egui::Context) {
         let old = std::mem::take(&mut self.settings);
         self.settings = restored(&old);
-        // Release the three old hotkeys before registering the new ones: old and new may swap (for example the
+        // Release the two old hotkeys before registering the new ones: old and new may swap (for example the
         // old read key is the new auto read key).
         self.editing_key = None;
         for which in Which::ALL {
@@ -3786,10 +4017,11 @@ impl AscendantApp {
 ///   restoring them would make this run's advice wrong); `run_log` (whether to save run logs is a privacy and
 ///   disk choice, and restoring does not silently turn it on); `keep_all_logs` (restoring must never start
 ///   deleting the player's run logs).
-/// - Back to default: `read_hotkey`, `auto_hotkey`, `through_hotkey`, `click_through` (off), `opacity`,
+/// - Back to default: `read_hotkey`, `auto_hotkey`, `click_through` (off), `opacity`,
 ///   `window_title`, `rollouts`, `auto_read`, `auto_place`, `window_pos` and `window_size` (back to 296×520 on
 ///   the next launch and placed by the game panel again), `observe`, `highlight`, `font_scale` (standard),
-///   `vorax_enabled`, `vorax_rollouts`, `vorax_learn`, `vorax_strips`, `game_log` (automatic again).
+///   `vorax_enabled`, `vorax_rollouts`, `vorax_learn`, `vorax_strips`, `game_log` (automatic again), `start_as_admin`
+///   ("Start as administrator", off).
 ///
 /// A field added later that is not listed as kept returns to the default. The run log files themselves are not
 /// deleted.
@@ -4603,6 +4835,21 @@ fn read_button(ui: &mut egui::Ui, size: Vec2) -> egui::Response {
     response
 }
 
+/// The click-through light in the navigation rail, laid out as the Auto button below it: a dot and "Through", the
+/// dot green while click-through is on and unlit while off.
+fn through_button(ui: &mut egui::Ui, size: Vec2, on: bool) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(size, Sense::click());
+    let visuals = ui.style().interact(&response);
+    let p = ui.painter();
+    let fill = if on { ACCENT.gamma_multiply(0.35) } else { visuals.weak_bg_fill };
+    p.rect_filled(rect, 5.0, fill);
+    p.rect_stroke(rect, 5.0, if on { Stroke::new(1.0, ACCENT) } else { visuals.bg_stroke }, StrokeKind::Inside);
+    p.circle_filled(rect.center_top() + Vec2::new(0.0, 8.5), 3.5, if on { theme::GOOD } else { Color32::from_gray(85) });
+    let text = if on { Color32::WHITE } else { visuals.fg_stroke.color };
+    p.text(rect.center_bottom() - Vec2::new(0.0, 4.0), Align2::CENTER_BOTTOM, tr("Through"), FontId::proportional(MIN_TEXT), text);
+    response
+}
+
 /// The Auto button: a dot and "Auto", green while auto read is on.
 /// Changed to a vertical layout in the navigation rail: a dot on top and the small text "Auto" below; when on,
 /// the background takes the primary colour and the dot is green.
@@ -4994,13 +5241,28 @@ mod tests {
         assert!(within_error(-0.5, f64::INFINITY));
     }
 
+    /// The status bar's "+N" takes the colour of the most serious item it folds away: red for an error, yellow for
+    /// the game log light red, progress full or a run check with issues, blue for the rest.
+    #[test]
+    fn the_more_button_takes_the_worst_folded_colour() {
+        let notice = || StatusItem::Notice(NoticeKind::Install);
+        let health = |issues: Vec<String>| StatusItem::Health { summary: String::new(), issues };
+        assert_eq!(more_colour(&[notice(), StatusItem::Auto(String::new()), health(vec![])]), ACCENT);
+        assert_eq!(more_colour(&[notice(), StatusItem::Charge(String::new())]), theme::WARN);
+        assert_eq!(more_colour(&[StatusItem::Log(String::new())]), theme::WARN);
+        assert_eq!(more_colour(&[notice(), health(vec!["x".to_string()])]), theme::WARN);
+        let elevated = StatusItem::Notice(NoticeKind::Elevated { text: String::new(), waiting: false });
+        assert_eq!(more_colour(&[elevated, notice()]), theme::WARN, "the administrator notice folded away: yellow");
+        assert_eq!(more_colour(&[StatusItem::Charge(String::new()), StatusItem::Error(String::new())]), theme::ERROR);
+    }
+
     /// "Restore defaults": the kept fields equal the original ones and every other field equals its default.
     /// Compared field by field through JSON, so fields added to Settings later are checked too.
     #[test]
     fn restoring_defaults_keeps_language_install_and_privacy() {
         const KEPT: [&str; 13] = ["language", "offer_install", "desktop_shortcut", "check_updates", "updated_seen", "share_logs", "shared_from", "install_id", "tools", "tools_days", "theme", "run_log", "keep_all_logs"];
         let custom: Settings = serde_json::from_str(
-            r#"{"read_hotkey":"F1","auto_hotkey":"F2","through_hotkey":"F3","click_through":true,"opacity":0.7,
+            r#"{"read_hotkey":"F1","auto_hotkey":"F2","click_through":true,"start_as_admin":true,"opacity":0.7,
             "window_title":"Game","rollouts":800,"tools":["lion_trap"],"tools_days":12,"theme":3,"auto_read":false,
             "auto_place":false,"window_pos":[10,20],"window_size":[300.0,600.0],"run_log":false,"keep_all_logs":true,"observe":true,
             "check_updates":false,"updated_seen":"1.0.1","offer_install":false,"share_logs":true,"shared_from":"2026-11-01_00-00-00",

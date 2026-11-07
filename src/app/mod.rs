@@ -21,6 +21,8 @@ pub mod report;
 #[cfg(windows)]
 pub mod run_review;
 #[cfg(windows)]
+pub mod elevation;
+#[cfg(windows)]
 pub mod gamelog;
 #[cfg(windows)]
 pub mod hotkey;
@@ -54,6 +56,14 @@ pub fn run(preload: Option<&std::path::Path>) -> Result<(), String> {
         }
     }
     let mut settings = settings::Settings::load();
+    // "Start as administrator": start again as administrator and end here once that copy started; declined at
+    // Windows' prompt (or failed), carry on without and let the window say so. A copy started again never does this.
+    if elevation::should_relaunch(settings.start_as_admin, elevation::own_elevated(), elevation::relaunched()) {
+        match elevation::relaunch() {
+            elevation::Relaunch::Started => return Ok(()),
+            other => elevation::set_at_start(other),
+        }
+    }
     // Before any run log is made (the window's RunLog and the Vorax session's are made in AscendantApp::new):
     // until now every run log is kept.
     runlog::set_keep_all(settings.keep_all_logs);

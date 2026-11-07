@@ -1,0 +1,26 @@
+[[zh-TW]]
+Ascendant 1.0.2：自動更新更穩、點擊穿透改成側欄燈、渴血讀卡與紀錄修正
+
+- 自動更新改用 WinHTTP 連線：部分網路設定（例如撥號連線只開「自動偵測設定」）下也能檢查與下載新版；公司 Proxy 要求 Windows 帳號認證時會自動通過；檢查失敗時，滑鼠提示附上錯誤碼。
+- 點擊穿透改成側欄的「穿透」燈（在「日誌」上方），點一下切換；拿掉 F7 快捷鍵和設定頁的開關。
+- 狀態列只放需要你看的事：錯誤、遊戲日誌紅燈、系統管理員提示、新版通知等，點擊穿透不再佔用；「＋N」依收起來的項目上色，黃色表示裡面有要你處理的事。
+- 遊戲以系統管理員身分執行時，F8／F9 在遊戲畫面上沒有作用：狀態列會提示，可以「以系統管理員身分重新啟動」；設定頁也可以開「以系統管理員身分啟動」（每次啟動會跳出 Windows 的確認視窗）。
+- 設定頁重新分類：遊戲、建議與輔助、視窗、紀錄與回報、更新、進階、關於；拿掉「匯出一局…」，匯出在本局頁。
+- 本局頁：選過的局會記住結算結果，再選回來直接顯示。
+- 匯出回報：塔羅斯的可疑時刻只列真正可疑的，正常的等待狀態改成一行彙總（附次數與時間），zip 更小。
+- 紀錄：只開關程式、沒有任何讀取時，不再留下空的紀錄資料夾；既有的這種空資料夾會自動清除（開著「保留全部紀錄」也一樣，它們不含任何資料）。
+- 渴血：器械的選卡紀錄用新出現的圖示補上；藥劑的選卡紀錄不再記到隔壁那張；一發牌就停在卡上時，用滑鼠提示補上讀不到的卡名；名稱表補上「表皮移植實驗」「生命復甦術」「黑膽汁療法」。
+
+[[en]]
+
+Ascendant 1.0.2: steadier updates, click-through on a side light, Vorax reading and record fixes
+
+- Updates go through WinHTTP: checking and downloading work on more network setups (such as a dial-up connection set to "Automatically detect settings" only); a company proxy that asks for your Windows sign-in is answered on its own; a failed check shows the error code in its tooltip.
+- Click-through is now the "Through" light in the side bar (above "Log"): click it to switch. The F7 hotkey and the settings switch are gone.
+- The status bar holds only what needs you: errors, the red game log light, the administrator notice, a new version and the like; click-through no longer takes it. "+N" is coloured by what it hides: yellow means something there needs you.
+- When the game runs as administrator, F8 and F9 do nothing on the game: the status bar says so and offers "Restart as administrator"; Settings also has "Start as administrator" (Windows asks to confirm at every start).
+- Settings are grouped anew: Game, Advice and controls, Window, Logs and reports, Updates, Advanced, About. "Export a run..." is gone: the export is on the Run tab.
+- Run tab: a run you picked keeps its review, shown at once when you pick it again.
+- Report export: Tartarus lists only the moments that look wrong; normal waits are summed up in one line (with counts and times), so the zip is smaller.
+- Logs: opening and closing the app without any read no longer leaves an empty log folder, and such empty folders already there are removed (also with "Keep all run logs" on: they hold no data).
+- Vorax: an instrument pick is recorded from the new icon; a potion pick is no longer recorded as the card next to it; a card name not read while the mouse is on a fresh hand is taken from the tooltip; three surgery protocols missing from the names list are now recognised (their English names are not known yet).

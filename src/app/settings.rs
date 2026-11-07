@@ -12,11 +12,9 @@ pub struct Settings {
     pub read_hotkey: String,
     /// Turns auto read on or off.
     pub auto_hotkey: String,
-    /// Turns click-through on or off: the only way to turn it off, as the
-    /// window takes no clicks while it is on.
-    pub through_hotkey: String,
-    /// Click-through: if it was on when Ascendant was last closed, it starts on next time (only turned on when the
-    /// click-through hotkey registered successfully, see `AscendantApp::new`).
+    /// Click-through: if it was on when Ascendant was last closed, it starts on next time. It is turned on and off
+    /// by the navigation rail's "Through" light, whose clicks stay in the window; the click-through hotkey of 1.0.1
+    /// and before is gone, and an old file's `through_hotkey` is ignored.
     pub click_through: bool,
     /// How opaque the window is, from [`MIN_OPACITY`] to 1.
     pub opacity: f32,
@@ -106,6 +104,10 @@ pub struct Settings {
     /// The game log (UE_game.log) chosen on the settings page; None finds it by itself (see
     /// [`super::gamelog::locate`]). Changing it rebuilds the auto read watcher.
     pub game_log: Option<PathBuf>,
+    /// "Start as administrator": at start Ascendant starts itself again as administrator, when it runs without (see
+    /// [`super::elevation::should_relaunch`]); for a game run as administrator, whose window otherwise keeps the
+    /// hotkeys from Ascendant. Off by default and in older files: Windows asks at every start.
+    pub start_as_admin: bool,
 }
 
 impl Default for Settings {
@@ -113,7 +115,6 @@ impl Default for Settings {
         Settings {
             read_hotkey: "F9".to_string(),
             auto_hotkey: "F8".to_string(),
-            through_hotkey: "F7".to_string(),
             click_through: false,
             opacity: 1.0,
             window_title: "Torchlight".to_string(),
@@ -144,6 +145,7 @@ impl Default for Settings {
             font_scale: 1.0,
             layout: "auto".to_string(),
             game_log: None,
+            start_as_admin: false,
         }
     }
 }
@@ -275,7 +277,7 @@ mod tests {
         assert!(s.check_updates && s.offer_install);
         // Old settings files have no dismissed "Updated to" notice.
         assert_eq!(s.updated_seen, "");
-        assert_eq!((s.through_hotkey.as_str(), s.opacity), ("F7", 1.0));
+        assert_eq!(s.opacity, 1.0);
         // Old settings files have no click-through: it starts off as before.
         assert!(!s.click_through);
         assert_eq!((s.share_logs, s.shared_from.as_str(), s.install_id.as_str()), (None, "", ""));
@@ -289,6 +291,28 @@ mod tests {
         assert!(on.keep_all_logs && !off.keep_all_logs);
         // Every save writes the field.
         assert_eq!(serde_json::to_value(Settings::default()).unwrap()["keep_all_logs"], serde_json::json!(false));
+    }
+
+    /// "Start as administrator": off by default and in an older file without it; on is written and read back.
+    #[test]
+    fn start_as_admin_saved_and_off_in_older_files() {
+        let old: Settings = serde_json::from_str(r#"{"read_hotkey": "F1"}"#).unwrap();
+        assert!(!old.start_as_admin, "an older file: off");
+        assert!(!Settings::default().start_as_admin);
+        let on: Settings = serde_json::from_str(r#"{"start_as_admin": true}"#).unwrap();
+        assert!(on.start_as_admin);
+        let back: Settings = serde_json::from_value(serde_json::to_value(&on).unwrap()).unwrap();
+        assert!(back.start_as_admin, "written and read back");
+    }
+
+    /// The click-through hotkey is gone (1.0.2): an older file's `through_hotkey` is ignored, not an error, and its
+    /// click-through stays as it was saved; a save no longer writes the field.
+    #[test]
+    fn old_through_hotkey_is_ignored() {
+        let s: Settings = serde_json::from_str(r#"{"through_hotkey": "F7", "click_through": true, "read_hotkey": "F1"}"#).unwrap();
+        assert!(s.click_through);
+        assert_eq!(s.read_hotkey, "F1");
+        assert!(serde_json::to_value(&s).unwrap().get("through_hotkey").is_none());
     }
 
     /// Loading "Keep all run logs": no file gives the defaults (off); a file without the field (an older version's)

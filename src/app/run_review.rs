@@ -9,6 +9,11 @@
 //! run's result). A settlement cannot be cancelled, so at most one picked run is settled at a time: a run picked
 //! meanwhile waits until it is done (only the newest pick waits), and a run already being settled, by a pick or
 //! automatically, is not settled twice.
+//!
+//! Every run settled this session, by a pick or automatically, is kept in memory (at most [`CACHED`], the oldest
+//! dropped first): picking it again shows it at once instead of settling it again, which is slow for Tartarus and
+//! gives slightly different numbers each time. Only settled results are kept, never on disk; switching the language
+//! drops them all (their text is in the language they were settled in), and "Review again" settles a run again.
 
 use super::report::{Game, ReportUi, RunEntry, Target, settled_of};
 use super::settle::{Outcome, RunKind, Settled};
@@ -17,8 +22,12 @@ use eframe::egui;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, TryRecvError};
 
-/// A settlement running in the background: its run folder and where its result comes.
-type Running = Option<(PathBuf, Receiver<Outcome>)>;
+/// A settlement running in the background: its run folder, where its result comes, and the language switch it was
+/// started after ([`RunReview::language_changed`]).
+type Running = Option<(PathBuf, Receiver<Outcome>, u64)>;
+
+/// How many settled runs [`RunReview`] keeps in memory; a settled result is under 1 KB.
+const CACHED: usize = 50;
 
 #[derive(Default)]
 pub struct RunReview {
@@ -41,6 +50,10 @@ pub struct RunReview {
     /// while a run settles the block keeps that height, so the export card below does not jump up and back (see
     /// [`RunReview::block_min`]).
     block: (f32, f32),
+    /// The runs settled this session, oldest first, each an `Outcome::Settled` (see the module notes).
+    cache: Vec<(PathBuf, Outcome)>,
+    /// How many times the language was switched: a settlement started before the last switch is not kept in memory.
+    language: u64,
 }
 
 /// A picked run and its result; None while it is being settled or waits for its turn.
@@ -49,16 +62,16 @@ struct Picked {
     settled: Option<(PathBuf, Outcome)>,
 }
 
-/// Takes the result from `slot` once it is in, emptying it; a settlement thread that died gives a failure, so the
-/// spinner does not spin forever.
-fn take(slot: &mut Running) -> Option<(PathBuf, Outcome)> {
-    let (_, rx) = slot.as_ref()?;
+/// Takes the result from `slot` once it is in, emptying it, with the language switch it was started after; a
+/// settlement thread that died gives a failure, so the spinner does not spin forever.
+fn take(slot: &mut Running) -> Option<(PathBuf, Outcome, u64)> {
+    let (_, rx, _) = slot.as_ref()?;
     let out = match rx.try_recv() {
         Ok(out) => out,
         Err(TryRecvError::Empty) => return None,
         Err(TryRecvError::Disconnected) => Outcome::Failed(tr("the review stopped unexpectedly").to_string()),
     };
-    slot.take().map(|(dir, _)| (dir, out))
+    slot.take().map(|(dir, _, language)| (dir, out, language))
 }
 
 fn kind_of(game: Game) -> RunKind {
@@ -73,7 +86,7 @@ impl RunReview {
     /// still running. A run picked stays picked: the folder also changes when a run starts or is given up, and only
     /// a run's end ([`RunReview::game_ended`]) goes back to "Latest run".
     pub fn start_tartarus(&mut self, dir: PathBuf, rx: Receiver<Outcome>, at: i64) {
-        self.settling = Some((dir, rx));
+        self.settling = Some((dir, rx, self.language));
         self.tartarus_at = at;
     }
 
@@ -81,9 +94,9 @@ impl RunReview {
     /// same game settled again). A new game's folder goes back to "Latest run"; the same game ending again (its
     /// endgame battle ended after its last round) does not.
     pub fn start_vorax(&mut self, dir: PathBuf, rx: Receiver<Outcome>, at: Option<i64>) {
-        let last = self.vorax_settling.as_ref().map(|(d, _)| d).or(self.vorax_settled.as_ref().map(|(d, _)| d));
+        let last = self.vorax_settling.as_ref().map(|(d, ..)| d).or(self.vorax_settled.as_ref().map(|(d, _)| d));
         let new_game = last != Some(&dir);
-        self.vorax_settling = Some((dir, rx));
+        self.vorax_settling = Some((dir, rx, self.language));
         if let Some(at) = at {
             self.vorax_at = at;
         }
@@ -97,18 +110,12 @@ impl RunReview {
         self.latest();
     }
 
-    /// Picks `entry` to review (and export) instead of the latest. Its result is taken from the automatic settlement
-    /// when that already settled the same run (even while it works on another run now); else it is settled by the next
-    /// [`RunReview::poll`], or follows the automatic or picked settlement already running for it.
+    /// Picks `entry` to review (and export) instead of the latest. A run settled before this session (by a pick or
+    /// automatically, even while the automatic settlement works on another run now) is shown at once from memory;
+    /// else it is settled by the next [`RunReview::poll`], or follows the automatic or picked settlement already
+    /// running for it.
     pub fn pick(&mut self, entry: RunEntry) {
-        let settled = match entry.game {
-            Game::Tartarus => &self.settled,
-            Game::Vorax => &self.vorax_settled,
-        };
-        let reuse = match settled {
-            Some((dir, out @ Outcome::Settled(_))) if *dir == entry.dir => Some((dir.clone(), out.clone())),
-            _ => None,
-        };
+        let reuse = self.cached(&entry.dir).map(|out| (entry.dir.clone(), out.clone()));
         self.picked = Some(Picked { entry, settled: reuse });
     }
 
@@ -117,23 +124,55 @@ impl RunReview {
         self.picked = None;
     }
 
-    /// Settles the picked run again (after the language was switched); false when none is picked.
-    pub fn again(&mut self) -> bool {
+    /// "Review again" for the run in `dir`: it is dropped from memory, so it is settled anew; the picked run is
+    /// settled again by the next [`RunReview::poll`]. False when none is picked (the caller starts the automatic
+    /// settlement again).
+    pub fn again(&mut self, dir: &Path) -> bool {
+        self.cache.retain(|(d, _)| d != dir);
         let Some(p) = &mut self.picked else { return false };
         p.settled = None;
         true
     }
 
+    /// The language was switched: the runs kept in memory were settled in the one before, so they are dropped and
+    /// a run picked from now on is settled again in the new one.
+    pub fn language_changed(&mut self) {
+        self.cache.clear();
+        self.language += 1;
+    }
+
+    /// The result kept in memory for the run in `dir`.
+    fn cached(&self, dir: &Path) -> Option<&Outcome> {
+        self.cache.iter().find(|(d, _)| d == dir).map(|(_, out)| out)
+    }
+
+    /// Keeps a settlement's result in memory as the run's latest: a settled one replaces the run's entry as the
+    /// newest (the oldest dropped past [`CACHED`]), anything else only drops the entry (a picked run whose
+    /// settlement now says another language must not show the old result again).
+    /// A settlement started before the last language switch (`language` is not the current count) is not kept: its
+    /// text is in the language before.
+    fn remember(&mut self, dir: &Path, out: &Outcome, language: u64) {
+        self.cache.retain(|(d, _)| d != dir);
+        if matches!(out, Outcome::Settled(_)) && language == self.language {
+            if self.cache.len() >= CACHED {
+                self.cache.remove(0);
+            }
+            self.cache.push((dir.to_path_buf(), out.clone()));
+        }
+    }
+
     /// Takes the results that came in, and starts the picked run's settlement with `spawn` when nothing settles it:
     /// no picked settlement running (one at a time) and no automatic one for the same folder.
     pub fn poll(&mut self, spawn: &mut impl FnMut(PathBuf, Game) -> Receiver<Outcome>) {
-        if let Some((dir, out)) = take(&mut self.settling) {
-            self.auto_result(dir, out, Game::Tartarus);
+        if let Some((dir, out, language)) = take(&mut self.settling) {
+            self.auto_result(dir, out, language, Game::Tartarus);
         }
-        if let Some((dir, out)) = take(&mut self.vorax_settling) {
-            self.auto_result(dir, out, Game::Vorax);
+        if let Some((dir, out, language)) = take(&mut self.vorax_settling) {
+            self.auto_result(dir, out, language, Game::Vorax);
         }
-        if let Some((dir, out)) = take(&mut self.running) {
+        if let Some((dir, out, language)) = take(&mut self.running) {
+            // Kept even when the run was picked before (its result is dropped from the pick, not lost).
+            self.remember(&dir, &out, language);
             self.give_picked(&dir, &out);
         }
         if self.running.is_none()
@@ -143,13 +182,14 @@ impl RunReview {
         {
             let dir = p.entry.dir.clone();
             let rx = spawn(dir.clone(), p.entry.game);
-            self.running = Some((dir, rx));
+            self.running = Some((dir, rx, self.language));
         }
     }
 
     /// An automatic settlement's result: the picked run gets it when it is the same run; then the Tartarus rule (a run
     /// given up does not replace the result held), and the run list is read again (the game's log is written by now).
-    fn auto_result(&mut self, dir: PathBuf, out: Outcome, game: Game) {
+    fn auto_result(&mut self, dir: PathBuf, out: Outcome, language: u64, game: Game) {
+        self.remember(&dir, &out, language);
         self.give_picked(&dir, &out);
         match game {
             Game::Tartarus => {
@@ -176,7 +216,7 @@ impl RunReview {
     }
 
     fn auto_settling(&self, dir: &Path) -> bool {
-        [&self.settling, &self.vorax_settling].into_iter().flatten().any(|(d, _)| d == dir)
+        [&self.settling, &self.vorax_settling].into_iter().flatten().any(|(d, ..)| d == dir)
     }
 
     /// The game "Latest run" reviews: the one that ended last of the Tartarus run and the Vorax game under review.
@@ -192,7 +232,7 @@ impl RunReview {
             RunKind::Tartarus => (&self.settling, &self.settled),
             RunKind::Vorax => (&self.vorax_settling, &self.vorax_settled),
         };
-        settling.as_ref().map(|(d, _)| d).or(settled.as_ref().map(|(d, _)| d)).cloned()
+        settling.as_ref().map(|(d, ..)| d).or(settled.as_ref().map(|(d, _)| d)).cloned()
     }
 
     /// Which game the Run tab reviews: the picked run's, else the latest's.
@@ -437,7 +477,7 @@ mod tests {
         spawns.send(2, language.clone());
         poll(&mut review, &mut spawns);
         assert_eq!(shown(&review), (false, Some(language)));
-        assert!(review.again());
+        assert!(review.again(&y.dir));
         poll(&mut review, &mut spawns);
         assert_eq!(spawns.dirs().last(), Some(&y.dir.as_path()));
         assert_eq!(shown(&review), (true, None));
@@ -526,6 +566,127 @@ mod tests {
         poll(&mut review, &mut spawns);
         assert_eq!(review.picked(), None);
         assert_eq!(shown(&review).1, None, "Latest run shows the Vorax game, still settling");
+    }
+
+    /// Picks `e` and, when that starts a settlement, answers it with a settled result; how many settlements the pick
+    /// started (0 when it was shown from memory or followed one already running).
+    fn pick_settled(review: &mut RunReview, spawns: &mut Spawns, e: &RunEntry) -> usize {
+        let before = spawns.0.len();
+        review.pick(e.clone());
+        poll(review, spawns);
+        let started = spawns.0.len() - before;
+        if started > 0 {
+            spawns.send(spawns.0.len() - 1, settled(&e.name));
+            poll(review, spawns);
+        }
+        started
+    }
+
+    /// A run settled once this session, by a pick or automatically, is shown at once when picked again: A, then B,
+    /// then A again settles nothing more, and an automatic result is kept too after the automatic settlement moved
+    /// on to other runs.
+    #[test]
+    fn a_run_picked_again_is_shown_from_memory() {
+        let (a, b, auto, next) = (tartarus("2026-11-01_00-00-00"), vorax("2026-11-02_00-00-00"), tartarus("2026-11-03_00-00-00"), tartarus("2026-11-04_00-00-00"));
+        let mut review = RunReview::default();
+        let mut spawns = Spawns::default();
+        assert_eq!(pick_settled(&mut review, &mut spawns, &a), 1);
+        assert_eq!(pick_settled(&mut review, &mut spawns, &b), 1);
+        assert_eq!(pick_settled(&mut review, &mut spawns, &a), 0, "A again: not settled again");
+        assert_eq!(shown(&review), (false, Some(settled(&a.name))), "shown at once, not a spinner");
+        assert_eq!(pick_settled(&mut review, &mut spawns, &b), 0, "B again too");
+        assert_eq!(shown(&review), (false, Some(settled(&b.name))));
+        assert_eq!(spawns.dirs(), [a.dir.as_path(), b.dir.as_path()]);
+
+        // An automatic result, then the automatic settlement settles two more runs: still kept.
+        review.latest();
+        for (k, run) in [&auto, &next, &tartarus("2026-11-05_00-00-00")].into_iter().enumerate() {
+            let (tx, rx) = channel();
+            review.start_tartarus(run.dir.clone(), rx, k as i64 + 1);
+            tx.send(settled(&run.name)).unwrap();
+            poll(&mut review, &mut spawns);
+        }
+        assert_eq!(pick_settled(&mut review, &mut spawns, &auto), 0, "settled automatically before: not settled again");
+        assert_eq!(shown(&review), (false, Some(settled(&auto.name))));
+        assert_eq!(spawns.0.len(), 2);
+
+        // Only settled results are kept: a run that settled to another language is settled again when picked.
+        let other = tartarus("2026-11-06_00-00-00");
+        review.pick(other.clone());
+        poll(&mut review, &mut spawns);
+        spawns.send(2, Outcome::Language { log: Lang::En, ui: Lang::ZhTw });
+        poll(&mut review, &mut spawns);
+        review.latest();
+        review.pick(other.clone());
+        poll(&mut review, &mut spawns);
+        assert_eq!(spawns.0.len(), 4, "not kept: settled again");
+    }
+
+    /// At most CACHED runs are kept: one more drops the oldest, which is settled again when picked, while the
+    /// others are still shown from memory.
+    #[test]
+    fn memory_keeps_the_newest_runs() {
+        let runs: Vec<RunEntry> = (0..=CACHED).map(|k| tartarus(&format!("2026-11-01_00-00-{k:02}"))).collect();
+        let mut review = RunReview::default();
+        let mut spawns = Spawns::default();
+        for run in &runs {
+            assert_eq!(pick_settled(&mut review, &mut spawns, run), 1);
+        }
+        assert_eq!(review.cache.len(), CACHED);
+        assert_eq!(pick_settled(&mut review, &mut spawns, &runs[1]), 0, "the second oldest is still kept");
+        assert_eq!(pick_settled(&mut review, &mut spawns, &runs[CACHED]), 0, "the newest too");
+        assert_eq!(pick_settled(&mut review, &mut spawns, &runs[0]), 1, "the oldest was dropped: settled again");
+        assert_eq!(review.cache.len(), CACHED);
+        assert_eq!(pick_settled(&mut review, &mut spawns, &runs[0]), 0, "and kept again");
+    }
+
+    /// Switching the language drops every run kept (their text is in the language before), and "Review again"
+    /// settles a kept run anew, picked or not.
+    #[test]
+    fn a_language_switch_or_review_again_settles_again() {
+        let (a, b) = (tartarus("2026-11-01_00-00-00"), tartarus("2026-11-02_00-00-00"));
+        let mut review = RunReview::default();
+        let mut spawns = Spawns::default();
+        assert_eq!(pick_settled(&mut review, &mut spawns, &a), 1);
+        assert_eq!(pick_settled(&mut review, &mut spawns, &b), 1);
+        review.language_changed();
+        assert_eq!(pick_settled(&mut review, &mut spawns, &a), 1, "a language switch: settled again");
+        assert_eq!(pick_settled(&mut review, &mut spawns, &b), 1);
+
+        // A settlement running across a language switch (the window does not allow one, but whatever): its result
+        // is shown, not kept, so the run is settled again in the new language when picked again.
+        let c = tartarus("2026-11-03_00-00-00");
+        review.pick(c.clone());
+        poll(&mut review, &mut spawns);
+        review.language_changed();
+        spawns.send(spawns.0.len() - 1, settled(&c.name));
+        poll(&mut review, &mut spawns);
+        assert_eq!(shown(&review), (false, Some(settled(&c.name))), "shown");
+        assert_eq!(pick_settled(&mut review, &mut spawns, &a), 1);
+        assert_eq!(pick_settled(&mut review, &mut spawns, &c), 1, "not kept: settled again");
+        let automatic = tartarus("2026-11-04_00-00-00");
+        let (tx, rx) = channel();
+        review.start_tartarus(automatic.dir.clone(), rx, 9);
+        review.language_changed();
+        tx.send(settled(&automatic.name)).unwrap();
+        poll(&mut review, &mut spawns);
+        assert_eq!(pick_settled(&mut review, &mut spawns, &automatic), 1, "an automatic one neither");
+
+        // "Review again" on the picked run, shown from memory: settled again, a spinner meanwhile.
+        assert_eq!(pick_settled(&mut review, &mut spawns, &a), 1, "the second switch dropped it");
+        assert_eq!(pick_settled(&mut review, &mut spawns, &a), 0);
+        assert!(review.again(&a.dir));
+        assert_eq!(shown(&review), (true, None));
+        poll(&mut review, &mut spawns);
+        assert_eq!(spawns.dirs().last(), Some(&a.dir.as_path()), "settled again although it was kept");
+        assert_eq!(spawns.0.len(), 10);
+        spawns.send(9, settled(&a.name));
+        poll(&mut review, &mut spawns);
+        assert_eq!(shown(&review), (false, Some(settled(&a.name))));
+        // "Review again" on "Latest run" (the caller restarts the automatic settlement): the run is dropped too.
+        review.latest();
+        assert!(!review.again(&b.dir));
+        assert_eq!(pick_settled(&mut review, &mut spawns, &b), 1, "dropped by Review again");
     }
 
     /// The review block holds the height of the result on show before a settlement started, only while it settles:

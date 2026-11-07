@@ -36,6 +36,14 @@ pub fn keep_all() -> bool {
 /// so a board the reader misses still shows in the log.
 const MISS_FRAME_EVERY: Duration = Duration::from_secs(60);
 
+/// How long a run folder holding only window and view lines is left alone before [`prune`] deletes it (see
+/// [`startup_only`]): an older version made one each time the app was opened and closed.
+const STARTUP_ONLY_AGE: Duration = Duration::from_secs(3600);
+
+/// The largest log.jsonl [`startup_only`] reads: a bigger one is kept unread (a few window and view lines take
+/// a few hundred bytes).
+const STARTUP_ONLY_BYTES: u64 = 64 * 1024;
+
 /// JPEG quality of the saved frames: a 1920 x 1080 frame takes about 420 KB,
 /// against 2.3 MB as a PNG. The reader reads the captured frame, never these.
 const FRAME_QUALITY: u8 = 92;
@@ -51,14 +59,18 @@ enum Job {
 
 enum Item {
     Line(String),
+    /// A window or view line: alone it does not make the folder. It waits until the same folder gets anything else
+    /// (then it is written first, in order), and is dropped when the log moves to another folder first.
+    Held(String),
     /// File name, frame and JPEG quality.
     Jpeg(String, Rgba, u8),
     /// An observe mode frame, a JPEG already.
     Observed(String, Vec<u8>),
 }
 
-/// The log of the run on show. A folder is made with its first line, so an
-/// app opened and closed without a read leaves none.
+/// The log of the run on show. A folder is made with its first line other than a window or view line, or its first
+/// frame, so an app opened and closed without a read leaves none (window and view lines wait for it, see
+/// [`Item::Held`]).
 pub struct RunLog {
     root: PathBuf,
     /// The run's folder.
@@ -86,6 +98,8 @@ impl RunLog {
         let keep_root = root.clone();
         let writer = std::thread::spawn(move || {
             let mut made: Option<PathBuf> = None;
+            // Window and view lines waiting for their folder to be made, with that folder.
+            let mut held: Option<(PathBuf, Vec<String>)> = None;
             for job in rx {
                 let (dir, item) = match job {
                     Job::Write(dir, item) => (dir, item),
@@ -96,17 +110,33 @@ impl RunLog {
                     Job::Adopt(dir) => {
                         let _ = std::fs::create_dir_all(&dir);
                         made = Some(dir);
+                        held = None;
                         continue;
                     }
                 };
                 if made.as_ref() != Some(&dir) {
+                    if let Item::Held(line) = item {
+                        // Not made yet: the line waits; lines held for another folder (one left by new_run) go.
+                        match &mut held {
+                            Some((d, lines)) if *d == dir => lines.push(line),
+                            _ => held = Some((dir, vec![line])),
+                        }
+                        continue;
+                    }
                     let _ = std::fs::create_dir_all(&dir);
                     prune(&keep_root, keep_all(), KEEP_GAMES, &dir, SystemTime::now());
                     made = Some(dir.clone());
+                    if let Some((d, lines)) = held.take()
+                        && d == dir
+                    {
+                        for line in lines {
+                            let _ = append(&dir.join("log.jsonl"), &line);
+                        }
+                    }
                 }
                 // Errors are dropped: the log must not get in the player's way.
                 let _ = match item {
-                    Item::Line(line) => append(&dir.join("log.jsonl"), &line),
+                    Item::Line(line) | Item::Held(line) => append(&dir.join("log.jsonl"), &line),
                     Item::Jpeg(name, frame, quality) => save_jpeg(&dir.join(name), &frame, quality),
                     Item::Observed(name, jpeg) => save_observed(&dir.join("observe"), &name, &jpeg),
                 };
@@ -173,9 +203,9 @@ impl RunLog {
 
     /// [`RunLog::event`] with the capture's queued rows (capture_geometry, capture_trim, capture_warning) from
     /// `notes`: they go in, each at the time it was asked for, just before the next line that is neither a window
-    /// nor a view line, into whichever log writes it. So a folder from only opening and closing the app still holds
-    /// window and view lines alone, which the report's run list leaves out (report.rs `has_play`), and a new run's
-    /// folder still starts with its window line.
+    /// nor a view line, into whichever log writes it. So window and view lines alone, from only opening and closing
+    /// the app, still make no folder (they wait for another line, see [`Item::Held`]), and a new run's folder still
+    /// starts with its window line.
     fn event_with(&self, kind: &str, at: SystemTime, fields: Value, notes: impl FnOnce() -> Vec<(SystemTime, &'static str, Value)>) {
         if kind != "window" && kind != "view" {
             for (asked, note, note_fields) in notes() {
@@ -193,7 +223,9 @@ impl RunLog {
         if let Value::Object(fields) = fields {
             line.extend(fields);
         }
-        self.send(Job::Write(self.dir.clone(), Item::Line(Value::Object(line).to_string())));
+        let line = Value::Object(line).to_string();
+        let item = if kind == "window" || kind == "view" { Item::Held(line) } else { Item::Line(line) };
+        self.send(Job::Write(self.dir.clone(), item));
     }
 
     /// Saves `frame` when its screen or board differs from the last frame
@@ -408,13 +440,77 @@ fn finished_games(root: &Path, now: SystemTime) -> (Vec<PathBuf>, Vec<PathBuf>) 
     (games, runs)
 }
 
-/// Deletes the old run folders under `root`, unless `keep_all` (the "Keep all run logs" setting, on: nothing is
-/// deleted, frames included). Otherwise, once there are at least `games` finished games ([`finished_games`]), every
+/// Whether a run folder holds nothing but window and view lines, so it can go whatever "Keep all run logs" says: its
+/// name is one RunLog gives (`name`, [`made_run_folder`]), it is not the folder being written (`writing`), it was last
+/// changed more than [`STARTUP_ONLY_AGE`] ago (`age`), its only entry is log.jsonl (`entries`: no frame, no observe
+/// folder, nothing else), the log is at most [`STARTUP_ONLY_BYTES`] long (`log_bytes`) and holds at least one line,
+/// and every line of it (`log`) is a window or view line. Such a folder came from opening and closing the app with an
+/// older version, before window and view lines waited for a played line. An empty log is kept: it is not known what
+/// made it.
+fn startup_only(name: &str, writing: bool, age: Duration, entries: &[String], log_bytes: u64, log: &str) -> bool {
+    let mut lines = log.lines().filter(|l| !l.trim().is_empty()).peekable();
+    made_run_folder(name)
+        && !writing
+        && age > STARTUP_ONLY_AGE
+        && entries == ["log.jsonl"]
+        && log_bytes <= STARTUP_ONLY_BYTES
+        && lines.peek().is_some()
+        && lines.all(|l| serde_json::from_str::<Value>(l).is_ok_and(|row| matches!(row["kind"].as_str(), Some("window" | "view"))))
+}
+
+/// [`startup_only`] for the folder `dir` on disk at `now`, `writing` being the folder being written; its age is the
+/// newer of the folder's and its log's last change. False when anything cannot be read.
+fn startup_only_on_disk(dir: &Path, writing: &Path, now: SystemTime) -> bool {
+    let Some(name) = dir.file_name().and_then(|n| n.to_str()) else { return false };
+    if !made_run_folder(name) || dir == writing {
+        return false;
+    }
+    let Ok(read) = std::fs::read_dir(dir) else { return false };
+    let entries: Vec<String> = read.filter_map(Result::ok).map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+    if entries != ["log.jsonl"] {
+        return false;
+    }
+    let log = dir.join("log.jsonl");
+    let changed = [dir, log.as_path()].iter().filter_map(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok()).max();
+    let Some(age) = changed.and_then(|t| now.duration_since(t).ok()) else { return false };
+    // A big log is not read at all: it cannot be a few window and view lines.
+    let Ok(bytes) = std::fs::metadata(&log).map(|m| m.len()) else { return false };
+    if bytes > STARTUP_ONLY_BYTES {
+        return false;
+    }
+    let Ok(text) = std::fs::read_to_string(&log) else { return false };
+    startup_only(name, false, age, &entries, bytes, &text)
+}
+
+/// Deletes a folder [`startup_only_on_disk`] found: its log, then the folder only if it is empty by then, so a file that
+/// came in since the check stays, with its folder. Errors are dropped.
+fn remove_startup_only(dir: &Path) {
+    if std::fs::remove_file(dir.join("log.jsonl")).is_ok() {
+        let _ = std::fs::remove_dir(dir);
+    }
+}
+
+/// The run folders under `root` that [`startup_only_on_disk`] would delete, by name.
+fn startup_only_folders(root: &Path, writing: &Path, now: SystemTime) -> Vec<PathBuf> {
+    let mut found: Vec<PathBuf> = std::fs::read_dir(root)
+        .map(|entries| entries.filter_map(Result::ok).filter(|e| e.file_type().is_ok_and(|t| t.is_dir())).map(|e| e.path()).filter(|d| startup_only_on_disk(d, writing, now)).collect())
+        .unwrap_or_default();
+    found.sort();
+    found
+}
+
+/// Deletes the run folders under `root` that hold only window and view lines ([`startup_only`]: no data at all, so
+/// whatever `keep_all` says), their log first and then the folder only if it is empty by then (a file that came in
+/// since the check stays, with its folder), then the old ones, unless `keep_all` (the "Keep all run logs" setting, on: nothing
+/// else is deleted, frames included). Otherwise, once there are at least `games` finished games ([`finished_games`]), every
 /// run folder older than the `games`-th newest of them is deleted whole (log, frames, observe frames); that one and
 /// every newer folder stay whole. Files in `root` (Vorax's learned.jsonl, opening-rerolls.json), folders not named
 /// as RunLog names them ([`made_run_folder`]) or named more than a day after `now` are never touched, nor is
 /// `writing`, the folder being written. Errors are dropped: the log must not get in the player's way.
 fn prune(root: &Path, keep_all: bool, games: usize, writing: &Path, now: SystemTime) {
+    for dir in startup_only_folders(root, writing, now) {
+        remove_startup_only(&dir);
+    }
     if keep_all || games == 0 {
         return;
     }
@@ -800,10 +896,13 @@ mod tests {
         log.geometry = stand_in_geometry;
         *GEOMETRY.lock().unwrap() = Some(serde_json::json!({ "texture": [2560, 1440], "origin": "unmatched" }));
         log.window(serde_json::json!({ "window": "w", "ocr": "en-US" }));
+        // A played line makes each folder (window lines alone wait for one).
+        log.event_with("read", SystemTime::now(), serde_json::json!({}), Vec::new);
         log.wait();
         let first_dir = log.dir().to_path_buf();
         *GEOMETRY.lock().unwrap() = Some(serde_json::json!({ "texture": [1922, 1112], "origin": "window" }));
         log.new_run();
+        log.event_with("read", SystemTime::now(), serde_json::json!({}), Vec::new);
         log.wait();
         let first_line = |dir: &Path| -> Value {
             let text = std::fs::read_to_string(dir.join("log.jsonl")).unwrap();
@@ -874,6 +973,7 @@ mod tests {
         log.window = Some(fields);
         log.wait();
         assert!(super::super::report::list_runs(&app).is_empty(), "opened and closed: no run listed");
+        assert!(!log.dir().exists(), "opened and closed: no folder at all");
 
         let at = asked + Duration::from_millis(500);
         log.event_with("read", at, serde_json::json!({ "screen": "Manage" }), queued);
@@ -885,12 +985,151 @@ mod tests {
         assert_eq!(row["at"], timestamp(asked), "the time it was asked for");
         assert!(super::super::report::list_runs(&app).is_empty(), "played but not finished: not listed");
 
-        // A new run's folder still starts with the window line.
+        // A new run's folder still starts with the window line (once a played line makes it).
         log.new_run();
+        log.event_with("read", SystemTime::now(), serde_json::json!({}), Vec::new);
         log.wait();
         let first = std::fs::read_to_string(log.dir().join("log.jsonl")).unwrap();
         assert!(first.lines().next().unwrap().contains("\"kind\":\"window\""));
         drop(log);
         std::fs::remove_dir_all(&app).unwrap();
+    }
+
+    /// The kinds of the lines in `dir`'s log, in order.
+    fn kinds(dir: &Path) -> Vec<String> {
+        let text = std::fs::read_to_string(dir.join("log.jsonl")).unwrap();
+        text.lines().map(|l| serde_json::from_str::<Value>(l).unwrap()["kind"].as_str().unwrap().to_string()).collect()
+    }
+
+    /// Window and view lines alone make no folder; the first other line makes it, with the held lines written
+    /// before it in their order; later window and view lines go straight in.
+    #[test]
+    fn window_and_view_lines_wait_for_a_played_line() {
+        let root = temp("held-lines");
+        let log = RunLog::new(root.clone());
+        let none = || Vec::new();
+        log.event_with("window", SystemTime::now(), serde_json::json!({ "n": 1 }), none);
+        log.event_with("view", SystemTime::now(), serde_json::json!({ "n": 2 }), none);
+        log.event_with("view", SystemTime::now(), serde_json::json!({ "n": 3 }), none);
+        log.wait();
+        assert!(!log.dir().exists(), "window and view lines only: no folder");
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+        log.event_with("read", SystemTime::now(), serde_json::json!({ "n": 4 }), none);
+        log.event_with("view", SystemTime::now(), serde_json::json!({ "n": 5 }), none);
+        log.wait();
+        assert_eq!(kinds(log.dir()), ["window", "view", "view", "read", "view"]);
+        let text = std::fs::read_to_string(log.dir().join("log.jsonl")).unwrap();
+        let order: Vec<i64> = text.lines().map(|l| serde_json::from_str::<Value>(l).unwrap()["n"].as_i64().unwrap()).collect();
+        assert_eq!(order, [1, 2, 3, 4, 5], "in the order sent");
+        drop(log);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A frame makes the folder too, the held lines written first; an observe frame as well.
+    #[test]
+    fn a_frame_makes_the_folder() {
+        let root = temp("held-jpeg");
+        let mut log = RunLog::new(root.clone());
+        log.event_with("window", SystemTime::now(), serde_json::json!({}), Vec::new);
+        log.wait();
+        assert!(!log.dir().exists());
+        let name = log.jpeg("frame", Rgba { w: 1, h: 1, data: vec![0, 0, 0, 255] }, 80);
+        log.wait();
+        assert!(log.dir().join(&name).is_file());
+        assert_eq!(kinds(log.dir()), ["window"], "the held line written with it");
+        // The next folder starts with the last window line again (as `window` keeps it).
+        log.window = Some(serde_json::json!({}));
+        log.geometry = |fields| fields;
+        log.new_run();
+        log.observed(vec![1], UNIX_EPOCH);
+        log.wait();
+        assert_eq!(kinds(log.dir()), ["window"], "the next folder, made by an observe frame, starts with its window line");
+        assert!(log.dir().join("observe").is_dir());
+        drop(log);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Lines held for a folder that never got a played line are dropped when the log moves to the next run's folder:
+    /// that folder is never made, and the next one holds only its own lines.
+    #[test]
+    fn held_lines_go_with_a_new_run() {
+        let root = temp("held-new-run");
+        let mut log = RunLog::new(root.clone());
+        log.event_with("view", SystemTime::now(), serde_json::json!({ "old": true }), Vec::new);
+        let first = log.dir().to_path_buf();
+        log.new_run();
+        log.event_with("view", SystemTime::now(), serde_json::json!({ "old": false }), Vec::new);
+        log.event_with("read", SystemTime::now(), serde_json::json!({}), Vec::new);
+        log.wait();
+        assert!(!first.exists(), "never made");
+        assert_eq!(kinds(log.dir()), ["view", "read"]);
+        assert!(!std::fs::read_to_string(log.dir().join("log.jsonl")).unwrap().contains("\"old\":true"));
+        drop(log);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// The rule for a folder holding only window and view lines: deleted only when its name is RunLog's, it is not
+    /// the folder being written, it is over an hour old, log.jsonl is its only entry and every line is a window or
+    /// view line.
+    #[test]
+    fn only_startup_folders_are_cleared() {
+        let (name, hour) = ("2026-11-01_00-00-00", STARTUP_ONLY_AGE + Duration::from_secs(1));
+        let log = || vec!["log.jsonl".to_string()];
+        // The length of the log does not matter below [`STARTUP_ONLY_BYTES`]; the call passes it.
+        let startup_only = |name: &str, writing: bool, age: Duration, entries: &[String], text: &str| startup_only(name, writing, age, entries, text.len() as u64, text);
+        let view = "{\"kind\":\"view\"}\n";
+        let window_view = "{\"kind\":\"window\",\"ocr\":\"zh-Hant-TW\"}\n{\"kind\":\"view\"}\n";
+        assert!(startup_only(name, false, hour, &log(), view), "only a view line");
+        assert!(startup_only(name, false, hour, &log(), window_view));
+        assert!(!startup_only(name, false, hour, &log(), "{\"kind\":\"view\"}\n{\"kind\":\"read\"}\n"), "any other kind");
+        assert!(!startup_only(name, false, hour, &log(), "{\"kind\":\"capture_geometry\"}\n"));
+        assert!(!startup_only(name, false, hour, &log(), "not json\n"), "a line that does not parse");
+        assert!(!startup_only(name, false, hour, &["frame-0001.jpg".to_string(), "log.jsonl".to_string()], view), "a frame");
+        assert!(!startup_only(name, false, hour, &["log.jsonl".to_string(), "observe".to_string()], view), "an observe folder");
+        assert!(!startup_only(name, false, hour, &[], view), "no log");
+        assert!(!startup_only(name, false, STARTUP_ONLY_AGE, &log(), view), "too new");
+        assert!(!startup_only(name, true, hour, &log(), view), "the folder being written");
+        assert!(!startup_only("2026-11-01_00-00-00 備份", false, hour, &log(), view), "renamed by the player");
+        assert!(!startup_only(name, false, hour, &log(), ""), "an empty log is kept");
+        assert!(!startup_only(name, false, hour, &log(), "\n  \n"), "blank lines only: kept");
+        assert!(!super::startup_only(name, false, hour, &log(), STARTUP_ONLY_BYTES + 1, view), "too long to be read");
+        assert!(super::startup_only(name, false, hour, &log(), STARTUP_ONLY_BYTES, view));
+
+        // On disk, through prune, with "Keep all run logs" on: only the view-only folder goes.
+        let root = temp("startup-only");
+        let only_view = root.join("2026-10-01_00-00-00");
+        let played = root.join("2026-10-01_00-00-01");
+        let framed = root.join("2026-10-01_00-00-02");
+        for (dir, text) in [(&only_view, view), (&played, "{\"kind\":\"read\"}\n"), (&framed, view)] {
+            std::fs::create_dir_all(dir).unwrap();
+            std::fs::write(dir.join("log.jsonl"), text).unwrap();
+        }
+        std::fs::write(framed.join("frame-0001.jpg"), b"").unwrap();
+        let later = SystemTime::now() + STARTUP_ONLY_AGE + Duration::from_secs(60);
+        prune(&root, true, KEEP_GAMES, &root.join("none"), SystemTime::now());
+        assert!(only_view.is_dir(), "too new now");
+        prune(&root, true, KEEP_GAMES, &only_view, later);
+        assert!(only_view.is_dir(), "the folder being written");
+        prune(&root, true, KEEP_GAMES, &root.join("none"), later);
+        assert!(!only_view.exists() && played.is_dir() && framed.is_dir());
+        // An empty log and a log over the size read are kept on disk too.
+        let empty = root.join("2026-10-01_00-00-03");
+        let big = root.join("2026-10-01_00-00-04");
+        std::fs::create_dir_all(&empty).unwrap();
+        std::fs::write(empty.join("log.jsonl"), b"").unwrap();
+        std::fs::create_dir_all(&big).unwrap();
+        std::fs::write(big.join("log.jsonl"), view.repeat((STARTUP_ONLY_BYTES as usize) / view.len() + 1)).unwrap();
+        prune(&root, true, KEEP_GAMES, &root.join("none"), later);
+        assert!(empty.join("log.jsonl").is_file() && big.join("log.jsonl").is_file());
+        // A file that came into the folder after the check: the log goes, the folder and the new file stay.
+        let late = root.join("2026-10-01_00-00-05");
+        std::fs::create_dir_all(&late).unwrap();
+        std::fs::write(late.join("log.jsonl"), view).unwrap();
+        let found = startup_only_folders(&root, &root.join("none"), later);
+        assert_eq!(found, std::slice::from_ref(&late));
+        std::fs::write(late.join("frame-0001.jpg"), b"").unwrap();
+        remove_startup_only(&found[0]);
+        assert!(late.join("frame-0001.jpg").is_file(), "remove_dir does not take a folder that is not empty");
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }

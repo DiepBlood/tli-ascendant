@@ -62,8 +62,8 @@ English summary at the [end of this page](#english).
 
 常用功能：
 
-- **自動讀取**（預設開啟）：畫面一有變化就讀取。F7 切換點擊穿透、F8 開關自動讀取、F9 讀一次。遊戲以系統管理員身分執行時，這三個鍵在遊戲畫面上沒有作用：先切到別的視窗再按，或也用系統管理員身分執行 Ascendant（右鍵 → 以系統管理員身分執行）。快捷鍵可以在設定頁「快捷鍵」更改。
-- **點擊穿透**（F7）：開啟後，點在視窗的空白處會穿到遊戲，按鈕、格子等元件仍然可以點。
+- **自動讀取**（預設開啟）：畫面一有變化就讀取。F8 開關自動讀取、F9 讀一次。遊戲以系統管理員身分執行時，F8／F9 在遊戲畫面上沒有作用，狀態列會提示：先切到別的視窗再按，或按提示裡的「以系統管理員身分重新啟動」，或在設定頁「建議與輔助」開啟「以系統管理員身分啟動」（之後每次啟動都會跳出 Windows 的確認視窗）。快捷鍵可以在設定頁「建議與輔助」更改。
+- **點擊穿透**：側欄「穿透」燈點一下切換，開著時亮綠燈。開啟後，點在視窗的空白處會穿到遊戲，按鈕、格子和側欄等元件仍然可以點。
 - **版面**：自動／完整／緊湊。「自動」會在視窗較矮時切到緊湊版。
 - **字體大小**：標準／大／特大。
 - **標示要點擊的位置**（預設關閉）：在遊戲畫面上用綠色框標出建議要點的格子、卡片或按鈕。
@@ -93,7 +93,7 @@ English summary at the [end of this page](#english).
 
 設定頁的「**保留對局紀錄**」（預設開啟）關閉時不寫紀錄，本局頁和匯出也就沒有資料。
 
-塔羅斯與渴血各只保留最近 10 局完成的對局（文字紀錄與截圖都完整保留），更舊的資料夾會整個自動刪除；完成的對局不滿 10 局時不會刪除任何東西。設定頁的「**保留全部紀錄**」（預設關閉）開啟後，所有紀錄與截圖都會保留、不會自動刪除，請自行注意磁碟空間。
+塔羅斯與渴血各只保留最近 10 局完成的對局（文字紀錄與截圖都完整保留），更舊的資料夾會整個自動刪除；完成的對局不滿 10 局時不會刪除任何東西。設定頁的「**保留全部紀錄**」（預設關閉）開啟後，所有紀錄與截圖都會保留、不會自動刪除（只有開關程式、沒有任何讀取的空資料夾除外），請自行注意磁碟空間。
 
 要回報讀錯或建議不合理時，請用下方「回報問題」的方法，不需要自己去壓縮資料夾。
 
@@ -160,14 +160,14 @@ A run is reviewed in the language it was played in; when the setting differs, th
 - Run `Ascendant.exe`. The first time, it offers to install for the current Windows user (Start menu, desktop shortcut and an Apps & features entry, no administrator rights); "Not now" runs it where it is, and Settings keeps an "Install" button.
 - Play. The window stays above the game and opens where you last moved it, and it switches between the Tartarus and Vorax boards by itself.
 - Turn on the game's log (Settings → Other → Enable log) and keep auto read on: Vorax switching and the Progress tab read `UE_game.log`; if it is not found, pick it under Settings → "Game log" with "Choose...".
-- Auto read (on by default) reads whenever the screen changes. F7 toggles click-through, F8 auto read, F9 reads once. When the game runs as administrator, these keys do nothing while it is in front: switch to another window first, or run Ascendant as administrator too (right-click → Run as administrator). The keys can be changed under Settings → "Hotkeys".
-- Click-through (F7): clicks on the window's empty space go to the game, while its buttons and cells still take clicks.
+- Auto read (on by default) reads whenever the screen changes. F8 toggles auto read, F9 reads once. When the game runs as administrator, F8 and F9 do nothing while it is in front, and the status bar says so: switch to another window first, press "Restart as administrator" on that notice, or turn on "Start as administrator" under Settings → "Advice and controls" (Windows then asks at every start). The keys can be changed under Settings → "Advice and controls".
+- Click-through: click the "Through" light in the side rail to turn it on or off; it is green while on. Clicks on the window's empty space then go to the game, while its buttons, cells and the side rail still take clicks.
 - "Layout": Auto, Full or Compact (Auto switches to Compact when the window is short). "Text size": Standard, Large or Extra large. "Highlight where to click" (off by default) puts a green box on the advised cell, card or button in the game. "Opacity" goes down to 50%.
 - Progress tab: Vorax and Tartarus counts and games left, read from the game log.
 - Run tab: after a game, whether it came down to luck or decisions, and the most costly step. The picker at the top reviews an earlier finished run ("Latest run" follows each game as it ends), and "Export this run" below exports the same run.
 - A misread cell can be clicked to correct it.
 - Settings live in `%APPDATA%\Ascendant\settings.json`; "Restore defaults" goes back to the defaults. Log sharing is off in this build.
-- "Keep a run log" (on by default) must stay on for the Run tab and the export. Run logs go to `%APPDATA%\Ascendant\runs` and `vorax`, where Tartarus and Vorax each keep only their newest 10 finished games (`log.jsonl`, `frame-*.jpg` and other screenshots) and older folders are deleted automatically, unless "Keep all run logs" (off by default) is turned on, which keeps every log and screenshot (watch your disk space).
+- "Keep a run log" (on by default) must stay on for the Run tab and the export. Run logs go to `%APPDATA%\Ascendant\runs` and `vorax`, where Tartarus and Vorax each keep only their newest 10 finished games (`log.jsonl`, `frame-*.jpg` and other screenshots) and older folders are deleted automatically, unless "Keep all run logs" (off by default) is turned on, which keeps every log and screenshot (watch your disk space); only empty folders from opening and closing Ascendant without any read are still deleted.
 
 **Updates**: "Check for updates at start" (on by default) asks GitHub for the latest release at start and then every hour while Ascendant is open, or when you press "Check now"; it only talks to GitHub and sends no logs. Later checks send the last answer's ETag, so an unchanged release costs GitHub only a "not modified"; when GitHub cannot be reached or asks to slow down, Ascendant waits for the next hourly turn instead of retrying. A new version found while Ascendant is open only puts a small red dot on the Settings button: nothing pops up and nothing moves (the top line stays as it is, and while you are on the settings page its "New version" group and check result change only once you leave it). After an update, the top line says "Updated to X.Y.Z" with "What's new" until you press × or play a game, and "What's new" next to the version in About shows them again any time inside the Ascendant window: every version's notes in the window's language, newest first, the current one open and older ones folded; ×, Esc or switching pages closes it. The notes are built into the program (the same text as each signed `RELEASE-NOTES.txt`), so a fresh install sees the whole history too, without the network and without opening a browser; when a new version is found, its notes come first, marked "not installed yet", and only they start open (the current version's are folded too). A newer version is verified during the check itself: the Ed25519 signature of `SHA256SUMS.txt` (`SHA256SUMS.txt.sig`) must verify against the public key built into Ascendant, the signed list must be for that version, GitHub's digest of `Ascendant.exe` must match it, the version must be newer (no downgrades), and every connection must go to GitHub's hosts. Only then is "New version X.Y.Z" shown with its release notes, taken from the signed `RELEASE-NOTES.txt`, never from the GitHub release page; otherwise there is no notice and the settings page says "This version failed verification. Do not install it." Without a network it only says to try again later. The update is downloaded only when you press "Update", verified again (including the exe's SHA-256) and only then swapped in; if the download or any check fails, the current version is kept (should replacing the file itself fail, Ascendant says what to do: rename `Ascendant.old.exe` back, or start Ascendant again). A stolen GitHub account alone cannot ship an update that installs, and Ascendant never needs you to download and replace files by hand. The About section shows the built-in key's fingerprint, which should match the published one; see [SECURITY.md](SECURITY.md) for checking downloaded files.
 

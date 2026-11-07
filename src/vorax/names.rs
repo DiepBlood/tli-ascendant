@@ -126,6 +126,16 @@ fn extra() -> Option<Value> {
 fn merge(base: &mut Value, extra: &Value) -> Vec<String> {
     const CARDS: [&str; 4] = ["potions", "unsimulatedPotions", "instruments", "protocols"];
     let mut changes = Vec::new();
+    // The Traditional Chinese name of every card already in the table and whose it is: a name the supplementary
+    // file gives another card is not applied (two cards with one name could not be told apart).
+    let mut taken: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for section in CARDS {
+        for (key, v) in base[section].as_object().into_iter().flatten() {
+            if let Some(zh) = v["zh"].as_str().map(str::trim).filter(|z| !z.is_empty()) {
+                taken.insert(zh.to_string(), format!("{section}.{key}"));
+            }
+        }
+    }
     for (section, entries) in extra.as_object().into_iter().flatten() {
         let (Some(entries), Some(target)) = (entries.as_object(), base.get_mut(section).and_then(Value::as_object_mut)) else { continue };
         for (key, fields) in entries {
@@ -134,6 +144,19 @@ fn merge(base: &mut Value, extra: &Value) -> Vec<String> {
                     // Cards only change the Traditional Chinese name: changing the English name would no longer
                     // match the solver's id.
                     for (field, v) in fields.iter().filter(|(f, _)| !CARDS.contains(&section.as_str()) || f.as_str() == "zh") {
+                        let here = format!("{section}.{key}");
+                        if CARDS.contains(&section.as_str())
+                            && let Some(zh) = v.as_str().map(str::trim).filter(|z| !z.is_empty())
+                            && let Some(other) = taken.get(zh).filter(|o| **o != here)
+                        {
+                            changes.push(format!("{here}.zh：{v} 和 {other} 重名，未套用"));
+                            continue;
+                        }
+                        if CARDS.contains(&section.as_str())
+                            && let Some(zh) = v.as_str().map(str::trim).filter(|z| !z.is_empty())
+                        {
+                            taken.insert(zh.to_string(), here.clone());
+                        }
                         let old = entry.insert(field.clone(), v.clone());
                         if old.as_ref() != Some(v) {
                             changes.push(format!("{section}.{key}.{field}：{} → {v}", old.map_or("（無）".to_string(), |o| o.to_string())));
@@ -157,7 +180,9 @@ fn parse_value(z: Value) -> Names {
     let mut cards = Vec::new();
     for (section, category) in [("potions", Category::Potion), ("unsimulatedPotions", Category::Potion), ("instruments", Category::Instrument), ("protocols", Category::Protocol)] {
         for (key, v) in z[section].as_object().into_iter().flatten() {
-            let en = v["en"].as_str().unwrap_or(key).to_string();
+            // A protocol whose English name is not known has `en` empty and its Traditional Chinese name as the key:
+            // the key stands in, so two such protocols are never the same card.
+            let en = v["en"].as_str().filter(|s| !s.is_empty()).unwrap_or(key).to_string();
             let id = match category {
                 Category::Potion => d.potion_by_name(&en),
                 Category::Instrument => d.instrument_by_name(&en),
@@ -228,7 +253,12 @@ mod tests {
         let n = names();
         assert_eq!(n.cards.iter().filter(|c| c.category == Category::Potion && c.id.is_some()).count(), 42);
         assert_eq!(n.cards.iter().filter(|c| c.category == Category::Instrument && c.id.is_some()).count(), 25);
-        assert_eq!(n.cards.iter().filter(|c| c.category == Category::Protocol).count(), 13);
+        // 13 from the upstream name file, and three seen in play whose English names are not known (keyed by their
+        // Traditional Chinese name, which stands in for `en`).
+        assert_eq!(n.cards.iter().filter(|c| c.category == Category::Protocol).count(), 16);
+        for zh in ["表皮移植實驗", "生命復甦術", "黑膽汁療法"] {
+            assert!(n.cards.iter().any(|c| c.category == Category::Protocol && c.en == zh && c.zh.as_deref() == Some(zh)), "{zh}");
+        }
         let mut zh: Vec<&str> = n.cards.iter().filter_map(|c| c.zh.as_deref()).collect();
         let all = zh.len();
         zh.sort_unstable();
@@ -256,5 +286,18 @@ mod tests {
         assert!(!n.cards.iter().any(|c| c.en == "Not A Potion"));
         assert_eq!(n.cards.len(), names().cards.len());
         assert!(n.monsters.iter().any(|(m, a)| m == "測試怪" && *a == Archetype::Pest));
+    }
+
+    /// A name the supplementary file gives a card that another card already has is not applied (here the unnamed
+    /// Yellow Bile Therapy given `黑膽汁療法`, which the name file has as its own protocol); its own name again is.
+    #[test]
+    fn the_extra_file_cannot_give_two_cards_one_name() {
+        let mut z: Value = serde_json::from_str(RAW).unwrap();
+        let extra = serde_json::json!({ "protocols": { "Yellow Bile Therapy": { "zh": "黑膽汁療法" }, "Trepanation": { "zh": "顱骨鑽孔術" } } });
+        let changes = merge(&mut z, &extra);
+        assert_eq!(changes.len(), 1, "{changes:?}");
+        assert!(changes[0].contains("重名") && changes[0].contains("protocols.黑膽汁療法"), "{changes:?}");
+        let n = parse_value(z);
+        assert!(n.cards.iter().any(|c| c.en == "Yellow Bile Therapy" && c.zh.is_none()));
     }
 }
