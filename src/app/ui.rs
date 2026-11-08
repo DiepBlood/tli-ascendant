@@ -629,6 +629,8 @@ impl AscendantApp {
             "mark": self.mark.as_ref().is_some_and(Mark::shown),
             "mark_at": self.mark.as_ref().and_then(Mark::at),
             "hidden": self.mark_hidden,
+            // Which window was in front instead of the game (diagnostics, see `capture::front_window`).
+            "front": if self.mark_hidden == Some("behind") { super::capture::front_window() } else { None },
             "screen": reading.map(|r| format!("{:?}", r.screen)),
             "line": reading.and_then(|r| r.kept_lines().first().map(|l| l.to_string())),
             // A Cage Fight's chain badges on the game, cell numbers in order.
@@ -2026,6 +2028,78 @@ struct Floats {
     whats_new: Option<WhatsNew>,
     tools: bool,
     health: bool,
+    /// The one open as a window of its own: where it was opened and where it was last seen (see [`Placing`]).
+    placing: Option<Placing>,
+}
+
+/// One of the small windows that open as a window of the system's own (1.1.0, the user 2026-11-08: they floated inside
+/// the main window and could not be dragged out of it). Each is its own always-on-top window of fixed size, not
+/// resizable and without minimize or maximize, out of the taskbar; it can be dragged anywhere, and where the player
+/// leaves it is kept in the settings by its key (see [`Settings::float_pos`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Float {
+    WhatsNew,
+    Health,
+    Tools,
+}
+
+impl Float {
+    /// The key its place is kept under in the settings.
+    fn key(self) -> &'static str {
+        match self {
+            Float::WhatsNew => "whats_new",
+            Float::Health => "run_check",
+            Float::Tools => "tools",
+        }
+    }
+
+    fn id(self) -> egui::ViewportId {
+        egui::ViewportId::from_hash_of(("ascendant-float", self.key()))
+    }
+
+    /// Its inner size in points, fixed so the layout never moves (the text wraps to it and scrolls when longer); the
+    /// width is that of the floating windows before (at most 360, see [`popup_width`]).
+    fn size(self) -> Vec2 {
+        match self {
+            Float::WhatsNew => Vec2::new(360.0, 440.0),
+            Float::Health => Vec2::new(360.0, 300.0),
+            Float::Tools => Vec2::new(250.0, 300.0),
+        }
+    }
+}
+
+/// The small window open as a window of its own: which, the position (points) it was created at, which stays the same
+/// for its whole life (a builder that changed position would move it back while dragged), and its outer top left
+/// (physical pixels) as last seen, with whether a move is not saved yet.
+struct Placing {
+    which: Float,
+    at: Option<Pos2>,
+    last: Option<[i32; 2]>,
+    unsaved: bool,
+    /// When it opened, or was last moved by the program (see [`FLOAT_SETTLES`]).
+    opened: Instant,
+}
+
+/// How long after a small window opens, or the program moves it, its position changing is not taken as a move of the
+/// player's.
+const FLOAT_SETTLES: Duration = Duration::from_millis(300);
+
+/// Ascendant's icon for the small windows' title bars, decoded once.
+fn float_icon() -> Option<std::sync::Arc<egui::IconData>> {
+    static ICON: std::sync::OnceLock<Option<std::sync::Arc<egui::IconData>>> = std::sync::OnceLock::new();
+    ICON.get_or_init(|| eframe::icon_data::from_png_bytes(include_bytes!("../../assets/icon.png")).ok().map(std::sync::Arc::new)).clone()
+}
+
+/// Where a small window of `size` (points) opens when the player has not placed it: over the main window's page,
+/// centred across it under the status bar, where it floated before (`main` the main window's outer rect, points).
+fn float_default_at(main: Rect, size: Vec2) -> Pos2 {
+    Pos2::new(main.min.x + RAIL / 2.0 + (main.width() - size.x) / 2.0, main.min.y + 30.0)
+}
+
+/// Whether the outer top left `now` (physical pixels) of a small window, seen `last` the frame before, is a move the
+/// player made: a change of more than 2 pixels; the first sight of a window is none.
+fn float_moved(last: Option<[i32; 2]>, now: [i32; 2]) -> bool {
+    last.is_some_and(|l| (l[0] - now[0]).abs() > 2 || (l[1] - now[1]).abs() > 2)
 }
 
 impl Floats {
@@ -2077,7 +2151,7 @@ fn esc_closes(pressed: bool, busy: bool) -> bool {
 /// cover, so they are as trusted as the program and a fresh install sees the whole history. A new version adds its
 /// file here.
 const RELEASE_NOTES: &[(&str, &str)] =
-    &[("1.0.4", include_str!("../../data/release-notes/1.0.4.txt")), ("1.0.3", include_str!("../../data/release-notes/1.0.3.txt")), ("1.0.2", include_str!("../../data/release-notes/1.0.2.txt")), ("1.0.1", include_str!("../../data/release-notes/1.0.1.txt")), ("1.0.0", include_str!("../../data/release-notes/1.0.0.txt"))];
+    &[("1.1.0", include_str!("../../data/release-notes/1.1.0.txt")), ("1.0.4", include_str!("../../data/release-notes/1.0.4.txt")),("1.0.3", include_str!("../../data/release-notes/1.0.3.txt")), ("1.0.2", include_str!("../../data/release-notes/1.0.2.txt")), ("1.0.1", include_str!("../../data/release-notes/1.0.1.txt")), ("1.0.0", include_str!("../../data/release-notes/1.0.0.txt"))];
 
 /// Which of the versions "What's new" lists (in its order, each with whether it is a release not installed yet) starts
 /// unfolded: the release not installed yet when there is one, else the `running` version, else the newest.
@@ -2694,6 +2768,7 @@ impl eframe::App for AscendantApp {
         self.tools_window(&ui.ctx().clone());
         self.whats_new_window(&ui.ctx().clone());
         self.health_window(&ui.ctx().clone());
+        self.forget_closed_float();
         if std::mem::take(&mut self.pick_log) {
             self.pick_game_log(frame);
         }
@@ -3099,26 +3174,108 @@ impl AscendantApp {
         }
     }
 
+    /// Shows `which` as a window of its own (see [`Float`]), titled `title`, its page drawn by `body` and scrolled when
+    /// longer than the window; gives whether it stays open. Its "x" closes it, and with `esc` so does Esc pressed while
+    /// it has the keyboard (not while a text box or a hotkey recording has the keys, see [`esc_closes`]); the caller
+    /// still checks Esc pressed in the main window, as before. It opens where the player last left it while that is on
+    /// a monitor, else over the main window where it floated before; a move is saved once the window stops moving, or
+    /// as it closes. Fonts, style and the text scale are the main window's (one egui context); the system's scale is
+    /// the monitor's it is on. When the main window closes, the program ends and this window with it.
+    fn float_viewport(&mut self, ctx: &egui::Context, which: Float, title: &str, esc: bool, mut body: impl FnMut(&mut Self, &mut egui::Ui)) -> bool {
+        if self.floats.placing.as_ref().is_none_or(|p| p.which != which) {
+            let ppp = physical_per_point(ctx);
+            let saved = self.settings.float_pos.get(which.key()).copied().filter(|&[x, y]| on_screen(x + 20, y + 20));
+            let at = match saved {
+                Some([x, y]) => Some(Pos2::new(x as f32, y as f32) / ppp),
+                None => ctx.input(|i| i.viewport().outer_rect).map(|main| float_default_at(main, which.size())),
+            };
+            self.floats.placing = Some(Placing { which, at, last: None, unsaved: false, opened: Instant::now() });
+        } else if !self.settings.float_pos.contains_key(which.key())
+            && let Some(main) = ctx.input(|i| i.viewport().outer_rect)
+            && let Some(p) = self.floats.placing.as_mut()
+        {
+            // One the player has never placed stays over the main window as that moves (it is placed at start, by
+            // `place`, after the first frames): the builder's new position moves it, which is no move of the player's.
+            let at = float_default_at(main, which.size());
+            if p.at.is_none_or(|was| (was - at).length() > 1.0) {
+                (p.at, p.last, p.opened) = (Some(at), None, Instant::now());
+            }
+        }
+        let mut builder = egui::ViewportBuilder::default()
+            .with_title(title)
+            .with_inner_size(which.size())
+            .with_resizable(false)
+            .with_minimize_button(false)
+            .with_maximize_button(false)
+            .with_always_on_top()
+            .with_taskbar(false);
+        if let Some(at) = self.floats.placing.as_ref().and_then(|p| p.at) {
+            builder = builder.with_position(at);
+        }
+        if let Some(icon) = float_icon() {
+            builder = builder.with_icon(icon);
+        }
+        let recording = self.recording.is_some();
+        let (close, seen) = ctx.show_viewport_immediate(which.id(), builder, |ui, _| {
+            let busy = ui.ctx().text_edit_focused() || recording;
+            let close = ui.input(|i| i.viewport().close_requested()) || (esc && esc_closes(ui.input(|i| i.key_pressed(egui::Key::Escape)), busy));
+            egui::CentralPanel::default().show(ui, |ui| {
+                egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| body(self, ui));
+            });
+            let ppp = physical_per_point(ui.ctx());
+            let seen = ui.input(|i| i.viewport().outer_rect.filter(|_| i.viewport().minimized != Some(true)));
+            (close, seen.map(|r| [(r.min.x * ppp).round() as i32, (r.min.y * ppp).round() as i32]))
+        });
+        let mut save = false;
+        if let Some(p) = self.floats.placing.as_mut().filter(|p| p.which == which) {
+            if let Some(now) = seen {
+                // Windows can still settle the new window in its first frames: that is no move of the player's.
+                if float_moved(p.last, now) && p.opened.elapsed() >= FLOAT_SETTLES {
+                    self.settings.float_pos.insert(which.key().to_string(), now);
+                    p.unsaved = true;
+                } else if p.unsaved {
+                    (p.unsaved, save) = (false, true);
+                }
+                p.last = Some(now);
+            }
+            if close && p.unsaved {
+                (p.unsaved, save) = (false, true);
+            }
+            // A window at rest draws no frame: one more comes to see the move has stopped, and save it.
+            if p.unsaved {
+                ctx.request_repaint_after(Duration::from_millis(250));
+            }
+        }
+        if save {
+            self.save();
+        }
+        !close
+    }
+
+    /// With no small window open, its placing is dropped (a move not saved yet, which closing it saves, is saved here
+    /// too: the window can close by a page switch or by another opening), so the next one opens afresh.
+    fn forget_closed_float(&mut self) {
+        let open = match self.floats.placing.as_ref().map(|p| p.which) {
+            Some(Float::WhatsNew) => self.floats.whats_new.is_some(),
+            Some(Float::Health) => self.floats.health,
+            Some(Float::Tools) => self.floats.tools,
+            None => return,
+        };
+        if !open && let Some(p) = self.floats.placing.take()
+            && p.unsaved
+        {
+            self.save();
+        }
+    }
+
     /// The edit window for instruments and theme (formerly a feature of the Run tab, behaviour unchanged:
-    /// set_tools, set_theme).
+    /// set_tools, set_theme), a window of its own (see [`Float`]). Esc does not close it, as before.
     fn tools_window(&mut self, ctx: &egui::Context) {
         if !self.floats.tools {
             return;
         }
-        let mut open = true;
-        let (max_w, max_h) = popup_limits(ctx);
-        egui::Window::new(trf!("{}s and run theme", instrument_term()))
-            .id(egui::Id::unique("ascendant-tools"))
-            .open(&mut open)
-            .collapsible(false)
-            .resizable(false)
-            .max_width(max_w)
-            .max_height(max_h)
-            .vscroll(true)
-            .constrain(true)
-            .anchor(Align2::CENTER_TOP, [RAIL / 2.0, 30.0])
-            .show(ctx, |ui| self.tools_editor(ui));
-        if !open {
+        let title = trf!("{}s and run theme", instrument_term());
+        if !self.float_viewport(ctx, Float::Tools, &title, false, |app, ui| app.tools_editor(ui)) {
             self.floats.tools = false;
         }
     }
@@ -4007,29 +4164,17 @@ impl AscendantApp {
     /// release's own verified notes (the signed RELEASE-NOTES.txt the check verified) come first, marked not installed
     /// yet, and only they start unfolded: the running version's notes, already read, start folded with the older ones
     /// so the new ones are not pushed down. Otherwise the running version (the latest update) starts unfolded and the
-    /// older ones folded. Nothing comes from the GitHub page. A window of fixed width anchored where the other windows
-    /// are, so the main window's layout does not move; the text wraps, can be selected and copied, and scrolls when it
-    /// is taller than the window allows. Its "x" or Esc closes it.
+    /// older ones folded. Nothing comes from the GitHub page. A window of its own of fixed size (see [`Float`]), so the
+    /// main window's layout does not move; the text wraps, can be selected and copied, and scrolls when it is taller
+    /// than the window. Its "x" or Esc (in it or in the main window) closes it.
     fn whats_new_window(&mut self, ctx: &egui::Context) {
         let Some(w) = &self.floats.whats_new else { return };
-        let pending = w.pending.as_ref().map(|p| (p, true));
-        let kept = self.notes_history.iter().filter(|n| w.pending.as_ref().is_none_or(|p| p.version != n.version)).map(|n| (n, false));
-        let shown: Vec<(&update::SavedNotes, bool)> = pending.into_iter().chain(kept).collect();
-        let unfolded = unfolded_notes(&shown.iter().map(|&(n, pending)| (n.version.as_str(), pending)).collect::<Vec<_>>(), env!("CARGO_PKG_VERSION"));
-        let mut open = true;
-        let (max_w, max_h) = popup_limits(ctx);
-        egui::Window::new(tr("What's new"))
-            .id(egui::Id::unique("ascendant-whats-new"))
-            .open(&mut open)
-            .collapsible(false)
-            .resizable(false)
-            .min_width(max_w)
-            .max_width(max_w)
-            .max_height(max_h)
-            .vscroll(true)
-            .constrain(true)
-            .anchor(Align2::CENTER_TOP, [RAIL / 2.0, 30.0])
-            .show(ctx, |ui| {
+        let opened = w.opened;
+        let pending = w.pending.clone().map(|p| (p, true));
+        let kept = self.notes_history.iter().filter(|n| w.pending.as_ref().is_none_or(|p| p.version != n.version)).map(|n| (n.clone(), false));
+        let shown: Vec<(update::SavedNotes, bool)> = pending.into_iter().chain(kept).collect();
+        let unfolded = unfolded_notes(&shown.iter().map(|(n, pending)| (n.version.as_str(), *pending)).collect::<Vec<_>>(), env!("CARGO_PKG_VERSION"));
+        let open = self.float_viewport(ctx, Float::WhatsNew, tr("What's new"), true, |app, ui| {
                 ui.set_width(ui.available_width());
                 // Only a build with the real release key can say so: a build from source without it verified nothing.
                 if update::has_release_key() {
@@ -4039,17 +4184,18 @@ impl AscendantApp {
                 for (k, (n, pending)) in shown.iter().enumerate() {
                     let head = if *pending { trf!("{} (not installed yet)", n.version) } else { n.version.clone() };
                     egui::CollapsingHeader::new(RichText::new(head).strong().color(if *pending { ACCENT } else { theme::TEXT }))
-                        .id_salt(("whats-new", w.opened, &n.version, *pending))
+                        .id_salt(("whats-new", opened, &n.version, *pending))
                         .default_open(Some(k) == unfolded)
                         .show(ui, |ui| {
                             ui.add(egui::Label::new(RichText::new(notes_in(&n.notes, lang::lang().key())).small()).wrap().selectable(true));
                         });
                 }
                 // For testing (ASCENDANT_PREVIEW_SCROLL=bottom): the window's list scrolled to its end too.
-                if self.preview_bottom {
+                if app.preview_bottom {
                     ui.scroll_to_cursor(Some(Align::BOTTOM));
                 }
             });
+        // Esc pressed in the main window closes it too, as before it was a window of its own.
         if !open || esc_closes(ctx.input(|i| i.key_pressed(egui::Key::Escape)), self.esc_busy) {
             self.floats.whats_new = None;
         }
@@ -4057,32 +4203,19 @@ impl AscendantApp {
 
     /// The run check window (2026-11-08, the user: the status bar's line showed the issues only on hover): the run's
     /// folder name (its start, UTC), the summary and every issue, as health.txt has them, in text that wraps and can be
-    /// selected and copied. Anchored with the other floating windows, one at a time (see [`Floats`]); it scrolls when
-    /// taller than the window allows, and its "x" or Esc closes it (not while a text box or a hotkey recording has the
-    /// keys, see [`esc_closes`]). Closed when there is no run check to show.
+    /// selected and copied. A window of its own (see [`Float`]), one at a time with the others (see [`Floats`]); it
+    /// scrolls when taller than the window, and its "x" or Esc (in it or in the main window) closes it (not while a text
+    /// box or a hotkey recording has the keys, see [`esc_closes`]). Closed when there is no run check to show.
     fn health_window(&mut self, ctx: &egui::Context) {
         if !self.floats.health {
             return;
         }
-        let Some(report) = &self.session.health else {
+        let Some(report) = self.session.health.clone() else {
             self.floats.health = false;
             return;
         };
         let folder = self.session.health_dir.as_ref().and_then(|d| d.file_name()).map(|n| n.to_string_lossy().into_owned());
-        let mut open = true;
-        let (max_w, max_h) = popup_limits(ctx);
-        egui::Window::new(tr("Run check"))
-            .id(egui::Id::unique("ascendant-run-check"))
-            .open(&mut open)
-            .collapsible(false)
-            .resizable(false)
-            .min_width(max_w)
-            .max_width(max_w)
-            .max_height(max_h)
-            .vscroll(true)
-            .constrain(true)
-            .anchor(Align2::CENTER_TOP, [RAIL / 2.0, 30.0])
-            .show(ctx, |ui| {
+        let open = self.float_viewport(ctx, Float::Health, tr("Run check"), true, |_, ui| {
                 ui.set_width(ui.available_width());
                 if let Some(folder) = &folder {
                     theme::fine_print(ui, &trf!("Run {}", folder), MUTED);
@@ -4094,6 +4227,7 @@ impl AscendantApp {
                     ui.add(egui::Label::new(RichText::new(format!("- {issue}")).small()).wrap().selectable(true));
                 }
             });
+        // Esc pressed in the main window closes it too, as before it was a window of its own.
         if !open || esc_closes(ctx.input(|i| i.key_pressed(egui::Key::Escape)), self.esc_busy) {
             self.floats.health = false;
         }
@@ -4284,6 +4418,10 @@ impl AscendantApp {
         self.preview_status_open = std::env::var("ASCENDANT_PREVIEW_STATUS_OPEN").is_ok_and(|v| v == "1");
         self.restoring = std::env::var("ASCENDANT_PREVIEW_RESTORE").is_ok_and(|v| v == "1");
         self.floats.tools = std::env::var("ASCENDANT_PREVIEW_TOOLS").is_ok_and(|v| v == "1");
+        // ASCENDANT_PREVIEW_WHATS_NEW=1: "What's new" open from the start, as its button opens it.
+        if std::env::var("ASCENDANT_PREVIEW_WHATS_NEW").is_ok_and(|v| v == "1") {
+            self.open_whats_new(false);
+        }
         // ASCENDANT_PREVIEW_HEALTH=issues or clear: a made-up run check (see `preview_health`) with its window open.
         if let Ok(v) = std::env::var("ASCENDANT_PREVIEW_HEALTH")
             && matches!(v.as_str(), "issues" | "clear")
@@ -4495,7 +4633,8 @@ impl AscendantApp {
 ///   deleting the player's run logs).
 /// - Back to default: `read_hotkey`, `auto_hotkey`, `click_through` (off), `opacity`,
 ///   `window_title`, `rollouts`, `auto_read`, `auto_place`, `window_pos` and `window_size` (back to 296×520 on
-///   the next launch and placed by the game panel again), `observe`, `highlight`, `show_value`, `font_scale` (standard),
+///   the next launch and placed by the game panel again), `float_pos` (the small windows open over the main window
+///   again), `observe`, `highlight`, `show_value`, `font_scale` (standard),
 ///   `vorax_enabled`, `vorax_rollouts`, `vorax_learn`, `vorax_strips`, `game_log` (automatic again), `start_as_admin`
 ///   ("Start as administrator", off).
 ///
@@ -6139,7 +6278,7 @@ mod tests {
         let custom: Settings = serde_json::from_str(
             r#"{"read_hotkey":"F1","auto_hotkey":"F2","click_through":true,"start_as_admin":true,"opacity":0.7,
             "window_title":"Game","rollouts":800,"tools":["lion_trap"],"tools_days":12,"theme":3,"auto_read":false,
-            "auto_place":false,"window_pos":[10,20],"window_size":[300.0,600.0],"run_log":false,"keep_all_logs":true,"observe":true,
+            "auto_place":false,"window_pos":[10,20],"window_size":[300.0,600.0],"float_pos":{"tools":[5,6]},"run_log":false,"keep_all_logs":true,"observe":true,
             "check_updates":false,"updated_seen":"1.0.1","offer_install":false,"share_logs":true,"shared_from":"2026-11-01_00-00-00",
             "install_id":"abc","desktop_shortcut":true,"highlight":true,"show_value":false,"language":"zh-TW","vorax_enabled":false,
             "vorax_rollouts":1024,"vorax_learn":false,"vorax_strips":true,"font_scale":1.3,"layout":"compact",
@@ -6230,6 +6369,28 @@ mod tests {
         assert!(floats.health && !floats.tools, "the run check closes the instruments window");
         floats.open_whats_new(WhatsNew::new(None));
         assert!(!floats.health && floats.whats_new.is_some(), "What's new closes the run check");
+    }
+
+    /// The small windows of their own (1.1.0): distinct ids and settings keys, a fixed size within the old floating
+    /// width; with no place saved one opens over the main window's page, centred across it under the status bar; only
+    /// a change of more than 2 pixels after the first sight is a move to save.
+    #[test]
+    fn small_windows_place_and_move() {
+        let all = [Float::WhatsNew, Float::Health, Float::Tools];
+        for (k, a) in all.iter().enumerate() {
+            assert!(a.size().x <= 360.0 && a.size().y >= 200.0);
+            for b in &all[k + 1..] {
+                assert_ne!(a.id(), b.id());
+                assert_ne!(a.key(), b.key());
+            }
+        }
+        let main = Rect::from_min_size(Pos2::new(1700.0, 200.0), Vec2::new(312.0, 559.0));
+        let at = float_default_at(main, Float::Tools.size());
+        assert_eq!(at, Pos2::new(1700.0 + RAIL / 2.0 + (312.0 - 250.0) / 2.0, 230.0));
+        assert!(!float_moved(None, [10, 10]), "the first sight is no move");
+        assert!(!float_moved(Some([10, 10]), [12, 8]));
+        assert!(float_moved(Some([10, 10]), [13, 10]));
+        assert!(float_moved(Some([10, 10]), [10, -300]));
     }
 
     /// Esc closes "What's new" only when no text box has the keyboard and no hotkey is being recorded.

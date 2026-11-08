@@ -76,8 +76,8 @@ pub const TEXT: &[(&str, &str)] = &[
     // The Vorax endgame battle card.
     ("Endgame battle", "終局戰鬥"),
     ("Endgame battle \u{b7} wave {}/{}", "終局戰鬥 第 {}/{} 波"),
-    ("Activity {} + bonus {} (+{}%)", "活性 {} \u{ff0b} 加成 {}\u{ff08}+{}%\u{ff09}"),
     ("Activity {} + bonus {}", "活性 {} \u{ff0b} 加成 {}"),
+    ("drops +{}%", "掉落 +{}%"),
     ("next {}", "下一格 {}"),
     ("all rewards taken", "獎勵全拿"),
     ("Readings are noisy during the battle; most accurate at its end", "戰鬥中讀數有雜訊，結束時最準"),
@@ -99,6 +99,9 @@ pub const TEXT: &[(&str, &str)] = &[
     ("How far behind the first; grey means within the simulation error, so either is about the same", "和第一名差多少；灰色表示在模擬誤差內，選哪個都差不多"),
     ("Reach 840k", "達 840k"),
     ("Average", "平均"),
+    // Vorax: the tanks column of the top three (the tanks each card acts on).
+    ("Tanks", "水箱"),
+    ("The tanks the card acts on are framed in gold", "金框是這張卡作用的水箱"),
     // Vorax: a card the solver always takes by its rule, in place of its value (top three, value on the game).
     ("Always take", "必拿"),
     ("The chance that the final Ultimate Activity reaches 840k", "最終活性達 840k 的機率"),
@@ -711,7 +714,6 @@ pub const TEXT: &[(&str, &str)] = &[
     ("{} rounds \u{b7} final board activity {}", "{} 回合 \u{b7} 盤面最終活性 {}"),
     (" (last board read)", "（最後盤面讀數）"),
     ("No endgame battle read", "沒有終局戰鬥的讀數"),
-    ("Activity {} + bonus {} (+{}%) = {}", "活性 {} ＋ 加成 {}（+{}%）＝ {}"),
     ("Activity {} + bonus {} = {}", "活性 {} ＋ 加成 {} ＝ {}"),
     ("Reward: next tier {}", "獎勵：下一階 {}"),
     ("Reward: all taken", "獎勵：全拿"),
@@ -720,6 +722,21 @@ pub const TEXT: &[(&str, &str)] = &[
     ("- Long numbers (ids): {} replaced with <數字>", "- 長數字（ID）：{} 處換成 <數字>"),
     ("Save and open folder", "存檔並開啟資料夾"),
     ("Saves the zip in Ascendant's folder and selects it in File Explorer", "把 zip 存到 Ascendant.exe 所在的資料夾，並在檔案總管中選取"),
+    // Vorax panel (src/app/vorax_view.rs, 1.1.0): the labels that were written in Chinese only. "Empty" and ", "
+    // are shared with the Tartarus board and are not repeated here.
+    ("Activity", "活性"),
+    ("Final activity {} (target {})", "最終活性 {}（目標 {}）"),
+    ("Full ranking", "全部排名"),
+    ("Board as read", "讀到的盤面"),
+    ("Potion rerolls {}", "藥劑重擲 {}"),
+    ("Instrument rerolls {}", "用具重擲 {}"),
+    ("{}{} runs", "{}{} 局"),
+    (", {} s", "，{} 秒"),
+    ("Option", "選項"),
+    ("Rank", "排名"),
+    ("Expected score", "期望分數"),
+    ("840k chance", "達840k"),
+    ("{} ({})\nActivity \u{d7} count: {}\nTotal activity: {}", "{}（{}）\n活性 \u{d7} 數量：{}\n總活性：{}"),
 ];
 
 /// The Traditional Chinese of a note from the Vorax solver (`vorax::advisor`'s `Advice::note`), line by line; a

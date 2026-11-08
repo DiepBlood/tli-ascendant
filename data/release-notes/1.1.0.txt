@@ -1,0 +1,40 @@
+[[zh-TW]]
+Ascendant 1.1.0：渴血支援英文客戶端、渴血面板改版
+
+渴血
+- 支援英文客戶端：回合約 97%、卡名約 98% 讀得到，結算頁也讀得到；讀不準的卡顯示「讀不到」，不亂猜。五張扇形手牌較難讀，約 84%。
+  （遊戲語言要和 Ascendant 設定相同，Windows 也要裝同一種 OCR 語言）
+- 面板改版：六個水箱排成一排，建議的卡作用在哪幾格會用金框標出；視窗小時的精簡版也一樣。
+- 卡名讀不到時，改用卡片效果文字判斷，讀到的卡更多。
+- 戰鬥面板的「(+15%)」改標成「掉落 +15%」：那是解藥瓶掉落加成，不是加成的比例。
+- 選卡畫面有欄位沒讀到（例如重擲次數）時，會自己再讀幾次，不用動滑鼠建議就會出來。
+- 修正：重擲後殘留「+0」讓建議卡住；選卡畫面偶爾被當成結算動畫，建議慢幾秒才出來；水箱數字被燭火照到時讀不完整。
+- 名稱表：怪物與卡片補上英文名；「黑膽汁療法」確認就是 Yellow Bile Therapy。
+
+塔羅斯
+- 按住門卡時，建議不再跳到別的門。
+
+其他
+- 更新內容、本局檢查、刑具與主題改成獨立小視窗：可以拖到主視窗外，會記住位置。
+- 滑鼠停在面板上，詳細說明立刻出現，不用再等半秒。
+
+[[en]]
+
+Ascendant 1.1.0: Vorax on the English client, a redesigned Vorax panel
+
+Vorax
+- The English game client is supported: rounds are read about 97% of the time and card names about 98%, and the result page too; a card that can't be read reliably shows as unread instead of a guess. The fanned five-card hand is harder, about 84%.
+  (The game's language must match Ascendant's setting, and Windows needs the same OCR language.)
+- Redesigned panel: the six tanks sit in one row, and the tanks the advised card acts on are framed in gold; the compact panel of a small window too.
+- When a card's name can't be read, its effect text tells which card it is, so more cards are read.
+- The battle panel's "(+15%)" now reads "drops +15%": it is the Antidote Vial drop bonus, not the bonus's share.
+- When a field on the choice screen isn't read (the rerolls, say), it is read again a few times, so the advice comes without moving the mouse.
+- Fixed: a "+0" left after a reroll leaving the advice stuck; a choice screen now and then taken for the resolve animation, the advice a few seconds late; tank numbers lit by a candle read incompletely.
+- Name table: English names for monsters and cards; Yellow Bile Therapy's Traditional Chinese name is confirmed.
+
+Tartarus
+- Holding the mouse down on a door card no longer makes the advice jump to another door.
+
+Other
+- What's new, Run check, and Instruments and theme are now separate small windows: drag them outside the main window, and they remember where they were.
+- Hover details show as soon as the mouse rests, without the half-second wait.

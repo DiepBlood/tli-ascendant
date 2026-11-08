@@ -1,5 +1,5 @@
 {
-  "note": "Vorax（渴血手術）的繁中名稱，鍵是英文求解器 crates/vorax 的 id：藥劑與手術用具用 data/game.json 的 id；求解器沒有 id 的（手術方案、無法模擬的 Supreme 藥劑）用英文名，英文名未查到的手術方案用繁中名當鍵、en 留空（程式以鍵當識別）；種族、稀有度用引擎的 serde 名稱（types.rs）。zh 只抄自 docs/vorax-實機紀錄-20261103.md 與 docs/vorax-繁中卡牌-20261103.md 實際看到的字，藥劑與手術用具都是效果文字和 effects.rs 實作逐條比對後才對上英文；沒抄到的 zh 是空字串，不猜。手術方案求解器沒有效果定義，7 個是依名稱語意對上英文。怪物名英文求解器沒有，en 留空，鍵用繁中名。繁中手術用具「接肢標本」（初始怪物改為6組隨機怪物）在英文 25 件裡沒有對應，所以不收。注意：錄影那局後來確認是教學局；名稱本身不受影響。",
+  "note": "Vorax（渴血手術）的繁中名稱，鍵是英文求解器 crates/vorax 的 id：藥劑與手術用具用 data/game.json 的 id；求解器沒有 id 的（手術方案、無法模擬的 Supreme 藥劑）用英文名，英文名未查到的手術方案用繁中名當鍵、en 留空（程式以鍵當識別）；種族、稀有度用引擎的 serde 名稱（types.rs）。zh 只抄自 docs/vorax-實機紀錄-20261103.md 與 docs/vorax-繁中卡牌-20261103.md 實際看到的字，藥劑與手術用具都是效果文字和 effects.rs 實作逐條比對後才對上英文；沒抄到的 zh 是空字串，不猜。手術方案求解器沒有效果定義，7 個是依名稱語意對上英文。怪物名英文求解器沒有，鍵用繁中名；en 是英文客戶端印的怪物名（2026-11-08 從英文局的水箱逐一對照補上，禁典學者沒見過、留空）。卡牌的 enClient 只在英文客戶端印的名字和求解器英文名不同時才填（例如 39 至純聖水：求解器 Purest Holy Water，英文客戶端 The Holiest Water）；en 不可改，它用來對求解器的 id。繁中手術用具「接肢標本」（初始怪物改為6組隨機怪物）在英文 25 件裡沒有對應，所以不收。注意：錄影那局後來確認是教學局；名稱本身不受影響。",
   "potions": {
     "0": {
       "en": "Probiotic Enzyme Solution",
@@ -159,6 +159,7 @@
     },
     "39": {
       "en": "Purest Holy Water",
+      "enClient": "The Holiest Water",
       "zh": "至純聖水"
     },
     "40": {
@@ -405,25 +406,21 @@
     },
     "Yellow Bile Therapy": {
       "en": "Yellow Bile Therapy",
-      "zh": ""
-    },
-    "表皮移植實驗": {
-      "en": "",
-      "zh": "表皮移植實驗",
-      "effect": "額外 +10% 玩家受到的傷害（右側被鄰卡蓋住，取多次讀取拼出）；手術風險：低",
-      "note": "普通手術方案，英文名未查到（en 留空，程式以鍵當識別）。來源 home/vorax/2026-11-06_21-42-03 learn-0051～0054（第 11 回合）、learn-0061、0062（第 13 回合）。"
-    },
-    "生命復甦術": {
-      "en": "",
-      "zh": "生命復甦術",
-      "effect": "玩家受到致命一擊時立刻恢復 50% 最大生命和護盾，並獲得無敵狀態（僅觸發 1 次；右側被鄰卡蓋住）；手術風險：未讀到",
-      "note": "普通手術方案，英文名未查到（en 留空，程式以鍵當識別）。來源 home/vorax/2026-11-06_21-42-03 learn-0063（第 13 回合，OCR 讀成「牛命復甦術」）。"
-    },
-    "黑膽汁療法": {
-      "en": "",
       "zh": "黑膽汁療法",
       "effect": "魔法怪物擊中時，施加 15 級膽怯和邪惡侵蝕詛咒；手術風險：低",
-      "note": "普通手術方案，英文名未查到（en 留空，程式以鍵當識別）。疑為 Yellow Bile Therapy 的同一張，待英文版確認：13 個英文方案中 12 個已對上繁中，只剩 Yellow Bile Therapy，而「黃膽汁」在實機紀錄中出現 0 次。確認前兩筆分開保留。來源 home/vorax/2026-11-06_12-23-50 learn-0083（第 12 回合）。"
+      "note": "普通手術方案。繁中版譯作「黑膽汁療法」：和 Yellow Bile Therapy 效果相同、同為普通手術方案，2026-11-08 確認是同一張，兩筆合併。來源 home/vorax/2026-11-06_12-23-50 learn-0083（第 12 回合）。"
+    },
+    "表皮移植實驗": {
+      "en": "Epidermal Grafting Experiment",
+      "zh": "表皮移植實驗",
+      "effect": "額外 +10% 玩家受到的傷害（右側被鄰卡蓋住，取多次讀取拼出）；手術風險：低",
+      "note": "普通手術方案。來源 home/vorax/2026-11-06_21-42-03 learn-0051～0054（第 11 回合）、learn-0061、0062（第 13 回合）。英文名 2026-11-08 補上（上游名稱檔沒有這張，鍵維持繁中）。"
+    },
+    "生命復甦術": {
+      "en": "Cardiac Pacing Resuscitation",
+      "zh": "生命復甦術",
+      "effect": "玩家受到致命一擊時立刻恢復 50% 最大生命和護盾，並獲得無敵狀態（僅觸發 1 次；右側被鄰卡蓋住）；手術風險：未讀到",
+      "note": "普通手術方案。來源 home/vorax/2026-11-06_21-42-03 learn-0063（第 13 回合，OCR 讀成「牛命復甦術」）。英文名 2026-11-08 補上（上游名稱檔沒有這張，鍵維持繁中）。"
     }
   },
   "archetypes": {
@@ -514,27 +511,27 @@
   },
   "monsters": {
     "智者": {
-      "en": "",
+      "en": "Sage",
       "zh": "智者",
       "archetype": "agito"
     },
     "學者": {
-      "en": "",
+      "en": "Scholar",
       "zh": "學者",
       "archetype": "agito"
     },
     "朝聖者": {
-      "en": "",
+      "en": "Pilgrim",
       "zh": "朝聖者",
       "archetype": "agito"
     },
     "異端學者": {
-      "en": "",
+      "en": "Heretical Scholar",
       "zh": "異端學者",
       "archetype": "agito"
     },
     "苦行大教宗": {
-      "en": "",
+      "en": "Penance Patriarch",
       "zh": "苦行大教宗",
       "archetype": "agito"
     },
@@ -544,122 +541,122 @@
       "archetype": "agito"
     },
     "蠍獸": {
-      "en": "",
+      "en": "Scorpid",
       "zh": "蠍獸",
       "archetype": "aemberon"
     },
     "刺蜥獸": {
-      "en": "",
+      "en": "Thornscale",
       "zh": "刺蜥獸",
       "archetype": "aemberon"
     },
     "異獸": {
-      "en": "",
+      "en": "Aemberbeast",
       "zh": "異獸",
       "archetype": "aemberon"
     },
     "灰蛾": {
-      "en": "",
+      "en": "Dust Moth",
       "zh": "灰蛾",
       "archetype": "pest"
     },
     "腐汁蠅": {
-      "en": "",
+      "en": "Putrid Fly",
       "zh": "腐汁蠅",
       "archetype": "pest"
     },
     "惡蛛": {
-      "en": "",
+      "en": "Evil Spider",
       "zh": "惡蛛",
       "archetype": "pest"
     },
     "赤螳螂": {
-      "en": "",
+      "en": "Blood Mantis",
       "zh": "赤螳螂",
       "archetype": "pest"
     },
     "紅斑花金龜": {
-      "en": "",
+      "en": "Scarlet-Spot Scarab",
       "zh": "紅斑花金龜",
       "archetype": "pest"
     },
     "空心繭": {
-      "en": "",
+      "en": "Hollow Cocoon",
       "zh": "空心繭",
       "archetype": "pest"
     },
     "巡察衛兵": {
-      "en": "",
+      "en": "Patrol Guard",
       "zh": "巡察衛兵",
       "archetype": "boneSentry"
     },
     "剛盾衛兵": {
-      "en": "",
+      "en": "Shield Guard",
       "zh": "剛盾衛兵",
       "archetype": "boneSentry"
     },
     "骸骨典獄官": {
-      "en": "",
+      "en": "Bone Warden",
       "zh": "骸骨典獄官",
       "archetype": "boneSentry"
     },
     "銹戟兵": {
-      "en": "",
+      "en": "Rust Halberdier",
       "zh": "銹戟兵",
       "archetype": "boneSentry"
     },
     "弓兵": {
-      "en": "",
+      "en": "Archer",
       "zh": "弓兵",
       "archetype": "boneSentry"
     },
     "暴食巨蠕蟲": {
-      "en": "",
+      "en": "Maw-Worm",
       "zh": "暴食巨蠕蟲",
       "archetype": "pest"
     },
     "裂顎獸": {
-      "en": "",
+      "en": "Cleaver-Jaw",
       "zh": "裂顎獸",
       "archetype": "aemberon"
     },
     "邪眼翼獸": {
-      "en": "",
+      "en": "Blightsight",
       "zh": "邪眼翼獸",
       "archetype": "aemberon"
     },
     "寄生蝴蝶": {
-      "en": "",
+      "en": "Parasitic Butterfly",
       "zh": "寄生蝴蝶",
       "archetype": "pest"
     },
     "紅瘟三頭犬": {
-      "en": "",
+      "en": "Red-Plague Cerberus",
       "zh": "紅瘟三頭犬",
       "archetype": "aemberon"
     },
     "墮落者": {
-      "en": "",
+      "en": "Apostate",
       "zh": "墮落者",
       "archetype": "agito"
     },
     "腐囊異獸": {
-      "en": "",
+      "en": "Festerpod",
       "zh": "腐囊異獸",
       "archetype": "aemberon"
     },
     "輕弩兵": {
-      "en": "",
+      "en": "Crossbowman",
       "zh": "輕弩兵",
       "archetype": "boneSentry"
     },
     "士兵": {
-      "en": "",
+      "en": "Soldier",
       "zh": "士兵",
       "archetype": "boneSentry"
     },
     "飛升之聖徒": {
-      "en": "",
+      "en": "Transcendent Saint",
       "zh": "飛升之聖徒",
       "archetype": "agito"
     }

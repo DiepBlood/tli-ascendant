@@ -494,8 +494,10 @@ mod tests {
     #[test]
     fn blanks_are_the_entries_without_zh() {
         let b = blanks();
-        assert!(b.iter().any(|x| x.section == "protocols" && x.category == Category::Protocol));
+        assert!(!b.is_empty());
         assert!(b.iter().all(|x| names().cards.iter().any(|c| c.en == x.en && c.zh.is_none())));
+        // The last protocol without one, Yellow Bile Therapy, is `黑膽汁療法` (2026-11-08).
+        assert!(!b.iter().any(|x| x.category == Category::Protocol));
     }
 
     #[test]
@@ -507,7 +509,9 @@ mod tests {
         if let Some(top) = cs.first().filter(|c| c.blank.rarity == Some(PotionRarity::Normal)) {
             assert!(matches!(top.blank.targeting, Some(Targeting::Select1 | Targeting::Select1To2)) || top.b == 0, "{top:?}");
         }
-        // The type text says protocol: only protocols remain.
+        // The type text says protocol: only protocols remain. No protocol is blank now, so one stands in.
+        let mut b = b;
+        b.push(Blank { section: "protocols", key: "Stand-in Protocol".into(), en: "Stand-in Protocol".into(), category: Category::Protocol, rarity: None, targeting: None });
         let cs = candidates(Some(Category::Potion), "稀有手術方案", "", &b);
         assert!(!cs.is_empty() && cs.iter().all(|c| c.blank.category == Category::Protocol));
     }

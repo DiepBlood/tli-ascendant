@@ -5,6 +5,7 @@
 //!   ascendant-cli solve <board.json | frame.png> [--rollouts N] [--seed S] [--tools id,id]
 //!   ascendant-cli read <frame.png | frame.jpg> [--tools id,id]
 //!   ascendant-cli vorax-read <frame.png> [--json] [--time] [--page-scale x]
+//!   ascendant-cli vorax-read --list <list.txt | -> [--page-scale x]
 //!   ascendant-cli vorax-solve <frame.png> [--rollouts N] [--instruments id,id@round]
 //!   ascendant-cli vorax-learn [vorax folder] [--out file]
 //!   ascendant-cli capture [--frames N] <title text> <out.png>
@@ -55,7 +56,7 @@ macro_rules! out {
     }};
 }
 
-const USAGE: &str = "usage: ascendant-cli solve <board.json | frame.png> [--rollouts N] [--seed S] [--tools id,id] | ascendant-cli read <frame.png> [--tools id,id] | ascendant-cli vorax-read <frame.png> [--json] [--time] [--page-scale x] | ascendant-cli vorax-solve <frame.png> [--rollouts N] [--instruments id,id@round] | ascendant-cli vorax-learn [vorax folder] [--out file] | ascendant-cli capture [--frames N] <title text> <out.png> | ascendant-cli bench [--games N] [--rollouts R] [--seed S] [--threads T] | ascendant-cli bench --strategy-only [--set name=value,...] [--hold id,id] [--rerolls N] [--save file] [--against file] [--games N] [--seed S] [--threads T] | ascendant-cli latency [run folder] [--game-log UE_game.log] [--each] | ascendant-cli rates [runs folder] [--each] | ascendant-cli audit [run folder ...] [--rollouts N] [--each] | ascendant-cli keygen <private key file> | ascendant-cli sign <private key file> <file> [--force] | ascendant-cli verify <SHA256SUMS.txt> [--public-key <64 hex digits>] | ascendant-cli release-key | ascendant-cli check-key <private key file> | ascendant-cli fingerprint <64 hex digits> | ascendant-cli --version";
+const USAGE: &str = "usage: ascendant-cli solve <board.json | frame.png> [--rollouts N] [--seed S] [--tools id,id] | ascendant-cli read <frame.png> [--tools id,id] | ascendant-cli vorax-read <frame.png> [--json] [--time] [--page-scale x] | ascendant-cli vorax-read --list <list.txt | -> [--page-scale x] | ascendant-cli vorax-solve <frame.png> [--rollouts N] [--instruments id,id@round] | ascendant-cli vorax-learn [vorax folder] [--out file] | ascendant-cli capture [--frames N] <title text> <out.png> | ascendant-cli bench [--games N] [--rollouts R] [--seed S] [--threads T] | ascendant-cli bench --strategy-only [--set name=value,...] [--hold id,id] [--rerolls N] [--save file] [--against file] [--games N] [--seed S] [--threads T] | ascendant-cli latency [run folder] [--game-log UE_game.log] [--each] | ascendant-cli rates [runs folder] [--each] | ascendant-cli audit [run folder ...] [--rollouts N] [--each] | ascendant-cli keygen <private key file> | ascendant-cli sign <private key file> <file> [--force] | ascendant-cli verify <SHA256SUMS.txt> [--public-key <64 hex digits>] | ascendant-cli release-key | ascendant-cli check-key <private key file> | ascendant-cli fingerprint <64 hex digits> | ascendant-cli --version";
 
 fn main() -> ExitCode {
     // First, before the reader's OCR or capture loads a DLL by name: System32 only, never the current or the exe's
@@ -1216,14 +1217,15 @@ fn run_strategy_bench(
 /// UE_game.log, 0.667 the original setting; see `ascendant::vorax::ui_scale`), in (0, 4] as the game log reader
 /// takes it; without it the frame is read as the app reads it while the log has no scale: as at the original
 /// setting, and only a frame that reads as no board is measured and, when off the original, read again at the
-/// measured scale (`ui_scale::read`).
+/// measured scale (`ui_scale::read`). `--list` reads many frames in one process instead ([`vorax_read_list`]).
 fn run_vorax_read(args: &[String]) -> Result<ExitCode, String> {
-    let (mut file, mut json, mut time, mut page) = (None, false, false, None);
+    let (mut file, mut json, mut time, mut page, mut list) = (None, false, false, None, None);
     let mut it = args.iter();
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "--json" => json = true,
             "--time" => time = true,
+            "--list" => list = Some(it.next().ok_or_else(|| format!("--list needs a file or -; {USAGE}"))?),
             "--page-scale" => {
                 let p = number::<f64>("--page-scale", it.next())?;
                 if !(p.is_finite() && p > 0.0 && p <= 4.0) {
@@ -1231,9 +1233,22 @@ fn run_vorax_read(args: &[String]) -> Result<ExitCode, String> {
                 }
                 page = Some(p);
             }
+            // The game client read, `zh` (the default) or `en` (feature `en-vorax`, on by default since 1.1.0).
+            #[cfg(feature = "en-vorax")]
+            "--client" => match it.next().map(String::as_str) {
+                Some("zh") => ascendant::vorax::read::set_english(false),
+                Some("en") => ascendant::vorax::read::set_english(true),
+                other => return Err(format!("--client takes zh or en, not {other:?}")),
+            },
             _ if file.is_none() && !arg.starts_with("--") => file = Some(arg),
             _ => return Err(format!("unexpected argument {arg}; {USAGE}")),
         }
+    }
+    if let Some(list) = list {
+        if file.is_some() || time {
+            return Err(format!("--list takes no frame and no --time; {USAGE}"));
+        }
+        return vorax_read_list(list, page);
     }
     let path = Path::new(file.ok_or(USAGE)?);
     let img = ascendant::reader::load_image_raw(path)?;
@@ -1258,6 +1273,69 @@ fn run_vorax_read(args: &[String]) -> Result<ExitCode, String> {
         print!("{}", ascendant::vorax::describe(&reading));
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// `vorax-read --list <list.txt | -> [--page-scale x]`: reads every frame of the list (one path a line, `-` reads
+/// the list from standard input; a tab after the path may give that frame's page scale, overriding
+/// `--page-scale`) in this one process and prints one JSON line a frame, in the list's order:
+/// `{"file":<path>,"reading":<the reading vorax-read --json prints>}`, or `{"file":<path>,"error":<why>}` for a
+/// frame that does not load or whose read panics, and goes on with the next frame. Launching the tool once a frame
+/// made Windows Defender check every start (9-16% CPU over a comparison of thousands of frames, 2026-11-08), so
+/// comparisons read in batches. The OCR cache is emptied before each frame, so each reads as in a fresh process: the
+/// cache gives a crop alike a cached one the cached text back, which would let one frame's text answer another's.
+fn vorax_read_list(list: &str, page: Option<f64>) -> Result<ExitCode, String> {
+    use std::io::{Read, Write};
+    let text = if list == "-" {
+        let mut t = String::new();
+        std::io::stdin().read_to_string(&mut t).map_err(|e| format!("standard input: {e}"))?;
+        t
+    } else {
+        std::fs::read_to_string(list).map_err(|e| format!("{list}: {e}"))?
+    };
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    for line in text.lines().map(|l| l.trim_end_matches('\r')).filter(|l| !l.trim().is_empty()) {
+        let (file, own_page) = list_entry(line);
+        let name = serde_json::to_string(file).map_err(|e| e.to_string())?;
+        // A page scale that does not parse is that line's error; the frames after it are read.
+        let own_page = match own_page {
+            Ok(p) => p,
+            Err(why) => {
+                writeln!(out, "{{\"file\":{name},\"error\":{}}}", serde_json::to_string(&why).map_err(|e| e.to_string())?).and_then(|()| out.flush()).map_err(|e| e.to_string())?;
+                continue;
+            }
+        };
+        let ui = own_page.or(page).map(ascendant::vorax::ui_scale::from_page_scale);
+        ascendant::reader::ocr::clear_cache();
+        let read = std::panic::catch_unwind(|| -> Result<String, String> {
+            let img = ascendant::reader::load_image_raw(Path::new(file))?;
+            let reference = ascendant::vorax::read::to_reference(&img);
+            let reading = ascendant::vorax::read::read_scaled(&reference, Some(&img), ui);
+            serde_json::to_string(&reading).map_err(|e| e.to_string())
+        });
+        let row = match read {
+            Ok(Ok(reading)) => format!("{{\"file\":{name},\"reading\":{reading}}}"),
+            Ok(Err(why)) => format!("{{\"file\":{name},\"error\":{}}}", serde_json::to_string(&why).map_err(|e| e.to_string())?),
+            Err(panic) => {
+                let why = panic.downcast_ref::<String>().cloned().or_else(|| panic.downcast_ref::<&str>().map(|s| s.to_string())).unwrap_or_default();
+                format!("{{\"file\":{name},\"error\":{}}}", serde_json::to_string(&format!("panic: {why}")).map_err(|e| e.to_string())?)
+            }
+        };
+        writeln!(out, "{row}").and_then(|()| out.flush()).map_err(|e| e.to_string())?;
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// One line of a `vorax-read --list`: the frame, and its own page scale when a tab and one follow it (None without),
+/// or why that page scale is not one: not a number, or outside (0, 4] as `--page-scale` takes it.
+fn list_entry(line: &str) -> (&str, Result<Option<f64>, String>) {
+    let Some((file, p)) = line.split_once('\t') else { return (line, Ok(None)) };
+    let scale = match p.trim().parse::<f64>() {
+        Ok(s) if s.is_finite() && s > 0.0 && s <= 4.0 => Ok(Some(s)),
+        Ok(s) => Err(format!("page scale {s} of {file} is outside (0, 4]")),
+        Err(e) => Err(format!("page scale {p:?} of {file}: {e}")),
+    };
+    (file, scale)
 }
 
 /// `vorax-learn [vorax folder] [--out file]`: collates the data saved by observe mode (plan section 6.5, see
@@ -1448,4 +1526,23 @@ fn run_solve(args: &[String]) -> Result<ExitCode, String> {
     }
     out!("\nUp to {rollouts} playouts per option, n of them played: a move that clearly trails stops early; gap is the paired standard error of the margin to the leader; * is the strategy's pick.");
     Ok(ExitCode::SUCCESS)
+}
+
+#[cfg(test)]
+mod list_tests {
+    use super::list_entry;
+
+    /// `vorax-read --list`: a line without a tab is a frame alone; a page scale that is not a number or outside (0, 4]
+    /// is that line's error (the batch goes on with the next frame), not the whole run's.
+    #[test]
+    fn a_list_line_gives_the_frame_and_its_own_page_scale() {
+        assert_eq!(list_entry("a.jpg"), ("a.jpg", Ok(None)));
+        assert_eq!(list_entry("a.jpg\t0.8"), ("a.jpg", Ok(Some(0.8))));
+        assert_eq!(list_entry("a.jpg\t 1.0 "), ("a.jpg", Ok(Some(1.0))));
+        for bad in ["a.jpg\tx", "a.jpg\t", "a.jpg\t0", "a.jpg\t5", "a.jpg\tNaN"] {
+            let (file, scale) = list_entry(bad);
+            assert_eq!(file, "a.jpg");
+            assert!(scale.is_err(), "{bad:?}");
+        }
+    }
 }

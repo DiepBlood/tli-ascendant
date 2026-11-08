@@ -56,6 +56,10 @@ pub const NIGHT: Color32 = Color32::from_rgb(0x0f, 0x14, 0x24);
 /// Apply Ascendant's colours to the dark theme (there is only the dark theme, see `AscendantApp::new`).
 pub fn apply(ctx: &egui::Context) {
     ctx.style_mut_of(egui::Theme::Dark, |style| {
+        // Tooltips show as soon as the mouse rests on something, not after egui's 0.5 s (2026-11-08, the user: the
+        // details on hover came too slowly). They still wait for the mouse to stop, so passing over the panel does
+        // not flash them.
+        style.interaction.tooltip_delay = 0.0;
         let v = &mut style.visuals;
         v.panel_fill = BG;
         v.window_fill = SIDEBAR;

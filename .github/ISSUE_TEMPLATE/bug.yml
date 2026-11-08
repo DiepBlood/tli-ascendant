@@ -12,8 +12,8 @@ body:
     id: version
     attributes:
       label: 版本（Version）
-      description: Ascendant 的版本號，例如 1.0.4（The Ascendant version, e.g. 1.0.4）
-      placeholder: "1.0.4"
+      description: Ascendant 的版本號，例如 1.1.0（The Ascendant version, e.g. 1.1.0）
+      placeholder: "1.1.0"
     validations:
       required: true
   - type: dropdown
@@ -29,7 +29,7 @@ body:
     id: client_language
     attributes:
       label: 遊戲客戶端語言（Game client language）
-      description: 繁中客戶端支援最完整（The Traditional Chinese client is the best supported）
+      description: 繁中客戶端支援最完整，英文客戶端的渴血為 1.1.0 新增（The Traditional Chinese client is the best supported; Vorax on the English client is new in 1.1.0）
       options:
         - 繁體中文（Traditional Chinese）
         - English
@@ -48,7 +48,7 @@ body:
     id: description
     attributes:
       label: 問題描述（What happened）
-      description: 發生了什麼事、怎麼重現（What happened and how to reproduce it）
+      description: 發生了什麼事、怎麼重現。若是英文客戶端渴血讀錯卡，請寫出讀成什麼、實際是什麼（What happened and how to reproduce it. For a Vorax misread on the English client, say what was read and what it should be）
     validations:
       required: true
   - type: textarea

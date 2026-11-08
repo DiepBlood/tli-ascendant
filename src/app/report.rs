@@ -1855,7 +1855,9 @@ fn settle_once(name: &str, text: &str, ui: Lang, rollouts: usize, cancel: &Atomi
 }
 
 /// The run's facts: game language, OCR language, resolution (from the window line, which is deleted later, and the reads).
-fn run_facts(game: Game, text: &str) -> (String, String, String) {
+/// `client` is the game client language read now (`crate::reader::ocr::client_language`, as
+/// `VoraxSession::client_language`), for a Vorax run whose log has no window line.
+fn run_facts(game: Game, text: &str, client: Option<Lang>) -> (String, String, String) {
     let rows = rows(text);
     // The last window line: a language switch mid run writes it again with the new OCR language (`set_ocr`).
     let window = rows.iter().rfind(|r| kind(&r.v) == "window");
@@ -1865,7 +1867,14 @@ fn run_facts(game: Game, text: &str) -> (String, String, String) {
         Some(format!("{} x {}", s.first()?.as_u64()?, s.get(1)?.as_u64()?))
     });
     let lang = match game {
-        Game::Vorax => Lang::ZhTw,
+        // The OCR language the log's last window line names (as `ocr` above; Tartarus's `log_language` and Vorax's
+        // write it, again on a switch mid game), which is what the run read; a log without one (older runs) takes the
+        // client language read now; Traditional Chinese when neither is known.
+        Game::Vorax => match window {
+            Some(w) => w.v["ocr"].as_str().and_then(crate::reader::ocr::game_lang),
+            None => client,
+        }
+        .unwrap_or(Lang::ZhTw),
         Game::Tartarus => rows.iter().find(|r| kind(&r.v) == "advice").and_then(|r| r.v["pick"].as_str()).map_or(lang::lang(), |p| if p.is_ascii() { Lang::En } else { Lang::ZhTw }),
     };
     (lang.native_name().to_string(), ocr, size.unwrap_or_else(|| "-".to_string()))
@@ -1892,7 +1901,7 @@ pub fn prepare(req: &Request, cancel: &AtomicBool, status: &dyn Fn(String)) -> R
     let steps = steps(req.game, &text);
     let scrub = Scrub::from_env(&req.install_id);
     let (log, removed) = clean_log(&text, &scrub);
-    let facts = run_facts(req.game, &text);
+    let facts = run_facts(req.game, &text, crate::reader::ocr::client_language());
     // Processed images: file -> contents (None: no board shows, left out), for the width and quality in `sized`.
     // A level of another width or quality empties it first, so only one size of the images is ever held.
     let mut cache: HashMap<String, Option<Vec<u8>>> = HashMap::new();
@@ -2668,6 +2677,27 @@ mod tests {
 
     fn t(s: &str) -> String {
         format!("2026-11-04T21:{s}Z")
+    }
+
+    /// A Vorax run's game language follows the OCR language of its last window line (an English client's run is
+    /// English), whatever the client read now; a log without a window line (an older run) takes the client
+    /// language read now; Traditional Chinese for an unknown tag or with neither.
+    #[test]
+    fn vorax_game_language_follows_the_ocr_language() {
+        let window = |ocr: &str| line(json!({"at": t("00:00.000"), "kind": "window", "ocr": ocr, "window": "\"Torchlight: Infinite\" (2560 x 1440)"}));
+        let read = line(json!({"at": t("00:01.000"), "kind": "vorax_read", "size": [2560, 1440]}));
+        let lang_of = |text: &str, client: Option<Lang>| run_facts(Game::Vorax, text, client).0;
+        // A log with a window line: it counts, not the client read now.
+        assert_eq!(lang_of(&window("en-US"), Some(Lang::ZhTw)), Lang::En.native_name());
+        assert_eq!(lang_of(&window("zh-Hant-TW"), Some(Lang::En)), Lang::ZhTw.native_name());
+        // A language switch mid game: the last window line counts.
+        assert_eq!(lang_of(&[window("zh-Hant-TW"), window("en-GB")].join("\n"), None), Lang::En.native_name());
+        assert_eq!(lang_of(&window("ja-JP"), Some(Lang::En)), Lang::ZhTw.native_name());
+        // An older log without a window line: the client language read now.
+        assert_eq!(lang_of(&read, Some(Lang::En)), Lang::En.native_name());
+        assert_eq!(lang_of(&read, Some(Lang::ZhTw)), Lang::ZhTw.native_name());
+        assert_eq!(lang_of(&read, None), Lang::ZhTw.native_name());
+        assert_eq!(lang_of("", None), Lang::ZhTw.native_name());
     }
 
     #[test]

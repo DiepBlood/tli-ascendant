@@ -5,9 +5,9 @@
 //! Outside Vorax mode, apart from the Vorax log cue (`Signal::Vorax`), events go back to
 //! ui.rs untouched and Tartarus carries on as before.
 //!
-//! The panel text is written directly in Traditional Chinese and does not go through `tr()`: Vorax mode is only
-//! entered when the game client is zh-TW (plan section 2.1), and the option names and the status line also come from
-//! VoraxSession in Chinese. Strings added by the Ascendant rework (header, verdict label) go through `tr()`.
+//! The panel text follows the window language: every label is an English key looked up with `tr()` / `trf!`
+//! (src/lang/zh_tw.rs has the Traditional Chinese). Game names (cards, instruments, monsters) come from the name
+//! table, and the option names and the status line come from VoraxSession, already in the client's language.
 
 use super::capture::{Event, Watcher, capture, game_in_front, game_rect};
 use super::gamelog::Signal;
@@ -20,7 +20,7 @@ use super::vorax_session::{self, BoardFrom, BoxStyle, Config, Cue, GameSummary, 
 use crate::lang::{tr, trf};
 use crate::reader::Rgba;
 use crate::vorax::AdviceRow;
-use crate::vorax::names::{archetype_zh, rarity_name};
+use crate::vorax::names::rarity_name;
 use crate::vorax::read::{self, Kind};
 use ::vorax::Rarity;
 use eframe::egui::{self, Align, Align2, Color32, FontId, Layout, RichText, Sense, Stroke, StrokeKind, Vec2};
@@ -63,6 +63,8 @@ pub struct VoraxView {
     /// The capture window last described in any mode: written into the Vorax log on entering (or resuming) Vorax,
     /// since a size change while Vorax was paused went to Tartarus's log only.
     latest_window: Option<String>,
+    /// Test only (ASCENDANT_PREVIEW_VORAX_PANEL): the panel draws this made-up view instead of the session's.
+    preview_view: Option<View>,
 }
 
 /// The content written to the `vorax_view` row, matching the fields written: the boxes drawn (what and `Mark::at()`),
@@ -81,7 +83,24 @@ impl VoraxView {
     pub fn new(settings: &Settings, ctx: egui::Context) -> VoraxView {
         let mut session = VoraxSession::new(Config::from_settings(settings));
         session.on_progress(move || ctx.request_repaint());
-        VoraxView { session, marks: Vec::new(), value: None, window: None, last_view: None, hidden: None, preview: false, preview_battle: None, preview_result: None, dismissed: None, latest_window: None }
+        let mut view = VoraxView { session, marks: Vec::new(), value: None, window: None, last_view: None, hidden: None, preview: false, preview_battle: None, preview_result: None, dismissed: None, latest_window: None, preview_view: None };
+        // ASCENDANT_PREVIEW_VORAX_PANEL=advice, none or blank: the panel draws a made-up board (see preview_view).
+        if let Ok(which) = std::env::var("ASCENDANT_PREVIEW_VORAX_PANEL") {
+            view.preview_panel(&which);
+        }
+        view
+    }
+
+    /// Test only (ASCENDANT_PREVIEW_VORAX_PANEL): the window shows the Vorax panel drawn from a made-up board
+    /// ([`preview_view`]) instead of a read one; the session is not entered, and nothing is captured or read.
+    fn preview_panel(&mut self, which: &str) {
+        self.preview = true;
+        self.preview_view = Some(preview_view(which));
+    }
+
+    /// The view the panel draws: the made-up one of a preview, else the session's.
+    fn view(&self) -> &View {
+        self.preview_view.as_ref().unwrap_or_else(|| self.session.view())
     }
 
     /// Test only (called only when ui.rs reads the environment variable ASCENDANT_PREVIEW_VORAX): enters Vorax mode
@@ -109,9 +128,9 @@ impl VoraxView {
         });
     }
 
-    /// In Vorax mode (intro page, board, result screen).
+    /// In Vorax mode (intro page, board, result screen), or showing the made-up panel of a preview.
     pub fn active(&self) -> bool {
-        self.session.active()
+        self.session.active() || self.preview_view.is_some()
     }
 
     /// The last finished Vorax game, kept after the mode ends until a new Vorax game starts or Tartarus is played (see
@@ -150,7 +169,12 @@ impl VoraxView {
         });
         let board = if battle.is_some() { 812_345 } else { 655_120 };
         let from = if battle.is_some() { BoardFrom::ResultScreen } else { BoardFrom::LastBoard };
-        let instruments = ["\u{7cbe}\u{5bc6}\u{93b7}\u{5b50}", "\u{6d88}\u{6bd2}\u{9257}", "\u{9aa8}\u{92f8}"].iter().map(|s| s.to_string()).collect();
+        // Made-up Chinese names in the Chinese window; in the English one the first three instruments of the name table.
+        let instruments = if crate::lang::zh() {
+            ["\u{7cbe}\u{5bc6}\u{93b7}\u{5b50}", "\u{6d88}\u{6bd2}\u{9257}", "\u{9aa8}\u{92f8}"].iter().map(|s| s.to_string()).collect()
+        } else {
+            crate::vorax::names::names().cards.iter().filter(|c| c.category == crate::vorax::names::Category::Instrument).take(3).map(|c| c.en.clone()).collect()
+        };
         self.preview_result = Some(GameSummary { log_dir: None, ended_at: vorax_session::now_ms(), board: Some(board), board_from: Some(from), rounds: 13, instruments, battle });
     }
 
@@ -447,6 +471,8 @@ impl VoraxView {
         let fields = json!({
             "marks": logged.marks.iter().map(|(w, at)| json!({ "what": w, "at": at })).collect::<Vec<_>>(),
             "hidden": logged.hidden,
+            // Which window was in front instead of the game (diagnostics, see `capture::front_window`).
+            "front": if logged.hidden == Some("behind") { super::capture::front_window() } else { None },
         });
         self.session.log_view(fields, now);
         self.last_view = Some(logged);
@@ -468,10 +494,10 @@ impl VoraxView {
         let injected;
         let v = match &self.preview_battle {
             Some(b) => {
-                injected = with_battle(self.session.view(), b);
+                injected = with_battle(self.view(), b);
                 &injected
             }
-            None => self.session.view(),
+            None => self.view(),
         };
         let always = self.always_take();
         if compact {
@@ -494,7 +520,7 @@ impl VoraxView {
         if !self.active() && self.last_game().is_some() {
             return tr("Vorax \u{b7} game over").to_string();
         }
-        head_text(self.session.view())
+        head_text(self.view())
     }
 }
 
@@ -503,9 +529,10 @@ impl VoraxView {
 ///
 /// Fixed skeleton (2026-11-05, same as the Tartarus board page): from top to bottom always the header
 /// `渴血 · 第 R 回合 / 13` (1 line), the progress bar of total activity against 840k, remaining rerolls (fixed 1
-/// line, blank when none), the advice card (fixed height, see [`advice_card`]), the `選項｜達 840k｜平均` columns
-/// (option | reaches 840k | average) and the top three (fixed 3 rows, numbers only), the six tanks (always 6 cells),
-/// the held instruments (fixed 1 line, truncated when too many), warnings and status (fixed 2 lines, flicker guard as
+/// line, blank when none), the advice card (fixed height, see [`advice_card`]), the six tanks in a row as in the game
+/// (always 6 cells of fixed height, the advised card's tanks marked, see [`tank_strip`]; 2026-11-08 the user: the
+/// panel must show which tank the advised card acts on), the `選項｜水箱｜達 840k｜平均` columns (option | tanks |
+/// reaches 840k | average) and the top three (fixed 3 rows), the held instruments (fixed 1 line, truncated when too many), warnings and status (fixed 2 lines, flicker guard as
 /// in Tartarus, see [`theme::notes`]), then the expandable full ranking and the board that was read. Below the top
 /// three is another small line for ranks 4-6 (with 5 cards or 6 options all of them are visible). The credit line
 /// ([`CREDIT`]) has been only in the settings "About" since 2026-11-05, and is no longer written at the bottom of the
@@ -525,34 +552,37 @@ pub fn draw_panel(v: &View, ui: &mut egui::Ui, always: bool) {
     match v.ultimate {
         Some(ultimate) => {
             let colour = if ultimate >= target { theme::GOOD } else { ACCENT };
-            progress(ui, "活性", ultimate as f32 / target as f32, format!("{} / {}", short_k(ultimate), short_k(target)), colour)
-                .on_hover_text(format!("最終活性 {}（目標 {}）", grouped(ultimate), grouped(target)));
+            progress(ui, tr("Activity"), ultimate as f32 / target as f32, format!("{} / {}", short_k(ultimate), short_k(target)), colour)
+                .on_hover_text(trf!("Final activity {} (target {})", grouped(ultimate), grouped(target)));
         }
         // No activity read yet: an empty bar (fill same as the track), the position is kept.
         None => {
-            progress(ui, "活性", 0.0, format!("\u{2014} / {}", short_k(target)), theme::TRACK);
+            progress(ui, tr("Activity"), 0.0, format!("\u{2014} / {}", short_k(target)), theme::TRACK);
         }
     }
     rerolls(ui, v);
     ui.add_space(4.0);
     advice_card(ui, v);
     let rows = advice_rows(v);
-    ranking_rows(ui, &cols, rows, v.stale, always);
+    // The six tanks in a row as in the game, the ones the advised card acts on marked (2026-11-08 layout), above the
+    // ranking whose tanks column draws them small.
+    ui.add_space(2.0);
+    tank_strip(ui, &v.tanks, advised_targets(rows), v.stale, false);
+    ui.add_space(2.0);
+    ranking_rows(ui, &cols, rows, v.stale, always, Some(&v.tanks));
     rest_line(ui, rows);
-    ui.add_space(4.0);
-    tanks(ui, &v.tanks, 6);
     held(ui, &v.held);
     theme::notes(ui, egui::Id::unique("vorax-notes"), &now_items(v), &note_items(v));
     // The two blocks the user expands themselves: the header is always there (`—` when there is no content), so the
     // credit line does not jump up and down.
-    egui::CollapsingHeader::new("全部排名").id_salt("vorax-ranking").show(ui, |ui| {
+    egui::CollapsingHeader::new(tr("Full ranking")).id_salt("vorax-ranking").show(ui, |ui| {
         if rows.is_empty() {
             ui.label(RichText::new("\u{2014}").small().color(MUTED));
         } else {
             ranking_table(ui, rows, v.stale);
         }
     });
-    egui::CollapsingHeader::new("讀到的盤面").id_salt("vorax-board").show(ui, |ui| match &v.board {
+    egui::CollapsingHeader::new(tr("Board as read")).id_salt("vorax-board").show(ui, |ui| match &v.board {
         Some(board) => ui.label(RichText::new(board).small().monospace()),
         None => ui.label(RichText::new("\u{2014}").small().color(MUTED)),
     });
@@ -560,10 +590,11 @@ pub fn draw_panel(v: &View, ui: &mut egui::Ui, always: bool) {
 
 /// The compact Vorax panel (when the window is small; the layout diagram the user confirmed, target 421x351,
 /// everything fits at the standard font size): line 1 has the header on the left and the short remaining-rerolls on
-/// the right; the activity progress bar; a one-line advice card with a label; below it two columns, the left column
-/// `選項｜達 840k` (option | reaches 840k) and the top three plus one line for ranks 4-6, the right column the tanks
-/// as 3x2 plus one line of held instruments (when too narrow for two columns the right column goes below the left);
-/// at the bottom the warning area (fixed 2 lines, flicker guard) and two links `全部排名 ▸　讀到的盤面 ▸` (full
+/// the right; the activity progress bar; a one-line advice card with a label and one small line under it; then, as in
+/// the full version since 2026-11-08 (the user: the compact panel was still the old one), the six tanks in a row with
+/// the advised card's tanks framed in gold (short cells, see [`tank_strip`]), the `選項｜水箱｜達 840k｜平均` columns
+/// (option | tanks | reaches 840k | average) and the top three across the whole width, one line for ranks 4-6 and one
+/// line of held instruments with the remaining rerolls on the right; at the bottom the warning area (fixed 2 lines, flicker guard) and two links `全部排名 ▸　讀到的盤面 ▸` (full
 /// ranking, board read), which expand below when clicked (scrollable when expanded; the `＋／－` after a link means
 /// collapsed / expanded, since Microsoft JhengHei UI has no glyph for symbols like ▸). The credit line is only in
 /// "About". Every block has a fixed height, same as the full version.
@@ -591,25 +622,25 @@ fn head_text(v: &View) -> String {
 fn rerolls_text(v: &View) -> String {
     let count = |n: Option<i32>| n.map_or_else(|| "?".to_string(), |n| n.to_string());
     if v.potion_rerolls.is_some() || v.instrument_rerolls.is_some() {
-        format!("藥劑重擲 {} \u{b7} 用具重擲 {}", count(v.potion_rerolls), count(v.instrument_rerolls))
+        format!("{} \u{b7} {}", trf!("Potion rerolls {}", count(v.potion_rerolls)), trf!("Instrument rerolls {}", count(v.instrument_rerolls)))
     } else {
         String::new()
     }
 }
 
 /// Below line 1 of the compact version: the activity progress bar, the advice card (only the large text and the
-/// label) and two small lines right under the card (reason first, then the solve note), two columns (top three /
-/// tanks and instruments), the warning area, and the two expand links.
+/// label) and one small line right under the card (reason first, then the solve note), the six tanks in a row, the
+/// top three with the tanks column, ranks 4-6, the held instruments, the warning area, and the two expand links.
 fn compact_body(v: &View, ui: &mut egui::Ui, always: bool) {
     let target = ::vorax::value::TARGET;
     match v.ultimate {
         Some(ultimate) => {
             let colour = if ultimate >= target { theme::GOOD } else { ACCENT };
-            progress(ui, "活性", ultimate as f32 / target as f32, format!("{} / {}", short_k(ultimate), short_k(target)), colour)
-                .on_hover_text(format!("最終活性 {}（目標 {}）", grouped(ultimate), grouped(target)));
+            progress(ui, tr("Activity"), ultimate as f32 / target as f32, format!("{} / {}", short_k(ultimate), short_k(target)), colour)
+                .on_hover_text(trf!("Final activity {} (target {})", grouped(ultimate), grouped(target)));
         }
         None => {
-            progress(ui, "活性", 0.0, format!("\u{2014} / {}", short_k(target)), theme::TRACK);
+            progress(ui, tr("Activity"), 0.0, format!("\u{2014} / {}", short_k(target)), theme::TRACK);
         }
     }
     let (big, small) = card_text(v);
@@ -638,46 +669,25 @@ fn compact_body(v: &View, ui: &mut egui::Ui, always: bool) {
     // click-through does not block the game.
     let sense = if cut || shown != big { Sense::click() } else { Sense::hover() };
     ui.interact(card, egui::Id::unique("vorax-card"), sense).on_hover_text(format!("{big}\n{small}"));
-    // Right under the card: fixed two lines, auto-wrapped (reason first, solve note only up to the first `；`), the
-    // full text in the tooltip.
-    card_small(ui, v, &brief, &small);
+    // Right under the card: fixed one line (reason first, solve note only up to the first `；`), the full text in the
+    // tooltip. One line rather than the two of before 2026-11-08: the row of six tanks needs the room at 421x351.
+    card_small(ui, v, &brief, &small, 1);
     let rows = advice_rows(v);
-    let width = ui.available_width();
-    // Two columns: left 58% (option names need to be wider), right the rest; when too narrow (< 300) the right column
-    // goes below the left.
-    if width >= 300.0 {
-        let gap = 8.0;
-        // The right column gets only the minimum width in which a tank cell fits `888k`, `空` (empty) and the
-        // archetype character (three cells plus two gaps), and everything else goes to the left column, so an option
-        // name such as `迷魂酊劑 → 水箱 1` (Bewitching Tincture -> tank 1) fits.
-        let cell = ["888k", "\u{7a7a}"].iter().map(|t| ui.painter().layout_no_wrap(t.to_string(), FontId::proportional(theme::MIN_TEXT), Color32::WHITE).size().x).fold(ui.painter().layout_no_wrap("\u{87f2}".to_string(), FontId::proportional(12.0), Color32::WHITE).size().x, f32::max) + 8.0;
-        let right_w = (3.0 * cell + 2.0 * 4.0).max(width * 0.24);
-        let left_w = (width - gap - right_w).floor();
-        ui.horizontal_top(|ui| {
-            ui.spacing_mut().item_spacing.x = gap;
-            ui.allocate_ui_with_layout(Vec2::new(left_w, 0.0), Layout::top_down(Align::Min), |ui| {
-                ui.set_width(left_w);
-                let cols = Cols::new(left_w, 4.0);
-                ranking_rows(ui, &cols, rows, v.stale, always);
-                rest_line(ui, rows);
-            });
-            let right_w = ui.available_width();
-            ui.allocate_ui_with_layout(Vec2::new(right_w, 0.0), Layout::top_down(Align::Min), |ui| {
-                ui.set_width(right_w);
-                ui.add_space(2.0);
-                tanks(ui, &v.tanks, 3);
-            });
-        });
-        // Held instruments go below the two columns using the full row width (after the right column narrowed it fits
-        // only `+N`), remaining rerolls on the right.
-        held_row(ui, &v.held, &rerolls_text(v));
-    } else {
-        let cols = Cols::new(width, 4.0);
-        ranking_rows(ui, &cols, rows, v.stale, always);
-        rest_line(ui, rows);
-        tanks(ui, &v.tanks, 3);
-        held_row(ui, &v.held, &rerolls_text(v));
-    }
+    // The same order as the full panel (2026-11-08 layout): the six tanks in a row as in the game, the advised card's
+    // tanks marked (short cells, see [`tank_strip`]), then the top three across the whole width with the tanks column.
+    tank_strip(ui, &v.tanks, advised_targets(rows), v.stale, true);
+    ui.scope(|ui| {
+        // The rows touch (each is already a widget high, taller than its text), so the tanks fit at 421x351.
+        ui.spacing_mut().item_spacing.y = 0.0;
+        let width = ui.available_width();
+        // Below 300 wide a tanks column would leave the option names a letter or two: there the names keep
+        // `→ 水箱 N` (to tank N) as before, and the row of tanks above still marks the advised card's.
+        let column = (width >= 300.0).then_some(v.tanks.as_slice());
+        ranking_rows(ui, &Cols::new(width, 4.0), rows, v.stale, always, column);
+    });
+    rest_line(ui, rows);
+    // Held instruments on the left, remaining rerolls on the right.
+    held_row(ui, &v.held, &rerolls_text(v));
     theme::notes(ui, egui::Id::unique("vorax-notes"), &now_items(v), &note_items(v));
     // Two links; clicking expands below (the state is kept in egui's temp storage, so switching layout does not
     // affect the full version's collapsed state).
@@ -685,11 +695,11 @@ fn compact_body(v: &View, ui: &mut egui::Ui, always: bool) {
     let (mut all, mut board) = ui.data(|d| (d.get_temp::<bool>(all_id).unwrap_or(false), d.get_temp::<bool>(board_id).unwrap_or(false)));
     ui.horizontal(|ui| {
         let arrow = |open: bool| if open { "\u{ff0d}" } else { "\u{ff0b}" };
-        if ui.add(egui::Label::new(RichText::new(format!("全部排名 {}", arrow(all))).small().color(ACCENT)).sense(Sense::click()).selectable(false)).clicked() {
+        if ui.add(egui::Label::new(RichText::new(format!("{} {}", tr("Full ranking"), arrow(all))).small().color(ACCENT)).sense(Sense::click()).selectable(false)).clicked() {
             all = !all;
         }
         ui.add_space(12.0);
-        if ui.add(egui::Label::new(RichText::new(format!("讀到的盤面 {}", arrow(board))).small().color(ACCENT)).sense(Sense::click()).selectable(false)).clicked() {
+        if ui.add(egui::Label::new(RichText::new(format!("{} {}", tr("Board as read"), arrow(board))).small().color(ACCENT)).sense(Sense::click()).selectable(false)).clicked() {
             board = !board;
         }
     });
@@ -718,7 +728,7 @@ fn compact_body(v: &View, ui: &mut egui::Ui, always: bool) {
 /// read; the detail and battle lines take a second line only when one would cut them short): the header
 /// `渴血 · 本局結束` (Vorax, game over; in the compact layout ui.rs merges it into the status line), the final activity bar against 840k, then a card with the large `812k · 到達 840k`
 /// (reached 840k or not) and the rounds and the board's final activity (with `（最後盤面讀數）`, the last board read,
-/// when the result screen was not read), the endgame battle (activity + bonus (+N%) = total, and the reward tier
+/// when the result screen was not read), the endgame battle (activity + bonus = total, the tiers' drop bonus, and the reward tier
 /// reached), the held instruments, and a hint that the review is on the Run tab. Fits 421x351 and 296x560 with no
 /// scrollbar.
 pub fn result_panel(g: &GameSummary, ui: &mut egui::Ui, compact: bool) {
@@ -734,11 +744,11 @@ pub fn result_panel(g: &GameSummary, ui: &mut egui::Ui, compact: bool) {
                 Some(Arrival::Unsure) => theme::WARN,
                 _ => ACCENT,
             };
-            progress(ui, "\u{6d3b}\u{6027}", board as f32 / target as f32, format!("{} / {}", short_k(board), short_k(target)), colour)
-                .on_hover_text(format!("\u{6700}\u{7d42}\u{6d3b}\u{6027} {}\u{ff08}\u{76ee}\u{6a19} {}\u{ff09}", grouped(board), grouped(target)));
+            progress(ui, tr("Activity"), board as f32 / target as f32, format!("{} / {}", short_k(board), short_k(target)), colour)
+                .on_hover_text(trf!("Final activity {} (target {})", grouped(board), grouped(target)));
         }
         None => {
-            progress(ui, "\u{6d3b}\u{6027}", 0.0, format!("\u{2014} / {}", short_k(target)), theme::TRACK);
+            progress(ui, tr("Activity"), 0.0, format!("\u{2014} / {}", short_k(target)), theme::TRACK);
         }
     }
     ui.add_space(4.0);
@@ -783,21 +793,27 @@ fn card_arrival(g: &GameSummary, target: i64) -> Option<Arrival> {
     g.board.map(|b| vorax_settle::arrival(b, g.board_from == Some(BoardFrom::Battle), target))
 }
 
-/// The two battle lines of the result card: `活性 812.3k ＋ 加成 304.6k（+37%）＝ 1.11M` (activity + bonus = total,
-/// numbers rounded down, see [`battle_k`]) and the reward reached (`獎勵：下一階 1.12M` next tier, or all taken);
+/// `numbers` and, when the game shows one, the drop bonus of the reward tiers reached: the `(+15%)` beside the antidote
+/// vials on the battle panel and the result screen is the tiers' "Antidote Vial Drop Quantity +15%" (854k), not a
+/// share of the bonus (2026-11-08, the user: the bonus was 44% of the activity while the panel showed +15%). The
+/// share was shown as `加成 …（+15%）` until then, and computed from activity and bonus when unread, which was wrong
+/// both ways. A negative reading is treated as unreadable.
+fn with_drops(numbers: String, percent: Option<i32>) -> String {
+    match percent {
+        Some(p) if p >= 0 => format!("{numbers} \u{b7} {}", trf!("drops +{}%", p)),
+        _ => numbers,
+    }
+}
+
+/// The two battle lines of the result card: `活性 812.3k ＋ 加成 304.6k ＝ 1.11M · 掉落 +15%` (activity + bonus = total,
+/// numbers rounded down, see [`battle_k`], then the drop bonus, see [`with_drops`]) and the reward reached (`獎勵：下一階 1.12M` next tier, or all taken);
 /// with no battle read, a line saying so and an empty reward, which is not drawn.
 fn result_battle(g: &GameSummary) -> (String, String) {
     let Some(b) = &g.battle else { return (tr("No endgame battle read").to_string(), String::new()) };
     let k = battle_k;
     let total = k(g.total());
-    let percent = b.percent.or_else(|| match (b.activity, b.bonus) {
-        (Some(a), Some(x)) if a > 0.0 => Some((x / a * 100.0).round() as i32),
-        _ => None,
-    });
-    let numbers = match percent {
-        Some(p) if p >= 0 => trf!("Activity {} + bonus {} (+{}%) = {}", k(b.activity), k(b.bonus), p, total),
-        _ => trf!("Activity {} + bonus {} = {}", k(b.activity), k(b.bonus), total),
-    };
+    let numbers = trf!("Activity {} + bonus {} = {}", k(b.activity), k(b.bonus), total);
+    let numbers = with_drops(numbers, b.percent);
     let reward = match b.next {
         Some(n) if n < 1e8 => trf!("Reward: next tier {}", k(Some(n))),
         Some(_) => tr("Reward: all taken").to_string(),
@@ -882,8 +898,8 @@ fn rerolls(ui: &mut egui::Ui, v: &View) {
     fixed_row(ui, |ui| {
         if v.potion_rerolls.is_some() || v.instrument_rerolls.is_some() {
             let count = |n: Option<i32>| n.map_or_else(|| "?".to_string(), |n| n.to_string());
-            theme::chip(ui, RichText::new(format!("藥劑重擲 {}", count(v.potion_rerolls))).small());
-            theme::chip(ui, RichText::new(format!("用具重擲 {}", count(v.instrument_rerolls))).small());
+            theme::chip(ui, RichText::new(trf!("Potion rerolls {}", count(v.potion_rerolls))).small());
+            theme::chip(ui, RichText::new(trf!("Instrument rerolls {}", count(v.instrument_rerolls))).small());
         }
     });
 }
@@ -917,7 +933,7 @@ fn held(ui: &mut egui::Ui, held: &[(String, bool)]) {
         }
     });
     if !held.is_empty() {
-        response.on_hover_text(held.iter().map(|(name, _)| name.as_str()).collect::<Vec<_>>().join("、"));
+        response.on_hover_text(held.iter().map(|(name, _)| name.as_str()).collect::<Vec<_>>().join(tr(", ")));
     }
 }
 
@@ -1024,7 +1040,7 @@ fn advice_card(ui: &mut egui::Ui, v: &View) {
         });
         // The small text is fixed at two lines high and auto-wrapped; the solve note is written only up to the first
         // `；`, with the full text in the tooltip. During battle it is the battle numbers.
-        card_small(ui, v, &brief, &small);
+        card_small(ui, v, &brief, &small, 2);
     });
 }
 
@@ -1060,11 +1076,13 @@ fn card_parts(v: &View, brief: bool) -> (String, String) {
         Some(a) if v.status == Status::Advised => {
             let method = match a.method.find('\u{ff1b}').or_else(|| a.method.find(';')) {
                 Some(i) if brief => format!("{} \u{b7} ", &a.method[..i]),
+                // The English sentence ends in `.` and needs a space before the count; the Chinese one ends in `。`.
+                _ if a.method.ends_with('.') => format!("{} ", a.method),
                 _ => a.method.clone(),
             };
-            let mut how = format!("{method}{} 局", v.rollouts);
+            let mut how = trf!("{}{} runs", method, v.rollouts);
             if let Some(ms) = v.solve_ms {
-                how += &format!("，{:.2} 秒", ms as f64 / 1000.0);
+                how += &trf!(", {} s", format!("{:.2}", ms as f64 / 1000.0));
             }
             // When the advice is not rank 1, or the ranking is not by 840k chance, the small text first gives the
             // reason (see advice_reason).
@@ -1128,8 +1146,94 @@ fn with_battle(v: &View, b: &read::Battle) -> View {
     View { status: Status::Battle, battle: Some(b.clone()), advice: None, lines: Vec::new(), ..v.clone() }
 }
 
+/// Test only (ASCENDANT_PREVIEW_VORAX_PANEL): a made-up board for the panel. Six tanks with all four archetypes and
+/// all four rarities; `advice` has a potion acting on tanks 2 and 5 advised, a reroll row and a potion with no target;
+/// `stale` is that advice greyed while solving again; `none` is the same tanks unreadable, with no advice; `blank` is
+/// nothing read yet.
+fn preview_view(which: &str) -> View {
+    use ::vorax::Archetype::{Aemberon, Agito, BoneSentry, Pest};
+    let zh = crate::lang::zh();
+    let zh_en = |zh_text: &'static str, en: &'static str| if zh { zh_text } else { en };
+    if which == "blank" {
+        return View { mode: vorax_session::Mode::Board, status: Status::Idle, lines: vec![zh_en("等待讀取", "Waiting for a read").to_string()], ..View::default() };
+    }
+    // Monster names: in Chinese the first of each archetype in the name table, in English made up.
+    let monster = |a: ::vorax::Archetype, en: &str| {
+        if zh { crate::vorax::names::names().monsters.iter().find(|(_, x)| *x == a).map_or_else(|| en.to_string(), |(n, _)| n.clone()) } else { en.to_string() }
+    };
+    let tank = |a: ::vorax::Archetype, en: &str, rarity: Rarity, activity: i64, quantity: i64| read::Tank {
+        name: Some(monster(a, en)),
+        archetype: Some(a),
+        rarity: Some(rarity),
+        activity: Some(activity),
+        quantity: Some(quantity),
+        total: Some(activity * quantity),
+        ..read::Tank::default()
+    };
+    let tanks = vec![
+        tank(Pest, "Gnawing Pest", Rarity::Normal, 3_200, 4),
+        tank(BoneSentry, "Bone Sentry", Rarity::Magic, 8_400, 3),
+        tank(Agito, "Agito Seer", Rarity::Rare, 21_500, 2),
+        tank(Aemberon, "Aemberon Wisp", Rarity::Boss, 64_000, 1),
+        tank(Pest, "Plague Pest", Rarity::Magic, 5_100, 5),
+        tank(BoneSentry, "Bone Warden", Rarity::Normal, 2_800, 6),
+    ];
+    if which == "none" {
+        return View {
+            mode: vorax_session::Mode::Board,
+            status: Status::Unreadable,
+            lines: vec![zh_en("讀不到：", "Unreadable:").to_string(), zh_en("卡 2 的名稱", "the name of card 2").to_string()],
+            round: Some(6),
+            ultimate: Some(612_000),
+            potion_rerolls: Some(2),
+            instrument_rerolls: Some(1),
+            tanks,
+            held: vec![(zh_en("骨鋸", "Bone Saw").to_string(), false)],
+            ..View::default()
+        };
+    }
+    let potions: Vec<String> = crate::vorax::names::names().cards.iter().filter(|c| c.category == crate::vorax::names::Category::Potion && c.zh.is_some()).take(4).map(|c| c.shown().to_string()).collect();
+    let potion = |k: usize| potions.get(k).cloned().unwrap_or_else(|| format!("Potion {k}"));
+    let label = |name: &str, targets: &[u8]| {
+        if targets.is_empty() {
+            return name.to_string();
+        }
+        let ts: Vec<String> = targets.iter().map(|k| (k + 1).to_string()).collect();
+        format!("{name} \u{2192} {} {}", zh_en("水箱", "tank"), ts.join(zh_en("\u{3001}", ",")))
+    };
+    let row = |name: &str, targets: &[u8], mean: f64, reached: f64, refresh: bool, best: bool| AdviceRow { label: label(name, targets), name: name.to_string(), targets: targets.to_vec(), mean, reached: Some(reached), refresh, best };
+    let rows = vec![
+        row(&potion(0), &[1, 4], 812_400.0, 0.62, false, true),
+        row(zh_en("重擲", "Reroll"), &[], 790_100.0, 0.55, true, false),
+        row(&potion(1), &[2], 771_800.0, 0.50, false, false),
+        row(&potion(2), &[0], 702_300.0, 0.41, false, false),
+        row(&potion(3), &[], 650_900.0, 0.33, false, false),
+    ];
+    let headline = format!("{}{}{}", zh_en("建議", "Pick"), zh_en("\u{ff1a}", ": "), rows[0].label);
+    let method = zh_en("藥劑：每個選項模擬到終局；期望分數是終局最終活性的平均（上限 840k）。", "Potions: each option played to the end; mean is the final Ultimate Activity, capped at 840k.");
+    let stale = which == "stale";
+    View {
+        mode: vorax_session::Mode::Board,
+        status: if stale { Status::Solving } else { Status::Advised },
+        lines: vec![if stale { zh_en("求解中", "Solving") } else { zh_en("建議", "Advised") }.to_string()],
+        stale,
+        round: Some(6),
+        ultimate: Some(612_000),
+        potion_rerolls: Some(2),
+        instrument_rerolls: Some(1),
+        advice: Some(crate::vorax::AdviceRows { headline, note: None, rows, method: method.to_string(), unknown: vec![] }),
+        rollouts: 4096,
+        solve_ms: Some(1234),
+        board: Some("preview".to_string()),
+        tanks,
+        held: vec![(zh_en("骨鋸", "Bone Saw").to_string(), false)],
+        ..View::default()
+    }
+}
+
 /// The battle card: large text `終局戰鬥 第 2/3 波` (endgame battle, wave 2/3), small text
-/// `活性 568.5k ＋ 加成 221.2k（+39%）· 下一格 854.0k` (activity 568.5k + bonus 221.2k (+39%), next tier 854.0k), and
+/// `活性 568.5k ＋ 加成 221.2k · 下一格 854.0k · 掉落 +15%` (activity 568.5k + bonus 221.2k, next tier 854.0k, drops +15% (see
+/// [`with_drops`])), and
 /// after the last tier is taken it writes `獎勵全拿` (all rewards taken) (threshold 999.9M). The numbers are those of
 /// the result card (see [`battle_k`]): rounded down, k with one decimal, M with two.
 fn battle_text(b: &read::Battle) -> (String, String) {
@@ -1138,28 +1242,27 @@ fn battle_text(b: &read::Battle) -> (String, String) {
         Some((w, n)) => trf!("Endgame battle \u{b7} wave {}/{}", w, n),
         None => tr("Endgame battle").to_string(),
     };
-    let percent = b.percent.or_else(|| match (b.activity, b.bonus) {
-        (Some(a), Some(x)) if a > 0.0 => Some((x / a * 100.0).round() as i32),
-        _ => None,
-    });
-    let numbers = match percent {
-        // The bonus is never negative; a negative reading is treated as unreadable, so it is not written as `+-5%`.
-        Some(p) if p >= 0 => trf!("Activity {} + bonus {} (+{}%)", k(b.activity), k(b.bonus), p),
-        _ => trf!("Activity {} + bonus {}", k(b.activity), k(b.bonus)),
+    let numbers = trf!("Activity {} + bonus {}", k(b.activity), k(b.bonus));
+    // The next tier before the drop bonus: the compact panel's one line is cut at its end, and the tier is what the
+    // player plays for (the drop bonus is in the tooltip then).
+    let numbers = match b.next {
+        Some(n) if n < 1e8 => format!("{numbers} \u{b7} {}", trf!("next {}", k(Some(n)))),
+        Some(_) => format!("{numbers} \u{b7} {}", tr("all rewards taken")),
+        None => numbers,
     };
-    let next = match b.next {
-        Some(n) if n < 1e8 => trf!("next {}", k(Some(n))),
-        Some(_) => tr("all rewards taken").to_string(),
-        None => return (big, numbers),
-    };
-    (big, format!("{numbers} \u{b7} {next}"))
+    (big, with_drops(numbers, b.percent))
 }
 
-/// The small-text area of the advice card (fixed two lines high): normally the compact form with the full text in the
-/// tooltip; in the endgame battle the first line is the battle numbers and the second line is the very faint
-/// `戰鬥中讀數有雜訊，結束時最準` (readings are noisy during battle, most accurate at the end).
-fn card_small(ui: &mut egui::Ui, v: &View, brief: &str, small: &str) {
-    if in_battle(v) {
+/// The small-text area of the advice card (fixed `rows` lines high: two in the full panel, one in the compact one):
+/// normally the compact form with the full text in the tooltip; in the endgame battle the first line is the battle
+/// numbers and the second line is the very faint `戰鬥中讀數有雜訊，結束時最準` (readings are noisy during battle,
+/// most accurate at the end). With one line, the battle numbers alone (cut short when too long) and the faint note
+/// only in the tooltip.
+fn card_small(ui: &mut egui::Ui, v: &View, brief: &str, small: &str, rows: usize) {
+    if in_battle(v) && rows < 2 {
+        let noise = tr("Readings are noisy during the battle; most accurate at its end");
+        theme::lines_full(ui, small, &format!("{small}\n{noise}"), theme::TEXT, 1);
+    } else if in_battle(v) {
         let noise = tr("Readings are noisy during the battle; most accurate at its end");
         let faint = MUTED.gamma_multiply(0.6);
         ui.scope(|ui| {
@@ -1193,7 +1296,7 @@ fn card_small(ui: &mut egui::Ui, v: &View, brief: &str, small: &str) {
             }
         });
     } else {
-        theme::lines_full(ui, brief, small, MUTED, 2);
+        theme::lines_full(ui, brief, small, MUTED, rows);
     }
 }
 
@@ -1260,7 +1363,10 @@ fn progress(ui: &mut egui::Ui, title: &str, share: f32, text: String, colour: Co
     ui.horizontal(|ui| {
         let h = ui.spacing().interact_size.y;
         let spacing = ui.spacing().item_spacing.x;
-        ui.add_sized([30.0, h], egui::Label::new(RichText::new(title).small().color(MUTED)));
+        // At least 30 wide (the Chinese title fits in it); a longer title (the English one) gets its own width.
+        let small = egui::TextStyle::Small.resolve(ui.style());
+        let title_w = ui.painter().layout_no_wrap(title.to_string(), small, MUTED).size().x.ceil().max(30.0);
+        ui.add_sized([title_w, h], egui::Label::new(RichText::new(title).small().color(MUTED)));
         let width = (ui.available_width() - 70.0 - spacing).max(30.0);
         theme::bar(ui, width, share, colour);
         ui.allocate_ui_with_layout(Vec2::new(70.0, h), Layout::right_to_left(Align::Center), |ui| {
@@ -1274,17 +1380,28 @@ fn progress(ui: &mut egui::Ui, title: &str, share: f32, text: String, colour: Co
 /// no meaning, so only numbers are written): rank, name, chance to reach 840k, average score (expected score, written
 /// as `812k` by short_k). Ranked by average score. The header and the three rows are always drawn (blank rows pad it
 /// when there are fewer than three).
-fn ranking_rows(ui: &mut egui::Ui, cols: &Cols, rows: &[AdviceRow], stale: bool, always: bool) {
+///
+/// With `tanks` (both panels, 2026-11-08 layout) the option column writes the card name alone ([`AdviceRow::name`])
+/// and a `水箱` (tanks) column after it draws the six tanks small, the ones the card acts on enlarged in a gold frame
+/// (see [`tank_minis`]); without (the compact panel below 300 wide), the option column writes the whole label,
+/// `卡名 → 水箱 2、5`, with no tanks column.
+fn ranking_rows(ui: &mut egui::Ui, cols: &Cols, rows: &[AdviceRow], stale: bool, always: bool, tanks: Option<&[read::Tank]>) {
     let shown = shown_rows(rows);
     // The number columns use the width actually needed (the wider of the value and the column header), and the rest
     // goes to the name column.
     let width_of = |text: &str, style: egui::TextStyle| ui.painter().layout_no_wrap(text.to_string(), style.resolve(ui.style()), Color32::WHITE).size().x;
     let reach_w = shown.iter().map(|&k| width_of(&chance(&rows[k]), egui::TextStyle::Body)).fold(width_of(tr("Reach 840k"), egui::TextStyle::Small), f32::max) + 2.0;
     let mean_w = shown.iter().map(|&k| width_of(&row_mean(&rows[k], always), egui::TextStyle::Body)).fold(width_of(tr("Average"), egui::TextStyle::Small).max(width_of("888k", egui::TextStyle::Body)), f32::max) + 2.0;
-    let total = cols.rank + cols.label + cols.reach + cols.mean;
-    let cols = &Cols { label: (total - cols.rank - reach_w - mean_w).max(20.0), reach: reach_w, mean: mean_w, ..*cols };
-    let blanks = shown.len()..TOP_ROWS;
     let h = ui.spacing().interact_size.y;
+    let total = cols.rank + cols.label + cols.reach + cols.mean;
+    // The tanks column: six cells about a row high, at most 30% of the row (narrow windows shrink the cells).
+    let tanks_w = match tanks {
+        Some(_) => (6.0 * (h - 4.0) + 5.0 * MINI_GAP).min(total * 0.3).max(width_of(tr("Tanks"), egui::TextStyle::Small)),
+        None => 0.0,
+    };
+    let tanks_room = if tanks.is_some() { tanks_w + cols.spacing } else { 0.0 };
+    let cols = &Cols { label: (total - cols.rank - reach_w - mean_w - tanks_room).max(20.0), reach: reach_w, mean: mean_w, ..*cols };
+    let blanks = shown.len()..TOP_ROWS;
     ui.spacing_mut().item_spacing.x = cols.spacing;
     let reach_tip = tr("The chance that the final Ultimate Activity reaches 840k");
     let mean_tip = tr("The average final Ultimate Activity, counting nothing above 840k; ranked by this");
@@ -1295,8 +1412,13 @@ fn ranking_rows(ui: &mut egui::Ui, cols: &Cols, rows: &[AdviceRow], stale: bool,
         let left = cols.rank + cols.spacing + cols.label;
         ui.allocate_ui_with_layout(Vec2::new(left, h * 0.8), Layout::left_to_right(Align::Center), |ui| {
             ui.set_min_width(left);
-            ui.label(head("選項"));
+            ui.label(head(tr("Option")));
         });
+        if tanks.is_some() {
+            ui.allocate_ui_with_layout(Vec2::new(tanks_w, h * 0.8), Layout::centered_and_justified(egui::Direction::LeftToRight), |ui| {
+                ui.label(head(tr("Tanks"))).on_hover_text(tr("The tanks the card acts on are framed in gold"));
+            });
+        }
         ui.allocate_ui_with_layout(Vec2::new(cols.reach, h * 0.8), Layout::right_to_left(Align::Center), |ui| {
             ui.label(head(tr("Reach 840k"))).on_hover_text(reach_tip);
         });
@@ -1307,7 +1429,8 @@ fn ranking_rows(ui: &mut egui::Ui, cols: &Cols, rows: &[AdviceRow], stale: bool,
     let body = egui::TextStyle::Body.resolve(ui.style());
     for k in shown {
         let r = &rows[k];
-        let name = fit_option(ui, &r.label, cols.label, &body);
+        // The full panel writes the card name alone (the tanks column shows where it goes).
+        let name = if tanks.is_some() { r.name.clone() } else { fit_option(ui, &r.label, cols.label, &body) };
         let (label, reach, mean) = (RichText::new(name), RichText::new(chance(r)), RichText::new(row_mean(r, always)));
         let (label, reach, mean) = if stale {
             (label.color(STALE), reach.color(STALE), mean.color(STALE))
@@ -1324,6 +1447,14 @@ fn ranking_rows(ui: &mut egui::Ui, cols: &Cols, rows: &[AdviceRow], stale: bool,
                 // two do not stack.
                 ui.add(egui::Label::new(label).truncate().show_tooltip_when_elided(false)).on_hover_text(&r.label);
             });
+            if let Some(tanks) = tanks {
+                let (rect, response) = ui.allocate_exact_size(Vec2::new(tanks_w, h), Sense::hover());
+                // The reroll acts on no tank: its cells are left out.
+                if !r.refresh {
+                    tank_minis(ui.painter(), rect, tanks, &r.targets, stale);
+                    response.on_hover_text(&r.label);
+                }
+            }
             ui.allocate_ui_with_layout(Vec2::new(cols.reach, h), Layout::right_to_left(Align::Center), |ui| {
                 ui.label(reach).on_hover_text(reach_tip);
             });
@@ -1349,7 +1480,7 @@ fn chance(r: &AdviceRow) -> String {
 /// The full ranking table (as it originally looked).
 fn ranking_table(ui: &mut egui::Ui, rows: &[AdviceRow], stale: bool) {
     egui::Grid::new("vorax-ranking-all").striped(true).show(ui, |ui| {
-        for title in ["排名", "選項", "期望分數", "達840k"] {
+        for title in [tr("Rank"), tr("Option"), tr("Expected score"), tr("840k chance")] {
             ui.label(RichText::new(title).small().weak());
         }
         ui.end_row();
@@ -1368,52 +1499,249 @@ fn ranking_table(ui: &mut egui::Ui, rows: &[AdviceRow], stale: bool) {
     });
 }
 
-/// Six tanks in a row: the colour is the rarity, on top is the first character of the archetype, below is the total
-/// activity; an empty tank is drawn as an outline plus `空` (empty). Hovering shows the monster name, rarity, and
-/// `活性 × 數量` (activity x count). Before the tanks are read (before the first steady pick screen) the six cells
-/// are still drawn, outline only, with position and height unchanged. `per_row` is how many cells per row: 6 in the
-/// full version (one row), 3 in the compact version (3x2).
-fn tanks(ui: &mut egui::Ui, tanks: &[read::Tank], per_row: usize) {
+/// Height of a cell in the full panel's row of six tanks ([`tank_strip`]).
+const CELL_H: f32 = 66.0;
+/// Room above the row for the upper half of the card-name tag on a marked cell's top edge.
+const TAG_ROOM: f32 = 8.0;
+/// The gap between the small tank cells of the ranking's tanks column ([`tank_minis`]).
+const MINI_GAP: f32 = 2.0;
+/// How much of its own colour a dimmed tank keeps (the rest is the window background).
+const DIM: f32 = 0.38;
+
+/// The advised card's name and the tanks it acts on: the advised row when it is a card with target tanks; None for a
+/// reroll, a card with no target tank, a protocol and no advice (nothing is marked then, nothing dimmed).
+fn advised_targets(rows: &[AdviceRow]) -> Option<(&str, &[u8])> {
+    rows.iter().find(|r| r.best && !r.refresh && !r.targets.is_empty()).map(|r| (r.name.as_str(), r.targets.as_slice()))
+}
+
+/// The six tanks in one row, as in the game (tank 1 to 6 left to right; 2026-11-08 layout the user confirmed): each
+/// cell has from top to bottom the archetype icon (drawn, see [`archetype_icon`]), the monster's name in its rarity
+/// colour and its total activity. The tanks the advised card acts on (`focus`: its name and tanks) get a gold cell, a
+/// thick gold frame, a larger icon, a bold name and a gold tag with the card's name on the top edge; the other tanks
+/// are dimmed. When the advice is stale (grey) the frame and tag are grey and nothing is dimmed. Fixed height: before
+/// the tanks are read the six cells are outlines only, and the tag's room above is kept with or without a tag.
+/// Hovering a cell shows the monster name, rarity and `活性 × 數量` (activity x count).
+///
+/// `compact` (the compact panel, 2026-11-08) draws short cells two small lines high: the icon with the total activity
+/// beside it, then the name; the marked tanks keep the gold cell and frame (2 wide), the bold name and the larger
+/// icon, but get no tag (the advice card right above names the card), and no room is kept for one. Below 300 wide
+/// the gaps narrow to 2.
+fn tank_strip(ui: &mut egui::Ui, tanks: &[read::Tank], focus: Option<(&str, &[u8])>, stale: bool, compact: bool) {
     const TANKS: usize = 6;
-    let gap = 4.0;
-    let count = tanks.len().max(TANKS);
-    let n = per_row as f32;
-    let w = ((ui.available_width() - gap * (n - 1.0)) / n).clamp(16.0, 64.0);
-    for start in (0..count).step_by(per_row) {
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = gap;
-            for k in start..(start + per_row).min(count) {
-                let (rect, response) = ui.allocate_exact_size(Vec2::new(w, 34.0), Sense::hover());
-                let p = ui.painter();
-                let radius = (w * 0.14).clamp(3.0, 6.0);
-                let Some(t) = tanks.get(k) else {
-                    p.rect_stroke(rect, radius, Stroke::new(1.0, DIVIDER), StrokeKind::Inside);
-                    continue;
-                };
-                if t.empty {
-                    p.rect_filled(rect, radius, Color32::from_rgb(0x1a, 0x1c, 0x22));
-                    p.rect_stroke(rect, radius, Stroke::new(1.0, DIVIDER), StrokeKind::Inside);
-                    p.text(rect.center(), Align2::CENTER_CENTER, "空", FontId::proportional(theme::MIN_TEXT), MUTED);
-                    continue;
-                }
-                // The fill is the rarity (matching the game), the outline has a uniform width and is a slightly
-                // darker rarity colour (same as Tartarus's cells).
-                let c = t.rarity.map_or(Color32::from_gray(110), rarity_colour);
-                p.rect_filled(rect, radius, c.gamma_multiply(0.3));
-                p.rect_stroke(rect, radius, Stroke::new(1.0, c.gamma_multiply(0.9)), StrokeKind::Inside);
-                let kind: String = t.archetype.map_or_else(|| "?".to_string(), |a| archetype_zh(a).chars().next().map_or_else(|| "?".to_string(), String::from));
-                p.text(rect.center_top() + Vec2::new(0.0, 3.0), Align2::CENTER_TOP, kind, FontId::proportional(12.0), Color32::WHITE);
-                let total = t.total.map_or_else(|| "?".to_string(), short_k);
-                p.text(rect.center_bottom() - Vec2::new(0.0, 3.0), Align2::CENTER_BOTTOM, total, FontId::proportional(theme::MIN_TEXT), Color32::from_gray(220));
-                let name = t.name.clone().unwrap_or_else(|| "?".to_string());
-                let rarity = t.rarity.map_or("?", rarity_name);
-                let values = match (t.activity, t.quantity) {
-                    (Some(a), Some(q)) => format!("{} × {}", grouped(a), grouped(q)),
-                    _ => "?".to_string(),
-                };
-                response.on_hover_text(format!("{name}（{rarity}）\n活性 × 數量：{values}\n總活性：{}", t.total.map_or_else(|| "?".to_string(), grouped)));
+    let width = ui.available_width();
+    let gap = if compact && width < 300.0 { 2.0 } else { 4.0 };
+    let small = FontId::proportional(theme::MIN_TEXT);
+    let line_h = ui.painter().layout_no_wrap("\u{570b}".to_string(), small.clone(), Color32::WHITE).size().y;
+    let (room, cell_h) = if compact { (0.0, 2.0 * line_h + 2.0) } else { (TAG_ROOM, CELL_H) };
+    let (strip, _) = ui.allocate_exact_size(Vec2::new(width, room + cell_h), Sense::hover());
+    let w = ((width - gap * (TANKS as f32 - 1.0)) / TANKS as f32).max(16.0);
+    let gold = if stale { STALE } else { theme::GOLD };
+    let frame = if compact { 2.0 } else { 3.0 };
+    for k in 0..TANKS {
+        let rect = egui::Rect::from_min_size(egui::pos2(strip.left() + k as f32 * (w + gap), strip.top() + room), Vec2::new(w, cell_h));
+        let marked = focus.is_some_and(|(_, ts)| ts.contains(&(k as u8)));
+        let keep = if focus.is_some() && !marked && !stale { DIM } else { 1.0 };
+        let p = ui.painter();
+        let radius = (w * 0.12).clamp(3.0, 6.0);
+        let Some(t) = tanks.get(k) else {
+            p.rect_stroke(rect, radius, Stroke::new(1.0, DIVIDER), StrokeKind::Inside);
+            continue;
+        };
+        let rarity = t.rarity.map_or(Color32::from_gray(150), rarity_colour);
+        let (fill, edge) = match (marked, stale) {
+            (true, false) => (mix(theme::PANEL, theme::GOLD, 0.26), Stroke::new(frame, theme::GOLD)),
+            (true, true) => (theme::PANEL, Stroke::new(frame, STALE)),
+            _ => (fade(Color32::from_rgb(0x1f, 0x22, 0x2a), keep), Stroke::new(1.0, fade(if t.empty { DIVIDER } else { rarity.gamma_multiply(0.55) }, keep))),
+        };
+        p.rect_filled(rect, radius, fill);
+        p.rect_stroke(rect, radius, edge, StrokeKind::Inside);
+        if t.empty {
+            p.text(rect.center(), Align2::CENTER_CENTER, tr("Empty"), small.clone(), fade(MUTED, keep));
+        } else if compact {
+            // Line 1: the icon and the total activity beside it, centred together; line 2: the name.
+            let (top, mid) = (rect.top() + 1.0 + line_h / 2.0, rect.top() + 1.0 + line_h * 1.5);
+            let r = if marked { line_h * 0.5 } else { line_h * 0.38 };
+            let total = t.total.map_or_else(|| "?".to_string(), short_k);
+            let galley = one_line(p, &total, small.clone(), fade(Color32::from_gray(220), keep), w - 8.0 - 2.0 * r);
+            let left = rect.center().x - (2.0 * r + 2.0 + galley.size().x) / 2.0;
+            archetype_icon(p, egui::pos2(left + r, top), r, t.archetype, keep);
+            p.galley(egui::pos2(left + 2.0 * r + 2.0, top - galley.size().y / 2.0), galley, Color32::from_gray(220));
+            let name = t.name.clone().unwrap_or_else(|| "?".to_string());
+            text_in(p, egui::pos2(rect.center().x, mid), &name, small.clone(), fade(rarity, keep), w - 6.0, marked);
+        } else {
+            let r = if marked { (w * 0.24).min(14.0) } else { (w * 0.17).min(10.0) };
+            archetype_icon(p, egui::pos2(rect.center().x, rect.top() + 21.0), r, t.archetype, keep);
+            let name = t.name.clone().unwrap_or_else(|| "?".to_string());
+            let name_font = FontId::proportional(if marked { theme::MIN_TEXT + 1.0 } else { theme::MIN_TEXT });
+            text_in(p, egui::pos2(rect.center().x, rect.top() + 43.0), &name, name_font, fade(rarity, keep), w - 6.0, marked);
+            let total = t.total.map_or_else(|| "?".to_string(), short_k);
+            text_in(p, egui::pos2(rect.center().x, rect.top() + 57.0), &total, small.clone(), fade(Color32::from_gray(220), keep), w - 6.0, false);
+        }
+        if marked && !compact && let Some((card, _)) = focus {
+            // The tag on the top edge: gold with dark text (grey when stale), at most the cell's width plus the gaps.
+            let font = FontId::proportional(theme::MIN_TEXT);
+            let room = w + gap - 8.0;
+            let galley = one_line(p, card, font, theme::NIGHT, room);
+            let tag = egui::Rect::from_center_size(egui::pos2(rect.center().x, rect.top()), Vec2::new(galley.size().x + 8.0, galley.size().y + 2.0));
+            p.rect_filled(tag, 3.0, gold);
+            p.galley(tag.center() - galley.size() / 2.0, galley, theme::NIGHT);
+        }
+        let rarity_text = t.rarity.map_or("?", rarity_name);
+        let values = match (t.activity, t.quantity) {
+            (Some(a), Some(q)) => format!("{} × {}", grouped(a), grouped(q)),
+            _ => "?".to_string(),
+        };
+        let name = t.name.clone().unwrap_or_else(|| "?".to_string());
+        if !t.empty {
+            ui.interact(rect, egui::Id::unique(("vorax-tank", k)), Sense::hover())
+                .on_hover_text(trf!("{} ({})\nActivity \u{d7} count: {}\nTotal activity: {}", name, rarity_text, values, t.total.map_or_else(|| "?".to_string(), grouped)));
+        }
+    }
+}
+
+/// The small tanks of one ranking row (the tanks column): six cells with the archetype icon; the tanks the card
+/// acts on (`targets`) are enlarged, framed in gold on a light gold cell, the others dimmed (grey frame and nothing
+/// dimmed when the advice is `stale`). A card with no target tank has all six dimmed. Before the tanks are read the
+/// cells are outlines only.
+fn tank_minis(p: &egui::Painter, rect: egui::Rect, tanks: &[read::Tank], targets: &[u8], stale: bool) {
+    const TANKS: usize = 6;
+    let s = ((rect.width() - MINI_GAP * (TANKS as f32 - 1.0)) / TANKS as f32).min(rect.height() - 4.0).max(4.0);
+    let used = s * TANKS as f32 + MINI_GAP * (TANKS as f32 - 1.0);
+    let left = rect.center().x - used / 2.0;
+    for k in 0..TANKS {
+        let cell = egui::Rect::from_min_size(egui::pos2(left + k as f32 * (s + MINI_GAP), rect.center().y - s / 2.0), Vec2::splat(s));
+        let marked = targets.contains(&(k as u8));
+        let keep = if marked || stale { 1.0 } else { DIM };
+        let Some(t) = tanks.get(k) else {
+            p.rect_stroke(cell, 2.0, Stroke::new(1.0, DIVIDER), StrokeKind::Inside);
+            continue;
+        };
+        if marked {
+            let big = cell.expand(1.5);
+            let (fill, edge) = if stale { (theme::PANEL, STALE) } else { (mix(theme::PANEL, theme::GOLD, 0.3), theme::GOLD) };
+            p.rect_filled(big, 3.0, fill);
+            p.rect_stroke(big, 3.0, Stroke::new(1.5, edge), StrokeKind::Inside);
+        } else {
+            p.rect_filled(cell, 2.0, fade(Color32::from_rgb(0x22, 0x25, 0x2e), keep));
+        }
+        if t.empty {
+            p.line_segment([cell.center() - Vec2::new(s * 0.2, 0.0), cell.center() + Vec2::new(s * 0.2, 0.0)], Stroke::new(1.0, fade(MUTED, keep)));
+        } else {
+            archetype_icon(p, cell.center(), if marked { s * 0.46 } else { s * 0.36 }, t.archetype, keep);
+        }
+    }
+}
+
+/// `c` dimmed: mixed toward the window background, keeping `keep` of it (1 is unchanged).
+fn fade(c: Color32, keep: f32) -> Color32 {
+    if keep >= 1.0 { c } else { mix(theme::BG, c, keep) }
+}
+
+/// `a` mixed toward `b` by `t` (0 is `a`, 1 is `b`), opaque.
+fn mix(a: Color32, b: Color32, t: f32) -> Color32 {
+    let m = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t).round().clamp(0.0, 255.0) as u8;
+    Color32::from_rgb(m(a.r(), b.r()), m(a.g(), b.g()), m(a.b(), b.b()))
+}
+
+/// `text` laid out on one line no wider than `max_w`, cut with `…` when longer.
+fn one_line(p: &egui::Painter, text: &str, font: FontId, colour: Color32, max_w: f32) -> std::sync::Arc<egui::Galley> {
+    let mut job = egui::text::LayoutJob::simple_singleline(text.to_string(), font, colour);
+    job.wrap.max_width = max_w.max(8.0);
+    job.wrap.max_rows = 1;
+    job.wrap.break_anywhere = true;
+    p.layout_job(job)
+}
+
+/// One line of `text` centred on `at` (cut with `…` beyond `max_w`); `bold` draws it twice, a little apart (the font
+/// has no bold face).
+fn text_in(p: &egui::Painter, at: egui::Pos2, text: &str, font: FontId, colour: Color32, max_w: f32, bold: bool) {
+    let galley = one_line(p, text, font, colour, max_w);
+    let min = at - galley.size() / 2.0;
+    if bold {
+        p.galley(min + Vec2::new(0.6, 0.0), galley.clone(), colour);
+    }
+    p.galley(min, galley, colour);
+}
+
+/// The archetype's icon, drawn as shapes in the style of the game's tank icons (the user chose drawn shapes over the
+/// game's images, 2026-11-08), centred on `c` with radius `r`, keeping `keep` of its colours (see [`fade`]):
+/// - Pest: a purple bead, a dark inner circle and a small highlight at the upper left.
+/// - Bone Sentry: a yellow helmet with a horn on each side and a dark T-shaped face slit.
+/// - Agito: a red eye with rays: eight short rays, a red almond eye and a light pupil.
+/// - Aemberon: a blue pinwheel: four curved blades around a dark centre.
+///
+/// An archetype not read is a grey circle.
+fn archetype_icon(p: &egui::Painter, c: egui::Pos2, r: f32, archetype: Option<::vorax::Archetype>, keep: f32) {
+    use ::vorax::Archetype;
+    let col = |rgb: [u8; 3]| fade(Color32::from_rgb(rgb[0], rgb[1], rgb[2]), keep);
+    let at = |x: f32, y: f32| egui::pos2(c.x + x * r, c.y + y * r);
+    match archetype {
+        Some(Archetype::Pest) => {
+            p.circle_filled(c, r, col([0xa3, 0x5c, 0xdc]));
+            p.circle_filled(c, r * 0.55, col([0x2b, 0x16, 0x42]));
+            p.circle_filled(at(-0.5, -0.5), (r * 0.17).max(0.8), col([0xec, 0xd8, 0xff]));
+        }
+        Some(Archetype::BoneSentry) => {
+            let yellow = col([0xe6, 0xb8, 0x3e]);
+            let dark = col([0x3a, 0x2a, 0x10]);
+            // Horns, then the helmet over their roots.
+            p.add(egui::Shape::convex_polygon(vec![at(-1.0, -0.98), at(-0.28, -0.42), at(-0.62, 0.0)], yellow, Stroke::NONE));
+            p.add(egui::Shape::convex_polygon(vec![at(1.0, -0.98), at(0.62, 0.0), at(0.28, -0.42)], yellow, Stroke::NONE));
+            let mut helmet: Vec<egui::Pos2> = (0..=10).map(|k| {
+                let a = std::f32::consts::PI * (1.0 + k as f32 / 10.0);
+                at(0.68 * a.cos(), -0.08 + 0.68 * a.sin())
+            }).collect();
+            helmet.extend([at(0.68, 0.45), at(0.4, 0.82), at(-0.4, 0.82), at(-0.68, 0.45)]);
+            p.add(egui::Shape::convex_polygon(helmet, yellow, Stroke::NONE));
+            p.rect_filled(egui::Rect::from_min_max(at(-0.46, 0.04), at(0.46, 0.22)), 0.0, dark);
+            p.rect_filled(egui::Rect::from_min_max(at(-0.1, 0.04), at(0.1, 0.72)), 0.0, dark);
+        }
+        Some(Archetype::Agito) => {
+            let red = col([0xe0, 0x48, 0x50]);
+            let ray = Stroke::new((r * 0.13).max(0.8), red);
+            for k in 0..8 {
+                let a = std::f32::consts::FRAC_PI_4 * k as f32;
+                p.line_segment([at(0.74 * a.cos(), 0.74 * a.sin()), at(a.cos(), a.sin())], ray);
             }
-        });
+            let n = 10;
+            let mut eye: Vec<egui::Pos2> = (0..=n).map(|k| {
+                let s = k as f32 / n as f32;
+                at(-0.62 + 1.24 * s, -0.4 * (std::f32::consts::PI * s).sin())
+            }).collect();
+            eye.extend((1..n).rev().map(|k| {
+                let s = k as f32 / n as f32;
+                at(-0.62 + 1.24 * s, 0.4 * (std::f32::consts::PI * s).sin())
+            }));
+            p.add(egui::Shape::convex_polygon(eye, red, Stroke::NONE));
+            p.circle_filled(c, (r * 0.2).max(0.8), col([0xff, 0xe2, 0xd6]));
+        }
+        Some(Archetype::Aemberon) => {
+            let blue = col([0x4f, 0x9e, 0xec]);
+            // Each blade is a lens from near the centre to a tip turned 35 degrees on, bulging more on one side, so
+            // the four read as a pinwheel turning.
+            for k in 0..4 {
+                let a = std::f32::consts::FRAC_PI_2 * k as f32;
+                let base = at(0.08 * a.cos(), 0.08 * a.sin());
+                let turn = a + 0.7;
+                let tip = at(0.98 * turn.cos(), 0.98 * turn.sin());
+                let along = tip - base;
+                let side = Vec2::new(-along.y, along.x).normalized();
+                let n = 8;
+                let mut blade: Vec<egui::Pos2> = (0..=n).map(|j| {
+                    let s = j as f32 / n as f32;
+                    base + along * s - side * (0.5 * r * (std::f32::consts::PI * s).sin())
+                }).collect();
+                blade.extend((1..n).rev().map(|j| {
+                    let s = j as f32 / n as f32;
+                    base + along * s + side * (0.1 * r * (std::f32::consts::PI * s).sin())
+                }));
+                p.add(egui::Shape::convex_polygon(blade, blue, Stroke::NONE));
+            }
+            p.circle_filled(c, (r * 0.26).max(0.8), col([0x10, 0x22, 0x44]));
+        }
+        None => {
+            p.circle_stroke(c, r * 0.8, Stroke::new(1.0, col([0x90, 0x90, 0x90])));
+        }
     }
 }
 
@@ -1523,7 +1851,7 @@ mod tests {
     /// game and a dash in the panel.
     #[test]
     fn the_value_on_the_game_is_the_panels_number() {
-        let row = |mean: f64, best: bool| AdviceRow { label: String::new(), mean, reached: Some(0.4), refresh: false, best };
+        let row = |mean: f64, best: bool| AdviceRow { name: String::new(), targets: vec![], label: String::new(), mean, reached: Some(0.4), refresh: false, best };
         let rows = vec![row(812_400.0, false), row(694_600.0, true), row(600_000.0, false)];
         let mut view = View {
             advice: Some(crate::vorax::AdviceRows { headline: String::new(), note: None, rows: rows.clone(), method: String::new(), unknown: vec![] }),
@@ -1542,7 +1870,7 @@ mod tests {
         assert_eq!(advised_k(&View::default(), false), None, "no advice");
         // A card always taken is advised without a playout (no chance, mean 0): "Always take" on the game and in the
         // panel's cell for it.
-        let taken = AdviceRow { label: String::new(), mean: 0.0, reached: None, refresh: false, best: true };
+        let taken = AdviceRow { name: String::new(), targets: vec![], label: String::new(), mean: 0.0, reached: None, refresh: false, best: true };
         view.boxes = vec![vorax_session::MarkBox { what: "card 1".into(), at: (1205.0, 1140.0, 110.0, 185.0), style: BoxStyle::Plain }];
         view.advice = Some(crate::vorax::AdviceRows { headline: String::new(), note: None, rows: vec![taken.clone()], method: String::new(), unknown: vec![] });
         assert_eq!(advised_k(&view, true).as_deref(), Some(tr("Always take")));
@@ -1551,7 +1879,7 @@ mod tests {
         assert_eq!(advised_k(&view, false), None);
         assert_eq!(row_mean(&taken, false), "\u{2014}");
         // A value worked out as 0 is a value, not the rule.
-        let zero = AdviceRow { label: String::new(), mean: 0.0, reached: Some(0.0), refresh: false, best: true };
+        let zero = AdviceRow { name: String::new(), targets: vec![], label: String::new(), mean: 0.0, reached: Some(0.0), refresh: false, best: true };
         assert_eq!(row_mean(&zero, false), "0");
     }
 
@@ -1620,7 +1948,7 @@ mod tests {
     /// it is in the third row, and this line writes 3, 4, 6.
     #[test]
     fn rest_line_lists_the_options_below_the_bars() {
-        let row = |label: &str, best: bool| AdviceRow { label: label.into(), mean: 812_000.0, reached: Some(0.5), refresh: false, best };
+        let row = |label: &str, best: bool| AdviceRow { name: String::new(), targets: vec![], label: label.into(), mean: 812_000.0, reached: Some(0.5), refresh: false, best };
         let five: Vec<AdviceRow> = ["甲", "乙", "丙", "丁", "戊"].iter().map(|l| row(l, *l == "甲")).collect();
         assert_eq!(rest_text(&five), "4 丁 50% 812k \u{b7} 5 戊 50% 812k");
         let three: Vec<AdviceRow> = five[..3].to_vec();
@@ -1683,9 +2011,9 @@ mod tests {
         let b = read::Battle { wave: Some((2, 3)), activity: Some(568_500.0), bonus: Some(221_200.0), next: Some(854_000.0), percent: Some(39), raw: String::new() };
         let (big, small) = battle_text(&b);
         assert_eq!(big, trf!("Endgame battle \u{b7} wave {}/{}", 2, 3));
-        assert_eq!(small, format!("{} \u{b7} {}", trf!("Activity {} + bonus {} (+{}%)", "568.5k", "221.2k", 39), trf!("next {}", "854.0k")));
+        assert_eq!(small, format!("{} \u{b7} {} \u{b7} {}", trf!("Activity {} + bonus {}", "568.5k", "221.2k"), trf!("next {}", "854.0k"), trf!("drops +{}%", 39)));
         let full = read::Battle { wave: Some((3, 3)), next: Some(999_900_000.0), activity: Some(1_260_000.0), ..b.clone() };
-        assert!(battle_text(&full).1.ends_with(tr("all rewards taken")));
+        assert!(battle_text(&full).1.contains(tr("all rewards taken")));
         assert!(battle_text(&full).1.contains("1.26M"));
         assert!(!battle_text(&full).1.contains('K'));
         // No ranking during battle.
@@ -1697,7 +2025,7 @@ mod tests {
     /// midway").
     #[test]
     fn kit_is_recognised_in_both_languages() {
-        let row = |label: &str, refresh: bool, best: bool| AdviceRow { label: label.into(), mean: 800_000.0, reached: Some(0.5), refresh, best };
+        let row = |label: &str, refresh: bool, best: bool| AdviceRow { name: String::new(), targets: vec![], label: label.into(), mean: 800_000.0, reached: Some(0.5), refresh, best };
         assert!(is_kit("藥劑箱（大）") && is_kit("稀有藥劑箱（小）") && is_kit("Potion Kit (Large)") && is_kit("Rare Potion Kit (Small)"));
         assert!(!is_kit("迷魂酊劑 \u{2192} 水箱 1") && !is_kit("Reroll"));
         assert_eq!(advice_reason(&[row("Reroll", true, false), row("Potion Kit (Small)", false, true)]), Some(tr("Potion kit first, no reroll")));
@@ -1708,7 +2036,7 @@ mod tests {
     /// reroll dropped midway.
     #[test]
     fn reason_follows_the_best_row() {
-        let row = |label: &str, reached: f64, refresh: bool, best: bool| AdviceRow { label: label.into(), mean: 800_000.0, reached: Some(reached), refresh, best };
+        let row = |label: &str, reached: f64, refresh: bool, best: bool| AdviceRow { name: String::new(), targets: vec![], label: label.into(), mean: 800_000.0, reached: Some(reached), refresh, best };
         // a: row 0 is a reroll, the advice is a potion kit.
         assert_eq!(advice_reason(&[row("重擲", 0.5, true, false), row("藥劑箱（小）", 0.4, false, true)]), Some(tr("Potion kit first, no reroll")));
         // b: the advice is row 0, but row 1 has a higher 840k chance.
@@ -1723,7 +2051,7 @@ mod tests {
 
     #[test]
     fn verdict_compares_the_advice_with_the_runner_up() {
-        let row = |mean: f64, reached: Option<f64>, best: bool| AdviceRow { label: String::new(), mean, reached, refresh: false, best };
+        let row = |mean: f64, reached: Option<f64>, best: bool| AdviceRow { name: String::new(), targets: vec![], label: String::new(), mean, reached, refresh: false, best };
         // 5 percentage points of chance difference, 5% expected score difference: clearly better.
         assert_eq!(verdict(&[row(800_000.0, Some(0.60), true), row(760_000.0, Some(0.55), false)], false), Some(Verdict::Clear));
         // Chance differs by less than 1 percentage point: either is fine.
@@ -1735,5 +2063,180 @@ mod tests {
         // Only one row, or the advice is stale: no label.
         assert_eq!(verdict(&[row(800_000.0, Some(0.6), true)], false), None);
         assert_eq!(verdict(&[row(800_000.0, Some(0.60), true), row(500_000.0, Some(0.1), false)], true), None);
+    }
+
+    /// The English keys this file looks up (`tr("...")` and `trf!("...")` outside the tests), unescaped.
+    fn panel_keys() -> Vec<String> {
+        let source = include_str!("vorax_view.rs");
+        let code = &source[..source.find("\nmod tests {").expect("the tests module")];
+        let calls = code.match_indices("tr(\"").chain(code.match_indices("trf!(\""));
+        let mut keys = Vec::new();
+        for (start, _) in calls {
+            // Only the calls themselves, not a name ending in `tr`.
+            if code[..start].chars().next_back().is_some_and(|c| c.is_alphanumeric() || c == '_') {
+                continue;
+            }
+            let rest = &code[start..];
+            let mut chars = rest[rest.find('"').unwrap() + 1..].chars();
+            let mut key = String::new();
+            while let Some(c) = chars.next() {
+                match c {
+                    '"' => break,
+                    '\\' => match chars.next() {
+                        Some('n') => key.push('\n'),
+                        Some('u') => {
+                            let hex: String = chars.by_ref().skip(1).take_while(|&c| c != '}').collect();
+                            key.push(char::from_u32(u32::from_str_radix(&hex, 16).unwrap()).unwrap());
+                        }
+                        Some(c) => key.push(c),
+                        None => break,
+                    },
+                    c => key.push(c),
+                }
+            }
+            keys.push(key);
+        }
+        keys
+    }
+
+    /// Every English key the panel looks up has its Traditional Chinese in src/lang/zh_tw.rs.
+    #[test]
+    fn every_panel_key_has_chinese() {
+        let keys = panel_keys();
+        assert!(keys.len() >= 40, "only {} keys found", keys.len());
+        let missing: Vec<&String> = keys.iter().filter(|k| crate::lang::tr_in(crate::lang::Lang::ZhTw, Box::leak(k.to_string().into_boxed_str())) == k.as_str()).collect();
+        assert!(missing.is_empty(), "no Chinese for {missing:?}");
+    }
+
+    /// The labels that were written in Chinese before they went through `tr()` read exactly as before in Chinese.
+    #[test]
+    fn the_chinese_panel_reads_as_before() {
+        use crate::lang::{Lang, fill, tr_in};
+        let zh = |en: &'static str| tr_in(Lang::ZhTw, en);
+        assert_eq!(zh("Activity"), "活性");
+        assert_eq!(fill(zh("Final activity {} (target {})"), &[&"612,000", &"840,000"]), "最終活性 612,000（目標 840,000）");
+        assert_eq!([zh("Full ranking"), zh("Board as read")], ["全部排名", "讀到的盤面"]);
+        let rerolls = format!("{} \u{b7} {}", fill(zh("Potion rerolls {}"), &[&2]), fill(zh("Instrument rerolls {}"), &[&"?"]));
+        assert_eq!(rerolls, "藥劑重擲 2 \u{b7} 用具重擲 ?");
+        assert_eq!(fill(zh("{}{} runs"), &[&"藥劑：每個選項模擬到終局 \u{b7} ", &4096]) + &fill(zh(", {} s"), &[&"1.23"]), "藥劑：每個選項模擬到終局 \u{b7} 4096 局，1.23 秒");
+        assert_eq!([zh("Option"), zh("Rank"), zh("Expected score"), zh("840k chance")], ["選項", "排名", "期望分數", "達840k"]);
+        assert_eq!([zh("Empty"), zh(", ")], ["空", "、"]);
+        let tip = fill(zh("{} ({})\nActivity \u{d7} count: {}\nTotal activity: {}"), &[&"吸血蝠", &"稀有", &"1,200 × 3", &"3,600"]);
+        assert_eq!(tip, "吸血蝠（稀有）\n活性 × 數量：1,200 × 3\n總活性：3,600");
+    }
+
+    /// The text the panel draws, laid out off screen at 421 wide.
+    fn drawn_text(draw: impl Fn(&mut egui::Ui)) -> String {
+        drawn_at(421.0, draw).0
+    }
+
+    /// The text the panel draws, laid out off screen at `width` wide, one line per text shape, and the rectangles it
+    /// strokes as (stroke width, colour).
+    fn drawn_at(width: f32, draw: impl Fn(&mut egui::Ui)) -> (String, Vec<(f32, Color32)>) {
+        let ctx = egui::Context::default();
+        let input = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(width, 900.0))), ..Default::default() };
+        let mut output = ctx.run_ui(input, |ui| draw(ui));
+        // egui asserts in debug builds that texture updates are taken before the output is dropped.
+        output.textures_delta.clear();
+        fn walk(shape: &egui::Shape, out: &mut String, strokes: &mut Vec<(f32, Color32)>) {
+            match shape {
+                egui::Shape::Text(t) => {
+                    out.push_str(t.galley.text());
+                    out.push('\n');
+                }
+                egui::Shape::Rect(r) if r.stroke.width > 0.0 => strokes.push((r.stroke.width, r.stroke.color)),
+                egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| walk(s, out, strokes)),
+                _ => {}
+            }
+        }
+        let (mut out, mut strokes) = (String::new(), Vec::new());
+        output.shapes.iter().for_each(|c| walk(&c.shape, &mut out, &mut strokes));
+        (out, strokes)
+    }
+
+    /// The compact panel draws the 2026-11-08 layout too (the user saw the old one in a 397x392 window): the six
+    /// tanks in a row, each named (an empty one `Empty`), the advised card's two tanks framed in gold (2 wide) and
+    /// the rest not, and the ranking's tanks column (from 300 wide); stale advice frames them grey, and with no advice
+    /// nothing is framed. At 421 wide and in the narrow fallback.
+    #[test]
+    fn the_compact_panel_marks_the_advised_tanks() {
+        let named = |which: &str| {
+            let mut view = preview_view(which);
+            for (k, t) in view.tanks.iter_mut().enumerate() {
+                t.name = Some(format!("T{}", k + 1));
+            }
+            view.tanks[5].empty = true;
+            view
+        };
+        let frames = |strokes: &[(f32, Color32)], colour: Color32| strokes.iter().filter(|&&(w, c)| w == 2.0 && c == colour).count();
+        let view = named("advice");
+        assert_eq!(advised_targets(advice_rows(&view)).map(|(_, ts)| ts), Some(&[1u8, 4][..]));
+        for width in [421.0, 240.0] {
+            let (text, strokes) = drawn_at(width, |ui| draw_panel_compact(&view, ui, false));
+            for k in 1..=5 {
+                assert!(text.lines().any(|l| l == format!("T{k}")), "tank {k} at {width}:\n{text}");
+            }
+            assert!(!text.lines().any(|l| l == "T6") && text.lines().any(|l| l == "Empty"), "{text}");
+            assert!(text.lines().any(|l| l == "Option"), "{text}");
+            // The ranking's tanks column from 300 wide; below, the option names keep `→ tank N`.
+            assert_eq!(text.lines().any(|l| l == "Tanks"), width >= 300.0, "{text}");
+            assert_eq!(text.lines().any(|l| l.contains('\u{2192}') && l.ends_with('3')), width < 300.0, "{text}");
+            assert_eq!(frames(&strokes, theme::GOLD), 2, "gold frames at {width}");
+        }
+        let (_, strokes) = drawn_at(421.0, |ui| draw_panel_compact(&named("stale"), ui, false));
+        assert_eq!((frames(&strokes, theme::GOLD), frames(&strokes, STALE)), (0, 2));
+        let (text, strokes) = drawn_at(421.0, |ui| draw_panel_compact(&named("none"), ui, false));
+        assert_eq!(frames(&strokes, theme::GOLD) + frames(&strokes, STALE), 0);
+        assert!(text.lines().any(|l| l == "T1") && text.lines().any(|l| l == "Tanks"), "{text}");
+    }
+
+    /// Chinese characters and punctuation; the full-width plus and minus of the compact links are symbols.
+    fn chinese(c: char) -> bool {
+        matches!(c, '\u{3000}'..='\u{303f}' | '\u{3400}'..='\u{4dbf}' | '\u{4e00}'..='\u{9fff}') || (matches!(c, '\u{ff00}'..='\u{ffef}') && !matches!(c, '\u{ff0b}' | '\u{ff0d}'))
+    }
+
+    /// In the English window, the panel (both layouts, the battle card and the result card) draws no Chinese when the
+    /// game's text it is given is English.
+    #[test]
+    fn the_english_panel_draws_no_chinese() {
+        assert_eq!(crate::lang::lang(), crate::lang::Lang::En, "the tests run in English");
+        let tank = |empty: bool, archetype: ::vorax::Archetype| read::Tank { empty, name: Some("Leech".into()), archetype: Some(archetype), rarity: Some(Rarity::Rare), activity: Some(1200), quantity: Some(3), total: Some(3600), ..read::Tank::default() };
+        let tanks = vec![tank(false, ::vorax::Archetype::Pest), tank(false, ::vorax::Archetype::Aemberon), tank(true, ::vorax::Archetype::Pest), tank(false, ::vorax::Archetype::BoneSentry), tank(false, ::vorax::Archetype::Agito), tank(true, ::vorax::Archetype::Pest)];
+        let row = |label: &str, best: bool| AdviceRow { name: String::new(), targets: vec![], label: label.into(), mean: 812_000.0, reached: Some(0.5), refresh: false, best };
+        let rows = vec![row("Bewitching Tincture \u{2192} Tank 1", true), row("Reroll", false), row("Potion Kit (Large)", false), row("Bone Saw", false)];
+        let method = "Potions: each option played to the end; mean is the final Ultimate Activity, capped at 840k.".to_string();
+        let advice = crate::vorax::AdviceRows { headline: "Bewitching Tincture \u{2192} Tank 1".into(), note: Some("Something else.".into()), rows, method, unknown: vec![] };
+        let view = View {
+            status: Status::Advised,
+            round: Some(5),
+            ultimate: Some(612_000),
+            potion_rerolls: Some(2),
+            instrument_rerolls: None,
+            advice: Some(advice),
+            rollouts: 4096,
+            solve_ms: Some(1234),
+            board: Some("tank 1".into()),
+            tanks,
+            held: vec![("Scalpel".into(), true), ("Bone Saw".into(), false)],
+            lines: vec!["Advised".into()],
+            ..View::default()
+        };
+        let battle = read::Battle { wave: Some((2, 3)), activity: Some(568_500.0), bonus: Some(221_200.0), next: Some(854_000.0), percent: Some(39), raw: String::new() };
+        let game = GameSummary { log_dir: None, ended_at: 0, board: Some(812_345), board_from: Some(BoardFrom::ResultScreen), rounds: 13, instruments: vec!["Scalpel".into()], battle: Some(battle.clone()) };
+        let texts = [
+            drawn_text(|ui| draw_panel(&view, ui, false)),
+            drawn_text(|ui| draw_panel_compact(&view, ui, false)),
+            drawn_text(|ui| draw_panel(&with_battle(&view, &battle), ui, false)),
+            drawn_text(|ui| result_panel(&game, ui, false)),
+            drawn_text(|ui| result_panel(&game, ui, true)),
+        ];
+        for text in &texts {
+            assert!(text.contains("Activity"), "{text}");
+            assert!(!text.chars().any(chinese), "Chinese in the English panel:\n{text}");
+        }
+        assert!(texts[0].contains("Potion rerolls 2") && texts[0].contains("Instrument rerolls ?") && texts[0].contains("Full ranking"), "{}", texts[0]);
+        assert_eq!(card_text(&view).1, "Potions: each option played to the end; mean is the final Ultimate Activity, capped at 840k. 4096 runs, 1.23 s");
+        assert_eq!(card_brief(&view), "Potions: each option played to the end \u{b7} 4096 runs, 1.23 s");
+        assert!(texts[1].contains("Board as read"), "{}", texts[1]);
     }
 }

@@ -49,6 +49,11 @@ pub struct CardName {
     pub id: Option<u8>,
     /// English name of the solver.
     pub en: String,
+    /// Name the English client prints, when it is not the solver's (`enClient` in the name file): the potion the
+    /// solver calls `Purest Holy Water` is `The Holiest Water` on the English client's card and tooltip (2026-11-08,
+    /// round 7 of 09-50-14, read as 至純聖水 once the client was switched to Traditional Chinese). `en` stays the
+    /// solver's, which ties the card to its id.
+    pub client_en: Option<String>,
     /// Name printed by the Traditional Chinese client; None if not copied.
     pub zh: Option<String>,
     /// Rarity of a potion (the card-bottom text `普通藥劑` / `魔法藥劑` / `稀有藥劑`); None for other categories.
@@ -60,8 +65,14 @@ impl CardName {
     pub fn shown(&self) -> &str {
         match (&self.zh, lang::zh()) {
             (Some(zh), true) => zh,
-            _ => &self.en,
+            _ => self.printed_en(),
         }
+    }
+
+    /// The name the English client prints: [`Self::client_en`] when it has one, the solver's otherwise. What the
+    /// English reader matches card names, tooltips and effect texts against, and what an English page shows.
+    pub fn printed_en(&self) -> &str {
+        self.client_en.as_deref().unwrap_or(&self.en)
     }
 }
 
@@ -70,13 +81,15 @@ pub struct Names {
     pub cards: Vec<CardName>,
     /// Traditional Chinese name and archetype of each monster (the English solver has no monster names).
     pub monsters: Vec<(String, Archetype)>,
+    /// English name and archetype of each monster whose English name is known (the English client's tank names).
+    pub monsters_en: Vec<(String, Archetype)>,
 }
 
 /// File name of the supplementary name file. Its format is a subset of the name file, for example
 /// `{"potions": {"38": {"zh": "誘蟲劑"}}, "monsters": {"墮落者": {"zh": "墮落者", "archetype": "agito"}}}`:
-/// the four card sections (potions, unsimulatedPotions, instruments, protocols) may only change `zh` of entries the
-/// name file already has (keys as in the name file: ids for potions and instruments, English names for protocols);
-/// `monsters` may add new ones.
+/// the four card sections (potions, unsimulatedPotions, instruments, protocols) may only change `zh` and `enClient` of
+/// entries the name file already has (keys as in the name file: ids for potions and instruments, English names for
+/// protocols); `monsters` may add new ones.
 pub const EXTRA_FILE: &str = "vorax-names-extra.json";
 
 /// The name table, parsed on first use (the built-in name file plus the supplementary name file).
@@ -141,18 +154,19 @@ fn merge(base: &mut Value, extra: &Value) -> Vec<String> {
         for (key, fields) in entries {
             match (target.get_mut(key).and_then(Value::as_object_mut), fields.as_object()) {
                 (Some(entry), Some(fields)) => {
-                    // Cards only change the Traditional Chinese name: changing the English name would no longer
-                    // match the solver's id.
-                    for (field, v) in fields.iter().filter(|(f, _)| !CARDS.contains(&section.as_str()) || f.as_str() == "zh") {
+                    // Cards only change the Traditional Chinese name and the English client's name: changing the
+                    // English name would no longer match the solver's id.
+                    for (field, v) in fields.iter().filter(|(f, _)| !CARDS.contains(&section.as_str()) || matches!(f.as_str(), "zh" | "enClient")) {
                         let here = format!("{section}.{key}");
-                        if CARDS.contains(&section.as_str())
+                        let card_zh = CARDS.contains(&section.as_str()) && field == "zh";
+                        if card_zh
                             && let Some(zh) = v.as_str().map(str::trim).filter(|z| !z.is_empty())
                             && let Some(other) = taken.get(zh).filter(|o| **o != here)
                         {
                             changes.push(format!("{here}.zh：{v} 和 {other} 重名，未套用"));
                             continue;
                         }
-                        if CARDS.contains(&section.as_str())
+                        if card_zh
                             && let Some(zh) = v.as_str().map(str::trim).filter(|z| !z.is_empty())
                         {
                             taken.insert(zh.to_string(), here.clone());
@@ -193,7 +207,8 @@ fn parse_value(z: Value) -> Names {
                 (Category::Potion, None) => Some(PotionRarity::Supreme),
                 _ => None,
             };
-            cards.push(CardName { category, id, en, zh: zh(v), rarity });
+            let client_en = v["enClient"].as_str().map(str::trim).filter(|s| !s.is_empty() && *s != en).map(str::to_string);
+            cards.push(CardName { category, id, en, client_en, zh: zh(v), rarity });
         }
     }
     let monsters = z["monsters"]
@@ -202,7 +217,13 @@ fn parse_value(z: Value) -> Names {
         .flatten()
         .filter_map(|(key, v)| Some((zh(v).unwrap_or_else(|| key.clone()), serde_json::from_value(v["archetype"].clone()).ok()?)))
         .collect();
-    Names { cards, monsters }
+    let monsters_en = z["monsters"]
+        .as_object()
+        .into_iter()
+        .flatten()
+        .filter_map(|(_, v)| Some((v["en"].as_str().map(str::trim).filter(|e| !e.is_empty())?.to_string(), serde_json::from_value(v["archetype"].clone()).ok()?)))
+        .collect();
+    Names { cards, monsters, monsters_en }
 }
 
 /// Archetype name in the current language.
@@ -253,11 +274,12 @@ mod tests {
         let n = names();
         assert_eq!(n.cards.iter().filter(|c| c.category == Category::Potion && c.id.is_some()).count(), 42);
         assert_eq!(n.cards.iter().filter(|c| c.category == Category::Instrument && c.id.is_some()).count(), 25);
-        // 13 from the upstream name file, and three seen in play whose English names are not known (keyed by their
-        // Traditional Chinese name, which stands in for `en`).
-        assert_eq!(n.cards.iter().filter(|c| c.category == Category::Protocol).count(), 16);
-        for zh in ["表皮移植實驗", "生命復甦術", "黑膽汁療法"] {
-            assert!(n.cards.iter().any(|c| c.category == Category::Protocol && c.en == zh && c.zh.as_deref() == Some(zh)), "{zh}");
+        // 13 from the upstream name file (Yellow Bile Therapy is `黑膽汁療法`, 2026-11-08), and two seen in play that it
+        // lacks (keyed by their Traditional Chinese name; their English names from the English client, 2026-11-08).
+        assert_eq!(n.cards.iter().filter(|c| c.category == Category::Protocol).count(), 15);
+        assert!(n.cards.iter().any(|c| c.en == "Yellow Bile Therapy" && c.zh.as_deref() == Some("黑膽汁療法")));
+        for (en, zh) in [("Epidermal Grafting Experiment", "表皮移植實驗"), ("Cardiac Pacing Resuscitation", "生命復甦術")] {
+            assert!(n.cards.iter().any(|c| c.category == Category::Protocol && c.en == en && c.zh.as_deref() == Some(zh)), "{zh}");
         }
         let mut zh: Vec<&str> = n.cards.iter().filter_map(|c| c.zh.as_deref()).collect();
         let all = zh.len();
@@ -265,6 +287,23 @@ mod tests {
         zh.dedup();
         assert_eq!(zh.len(), all);
         assert!(n.monsters.iter().any(|(m, a)| m == "苦行大教宗" && *a == Archetype::Agito));
+        // The English monster names: all but 禁典學者 (never seen in the English games), each once.
+        assert_eq!(n.monsters_en.len(), n.monsters.len() - 1);
+        assert!(n.monsters_en.iter().any(|(m, a)| m == "Apostate" && *a == Archetype::Agito));
+        let mut en: Vec<&str> = n.monsters_en.iter().map(|(m, _)| m.as_str()).collect();
+        en.sort_unstable();
+        en.dedup();
+        assert_eq!(en.len(), n.monsters_en.len());
+        // The English client's names of cards it prints otherwise: the solver's name and id stay.
+        let holy = n.cards.iter().find(|c| c.en == "Purest Holy Water").unwrap();
+        assert_eq!((holy.id.is_some(), holy.printed_en(), holy.zh.as_deref()), (true, "The Holiest Water", Some("至純聖水")));
+        assert!(n.cards.iter().filter(|c| c.client_en.is_none()).all(|c| c.printed_en() == c.en));
+        // No two cards print one English name.
+        let mut printed: Vec<&str> = n.cards.iter().map(CardName::printed_en).collect();
+        let all = printed.len();
+        printed.sort_unstable();
+        printed.dedup();
+        assert_eq!(printed.len(), all);
     }
 
     /// Supplementary name file: cards only change existing entries (field by field), new card keys are not added;
@@ -288,16 +327,16 @@ mod tests {
         assert!(n.monsters.iter().any(|(m, a)| m == "測試怪" && *a == Archetype::Pest));
     }
 
-    /// A name the supplementary file gives a card that another card already has is not applied (here the unnamed
-    /// Yellow Bile Therapy given `黑膽汁療法`, which the name file has as its own protocol); its own name again is.
+    /// A name the supplementary file gives a card that another card already has is not applied (here Yellow Bile
+    /// Therapy given Trepanation's `顱骨鑽孔術`); a card's own name again is.
     #[test]
     fn the_extra_file_cannot_give_two_cards_one_name() {
         let mut z: Value = serde_json::from_str(RAW).unwrap();
-        let extra = serde_json::json!({ "protocols": { "Yellow Bile Therapy": { "zh": "黑膽汁療法" }, "Trepanation": { "zh": "顱骨鑽孔術" } } });
+        let extra = serde_json::json!({ "protocols": { "Yellow Bile Therapy": { "zh": "顱骨鑽孔術" }, "Trepanation": { "zh": "顱骨鑽孔術" } } });
         let changes = merge(&mut z, &extra);
         assert_eq!(changes.len(), 1, "{changes:?}");
-        assert!(changes[0].contains("重名") && changes[0].contains("protocols.黑膽汁療法"), "{changes:?}");
+        assert!(changes[0].contains("重名") && changes[0].contains("protocols.Trepanation"), "{changes:?}");
         let n = parse_value(z);
-        assert!(n.cards.iter().any(|c| c.en == "Yellow Bile Therapy" && c.zh.is_none()));
+        assert!(n.cards.iter().any(|c| c.en == "Yellow Bile Therapy" && c.zh.as_deref() == Some("黑膽汁療法")));
     }
 }

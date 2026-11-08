@@ -9,6 +9,12 @@ pub mod names;
 pub mod read;
 pub mod scale;
 mod templates;
+// The English game client's digits (feature `en-vorax`, on by default since 1.1.0).
+#[cfg(feature = "en-vorax")]
+mod templates_en;
+// The English client's effect-text words by card (the same feature).
+#[cfg(feature = "en-vorax")]
+mod templates_en_effects;
 pub mod ui_scale;
 
 use crate::lang;
@@ -126,7 +132,7 @@ pub fn to_screen(r: &Reading, held: Option<&HeldOverride>) -> Result<ScreenState
     let hand: Vec<String> = r.cards.iter().map(|c| c.en.clone().unwrap_or_default()).collect();
     for (k, c) in r.cards.iter().enumerate() {
         // The solver never advises on protocols anyway (they do not affect the final activity): protocols
-        // missing from the name table (`生命復甦術`, `黑膽汁療法`, 2026-11-03 ranked game) do not count as unreadable.
+        // missing from the name table (`生命復甦術` in the 2026-11-03 ranked game, since named) do not count as unreadable.
         if c.en.is_none() && phase != ScreenPhase::Protocol {
             why.push(trf2("第 {} 張卡未知。", "Card {} is unknown.", k + 1));
         }
@@ -311,6 +317,12 @@ pub struct AdviceRow {
     /// Name of the option (current language); a target-choosing potion carries `→ 水箱 2、5` (tanks 2 and 5); ones
     /// with no effect get a note.
     pub label: String,
+    /// The option's name alone, without the target tanks: the card name (or `重擲`, reroll), with the no-effect note
+    /// as in `label`. The window's ranking writes this and draws the tanks from `targets`.
+    pub name: String,
+    /// The tanks the card acts on (0-based, left to right, the order of `→ 水箱 2、5`); empty for the reroll and a
+    /// card with no target.
+    pub targets: Vec<u8>,
     pub mean: f64,
     /// Probability of reaching 840k (0 to 1); None when the solver does not give it.
     pub reached: Option<f64>,
@@ -343,8 +355,9 @@ pub struct AdviceRows {
 pub fn advice_rows(x: &ScreenState, a: &Advice) -> AdviceRows {
     let category = if x.phase == ScreenPhase::Instrument { Category::Instrument } else { Category::Potion };
     let zh = lang::zh();
+    let name_of = |index: usize| x.hand.get(index).map_or_else(|| zh_en("重擲", "Reroll").to_string(), |en| card_label(category, en));
     let label = |index: usize, targets: &[u8]| {
-        let name = x.hand.get(index).map_or_else(|| zh_en("重擲", "Reroll").to_string(), |en| card_label(category, en));
+        let name = name_of(index);
         if targets.is_empty() {
             name
         } else {
@@ -364,18 +377,24 @@ pub fn advice_rows(x: &ScreenState, a: &Advice) -> AdviceRows {
     let mut rows: Vec<AdviceRow> = a
         .ranking
         .iter()
-        .map(|r| AdviceRow {
-            label: label(r.index, &r.targets) + if r.no_effect == Some(true) { zh_en("（無效果）", " (no effect)") } else { "" },
-            mean: r.end.map_or(r.value, |e| e.activity),
-            reached: r.end.map(|e| e.reached),
-            refresh: false,
-            best: best_card.as_ref().is_some_and(|(i, t)| *i == r.index && *t == r.targets),
+        .map(|r| {
+            let no_effect = if r.no_effect == Some(true) { zh_en("（無效果）", " (no effect)") } else { "" };
+            AdviceRow {
+                label: label(r.index, &r.targets) + no_effect,
+                name: name_of(r.index) + no_effect,
+                targets: r.targets.clone(),
+                mean: r.end.map_or(r.value, |e| e.activity),
+                reached: r.end.map(|e| e.reached),
+                refresh: false,
+                best: best_card.as_ref().is_some_and(|(i, t)| *i == r.index && *t == r.targets),
+            }
         })
         .collect();
     // The reroll is placed by expected score (the solver lists it separately, not in the ranking).
     if let Some(e) = a.refresh_end {
         let at = rows.iter().position(|r| r.mean < e.activity).unwrap_or(rows.len());
-        rows.insert(at, AdviceRow { label: zh_en("重擲", "Reroll").to_string(), mean: e.activity, reached: Some(e.reached), refresh: true, best: a.best == Best::Refresh });
+        let reroll = zh_en("重擲", "Reroll").to_string();
+        rows.insert(at, AdviceRow { label: reroll.clone(), name: reroll, targets: Vec::new(), mean: e.activity, reached: Some(e.reached), refresh: true, best: a.best == Best::Refresh });
     }
     let method = if a.plan {
         zh_en("藥劑：每個選項模擬到終局；期望分數是終局最終活性的平均（上限 840k）。", "Potions: each option played to the end; mean is the final Ultimate Activity, capped at 840k.")

@@ -761,6 +761,12 @@ pub fn two_card_row(xs: &[i32]) -> bool {
     xs.len() == 2 && xs.iter().zip(TWO_CARDS).all(|(&x, c)| (x - c).abs() < CARD_PITCH / 4)
 }
 
+/// Whether two door card centres (reference coordinates) are the same place in the row: within a quarter of the
+/// card pitch, which tells the three-card places from the two-card ones (171 pixels or more apart).
+pub fn same_card_place(a: i32, b: i32) -> bool {
+    (a - b).abs() < CARD_PITCH / 4
+}
+
 /// Check of the patrol door cards. Left to right, the door cards run from nearest to farthest from the
 /// Warden (1-6 steps clockwise): of 11,415 three-door reads in the logged history, 11,380 were so, and
 /// the rest were misreads. A card whose door number was read but is unreachable, or does not fit this

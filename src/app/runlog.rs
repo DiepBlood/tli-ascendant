@@ -167,7 +167,14 @@ impl RunLog {
 
     /// Writes the "window" line, and again at the top of each later run's
     /// folder.
-    pub fn window(&mut self, fields: Value) {
+    pub fn window(&mut self, mut fields: Value) {
+        // Which Ascendant wrote the run: the version, and its exe's time and size, which tell apart test builds that
+        // all say the same version (2026-11-08: a day of 1.1.0 test builds could be told apart only by the time of
+        // play). Read from the exe at run time, never built in, so two release builds of one tree stay the same.
+        if let Some(map) = fields.as_object_mut() {
+            map.entry("app").or_insert_with(|| Value::from(env!("CARGO_PKG_VERSION")));
+            map.entry("exe").or_insert_with(|| exe_stamp().clone());
+        }
         // The capture's latest measured geometry (numbers only) goes in as `capture`, see capture::with_geometry; it
         // is taken again for each later folder's window line, so that one carries the geometry of its own time.
         self.window = Some(fields.clone());
@@ -403,6 +410,19 @@ pub(super) fn folder_name(t: SystemTime) -> String {
 }
 
 /// A line's time, UTC: "2026-10-18T01:23:45.678Z".
+/// This exe's modification time and size (`{"modified": …, "size": …}`, never its path), read once; null when the
+/// exe cannot be read.
+fn exe_stamp() -> &'static Value {
+    static STAMP: std::sync::OnceLock<Value> = std::sync::OnceLock::new();
+    STAMP.get_or_init(|| {
+        let meta = std::env::current_exe().ok().and_then(|p| std::fs::metadata(p).ok());
+        match meta {
+            Some(m) => serde_json::json!({ "modified": m.modified().ok().map(timestamp), "size": m.len() }),
+            None => Value::Null,
+        }
+    })
+}
+
 pub fn timestamp(t: SystemTime) -> String {
     let (y, mo, d, h, mi, s, ms) = civil(t);
     format!("{y:04}-{mo:02}-{d:02}T{h:02}:{mi:02}:{s:02}.{ms:03}Z")

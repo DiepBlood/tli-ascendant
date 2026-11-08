@@ -40,6 +40,13 @@ pub struct Settings {
     /// The window's inner size in points the player last resized it to,
     /// which it opens at; None until the player resizes it.
     pub window_size: Option<[f32; 2]>,
+    /// Where the player last moved each small window that opens as a window of its own ("What's new", the run check,
+    /// the instruments and theme; 1.1.0), by its key (see `Float::key` in ui.rs): its outer top left in physical
+    /// screen pixels. A window not listed opens over the main window, where it floated before. An older settings file
+    /// has none, and an entry that does not read (another type, a broken value) is left out alone, the rest of the
+    /// file still read (see [`float_places`]); an older version reading a newer file ignores the field.
+    #[serde(deserialize_with = "float_places")]
+    pub float_pos: std::collections::BTreeMap<String, [i32; 2]>,
     /// Keep a log of each run's reads, advice and corrections, with the
     /// frames read, in %APPDATA%\Ascendant\runs, see [`super::runlog`].
     pub run_log: bool,
@@ -130,6 +137,7 @@ impl Default for Settings {
             auto_place: true,
             window_pos: None,
             window_size: None,
+            float_pos: std::collections::BTreeMap::new(),
             run_log: true,
             keep_all_logs: false,
             observe: false,
@@ -158,6 +166,15 @@ impl Default for Settings {
 /// [`Settings::keep_all_logs`] for a settings file without the field: on, so nothing is deleted.
 fn keep_all_when_missing() -> bool {
     true
+}
+
+/// [`Settings::float_pos`] as saved: each entry that reads as two whole numbers, the rest left out, and nothing at all
+/// for a value that is not a map. One broken entry so loses only itself: a field that failed to read would fail the
+/// whole file, and the defaults would come back for every setting.
+fn float_places<'de, D: serde::Deserializer<'de>>(d: D) -> Result<std::collections::BTreeMap<String, [i32; 2]>, D::Error> {
+    let value = serde_json::Value::deserialize(d)?;
+    let serde_json::Value::Object(map) = value else { return Ok(std::collections::BTreeMap::new()) };
+    Ok(map.into_iter().filter_map(|(k, v)| serde_json::from_value::<[i32; 2]>(v).ok().map(|at| (k, at))).collect())
 }
 
 /// The least opacity the window can be set to: below it the window is
@@ -274,6 +291,29 @@ impl Settings {
 #[cfg(test)]
 mod tests {
     use super::Settings;
+
+    #[test]
+    fn float_places_read_from_old_new_and_broken_files() {
+        // An older file has no field: no window placed.
+        let old: Settings = serde_json::from_str(r#"{"rollouts": 1600}"#).unwrap();
+        assert!(old.float_pos.is_empty());
+        // Saved and read back.
+        let mut s = Settings::default();
+        s.float_pos.insert("tools".to_string(), [-1200, 340]);
+        let back: Settings = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+        assert_eq!(back.float_pos.get("tools"), Some(&[-1200, 340]));
+        // A broken entry is left out alone; the other entries and fields still read.
+        let broken: Settings = serde_json::from_str(r#"{"float_pos": {"tools": [10, 20], "run_check": "x", "whats_new": [1.5, 2]}, "rollouts": 900}"#).unwrap();
+        assert_eq!(broken.float_pos.len(), 1);
+        assert_eq!(broken.float_pos.get("tools"), Some(&[10, 20]));
+        assert_eq!(broken.rollouts, 900);
+        // Not a map at all, or null: none, the file still read.
+        for text in [r#"{"float_pos": 5, "rollouts": 900}"#, r#"{"float_pos": null, "rollouts": 900}"#] {
+            let s: Settings = serde_json::from_str(text).unwrap();
+            assert!(s.float_pos.is_empty());
+            assert_eq!(s.rollouts, 900);
+        }
+    }
 
     #[test]
     fn old_hotkey_field() {

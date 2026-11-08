@@ -21,6 +21,32 @@ use super::icons;
 use super::names::{CardName, Category, archetype_zh, names};
 use super::scale::{self, Frame};
 use super::templates;
+
+// The English client reader (feature `en-vorax`, on by default since 1.1.0).
+#[cfg(feature = "en-vorax")]
+#[path = "read_en.rs"]
+mod read_en;
+#[cfg(feature = "en-vorax")]
+pub use read_en::{english, english_sets, set_english, set_english_here};
+
+// The Traditional Chinese client's effect-text words by card ([`zh_by_effect_words`]).
+#[path = "templates_zh_effects.rs"]
+mod templates_zh_effects;
+
+/// The game client read is the English one: never without the feature `en-vorax` (on by default since 1.1.0).
+#[cfg(not(feature = "en-vorax"))]
+pub const fn english() -> bool {
+    false
+}
+
+/// The templates of a field for the client read: `zh`, the Traditional Chinese client's, unless [`english`].
+fn tpl(zh: &'static [Template]) -> &'static [Template] {
+    #[cfg(feature = "en-vorax")]
+    if english() {
+        return read_en::templates(zh);
+    }
+    zh
+}
 use crate::reader::ocr::{Line, ocr_all};
 use crate::reader::panels::{similarity, squash};
 use crate::reader::{Rect, Rgba};
@@ -137,7 +163,8 @@ pub enum How {
     /// The card name could not be read; the card name from the left tooltip.
     Tooltip,
     /// The card name could not be read; the card name at the start of the effect text (the effect text's area
-    /// reaches up to the card-name line).
+    /// reaches up to the card-name line), or, on the English client, the words of the effect text that only one of
+    /// the cards the cut name leaves open prints (`read_en::by_effect_words`).
     Effect,
     /// The card name could not be read on this frame; the live session took it from the last steady read of the
     /// same hand with every name read (`carry_names` in `crate::app::vorax_session`). Never set by a read alone.
@@ -326,6 +353,41 @@ impl Text<'_> {
             (g.x0, g.x1, g.y0, g.y1) = (g.x0 + r.x, g.x1 + r.x, g.y0 + r.y, g.y1 + r.y);
         }
         gs
+    }
+
+    /// [`Self::glyphs`] with a warm colour cast taken out of `r` first (see [`neutral_labels`]): the red and blue
+    /// channels are scaled so the strokes' mean colour is grey, leaving the heart's bright red as it is. None when
+    /// the strokes show no clear warm cast (mean red under 1.12 times green) or there are too few of them.
+    fn glyphs_neutral(&self, r: Rect, min_h: i32, kind: Ink) -> Option<Vec<Glyph>> {
+        let (mut crop, x0, y0) = match self.frame.as_ref().filter(|f| f.enlarges() && !f.is_ui()) {
+            Some(f) => (f.digits(r), r.x, r.y),
+            None => (self.img.crop(r), r.x.max(0), r.y.max(0)),
+        };
+        let heart = |p: &[u8; 4]| p[0] > 170 && i32::from(p[0]) - i32::from(p[1]) > 60;
+        let (mut sum, mut n) = ([0f64; 3], 0u32);
+        for p in crop.data.as_chunks::<4>().0.iter().filter(|p| !heart(p)) {
+            let (mx, mn) = (p[..3].iter().max().copied().unwrap_or(0), p[..3].iter().min().copied().unwrap_or(0));
+            let lum = (u32::from(p[0]) * 77 + u32::from(p[1]) * 150 + u32::from(p[2]) * 29) / 256;
+            if lum >= 60 && mx - mn <= 75 {
+                for c in 0..3 {
+                    sum[c] += f64::from(p[c]);
+                }
+                n += 1;
+            }
+        }
+        if n < 20 || sum[0] < sum[1] * 1.12 || sum[2] <= 0.0 {
+            return None;
+        }
+        let (kr, kb) = (sum[1] / sum[0], (sum[1] / sum[2]).min(1.6));
+        for p in crop.data.as_chunks_mut::<4>().0.iter_mut().filter(|p| !heart(p)) {
+            p[0] = (f64::from(p[0]) * kr).round() as u8;
+            p[2] = (f64::from(p[2]) * kb).round().min(255.0) as u8;
+        }
+        let mut gs = digits::text_glyphs(&crop, Rect::new(0, 0, crop.w as i32, crop.h as i32), min_h, kind);
+        for g in &mut gs {
+            (g.x0, g.x1, g.y0, g.y1) = (g.x0 + x0, g.x1 + x0, g.y0 + y0, g.y1 + y0);
+        }
+        Some(gs)
     }
 
     /// [`ocr_images`] of crops of the reference; from the frame when there is one.
@@ -730,9 +792,51 @@ fn fits(seen: &str, want: &str) -> Option<Fix> {
     (unknown < MAX_REPAIRS && w.len() == s.len() + 1 && (0..w.len()).any(|i| w[i] == b'1' && same(s, &[&w[..i], &w[i + 1..]].concat()))).then_some(Fix::One)
 }
 
+/// Tank `i`'s labels read again with the warm colour cast taken out ([`Text::glyphs_neutral`]), when either row
+/// has an unrecognized glyph (`?`). A candle beside the tank tints its digits beige (RGB about 128,98,72), and
+/// the stroke pixels whose red runs more than 28 over green are dropped as the heart's dark pink edge, so the
+/// strokes break up: 2026-11-08 English game, round 5, `Putrid Fly` read `572?` and `36x1?9` for 5724 and 36x159
+/// on every frame (the 4 at distance 47.7 and the 5 at 44.0, over the limit of 42). The second read only fills in
+/// the `?` (same number of glyphs, no character read differently), and counts only when the three fields then
+/// multiply exactly (activity × count = total activity, none starting with 0); otherwise the rows stay as read.
+fn neutral_labels(text: &Text, i: usize, raw_total: String, raw_values: String) -> (String, String) {
+    if !raw_total.contains('?') && !raw_values.contains('?') {
+        return (raw_total, raw_values);
+    }
+    let (Some(total), Some(vals)) = (text.glyphs_neutral(tank_total(i), 9, Ink::Label), text.glyphs_neutral(tank_values(i), 9, Ink::Label)) else {
+        return (raw_total, raw_values);
+    };
+    let (total, vals) = (chars(&total, tpl(templates::LABEL)), values_of(&vals));
+    match (fill_unknowns(&raw_total, &total), fill_unknowns(&raw_values, &vals)) {
+        (Some(total), Some(vals)) if multiplies(&vals, &total) => (total, vals),
+        _ => (raw_total, raw_values),
+    }
+}
+
+/// A row as read (`seen`) with its `?` filled from a second read of the same glyphs (`again`): a `?` takes the second
+/// read's character and a character read stays (the second read may lose it in turn: in that game the 6 of `36` went
+/// to `?` with the cast taken out). None when the glyph counts differ or a character reads differently.
+fn fill_unknowns(seen: &str, again: &str) -> Option<String> {
+    if seen.chars().count() != again.chars().count() {
+        return None;
+    }
+    seen.chars().zip(again.chars()).map(|(s, a)| if s == '?' { Some(a) } else if a == '?' || a == s { Some(s) } else { None }).collect()
+}
+
+/// "activity x count" and total activity read whole and self-consistent: all digits, none starting with 0, at least
+/// 1, and activity × count = total activity.
+fn multiplies(values: &str, total: &str) -> bool {
+    let clean = |s: &str| number(s).filter(|&v| v >= 1 && !s.starts_with('0'));
+    values.split_once('x').and_then(|(a, q)| Some(clean(a)?.checked_mul(clean(q)?)? == clean(total)?)) == Some(true)
+}
+
 /// "activity x count": the glyph that is shorter than the other digits is the "x".
 fn values(text: &Text, r: Rect) -> String {
-    let gs = text.glyphs(r, 9, Ink::Label);
+    values_of(&text.glyphs(r, 9, Ink::Label))
+}
+
+/// [`values`] of glyphs already cut.
+fn values_of(gs: &[Glyph]) -> String {
     // The digit height: take the median (there is only one "x", and it is shorter than the digits).
     let mut hs: Vec<i32> = gs.iter().map(Glyph::h).collect();
     hs.sort_unstable();
@@ -741,25 +845,44 @@ fn values(text: &Text, r: Rect) -> String {
         .map(|g| {
             if g.h() * 10 < hdigit * 8 {
                 // A short glyph can only be the "x"; confirm once more against the template.
-                match digits::classify(g, templates::LABEL) {
+                match digits::classify(g, tpl(templates::LABEL)) {
                     Some(('x', d, _)) if d <= 50.0 => 'x',
                     _ => '?',
                 }
             } else {
-                chars(std::slice::from_ref(g), templates::LABEL).chars().next().map_or('?', |c| if c == 'x' { '?' } else { c })
+                chars(std::slice::from_ref(g), tpl(templates::LABEL)).chars().next().map_or('?', |c| if c == 'x' { '?' } else { c })
             }
         })
         .collect()
 }
 
+/// The reroll count's one digit: as [`chars`] (within 42, at least 6 ahead of the next), and also up to 60 away when at
+/// least 20 ahead. The count only takes 0 to 3, and the nearest is far ahead of the rest when the digit is whole (the
+/// next nearest is 60 to 100 away), but a red shard of the card animation crossing it drops the top of the digit with
+/// the heart's red (2026-11-08_11-33-51 round 6: the saved frame's "1" was 40.7 away and the live frame's over 42, read
+/// as no count and no advice until the mouse moved; 41 ahead of the next). Two digits that read alike, as the first
+/// frames of a game do (1 apart), stay unread.
+fn reroll_digit(g: &Glyph) -> Option<i32> {
+    match digits::classify(g, tpl(templates::REROLL)) {
+        Some((c, d, second)) if (d <= 42.0 && second - d >= 6.0) || (d <= 60.0 && second - d >= 20.0) => c.to_digit(10).map(|v| v as i32),
+        _ => None,
+    }
+}
+
 /// The left panel's round: large digits followed by a small "/13".
 fn round(text: &Text) -> Option<i32> {
     // The "/13" must be there: it is the main basis for recognizing the tank screen.
-    if chars(&text.glyphs(ROUND_OF, 25, Ink::Plain), templates::SLASH) != "/13" {
+    if chars(&text.glyphs(ROUND_OF, 25, Ink::Plain), tpl(templates::SLASH)) != "/13" {
         return None;
     }
-    let big: Vec<Glyph> = text.glyphs(ROUND, 30, Ink::Plain).into_iter().filter(|g| g.h() >= 40).collect();
-    number(&chars(&big, templates::ROUND)).map(|n| n as i32).filter(|n| (1..=14).contains(n))
+    let (big, short): (Vec<Glyph>, Vec<Glyph>) = text.glyphs(ROUND, 30, Ink::Plain).into_iter().partition(|g| g.h() >= 40);
+    // A digit cut short beside the big ones (a golden streak across it) would leave the rest read as another round:
+    // the "12" of 2026-11-07_15-37-39 sample-0071 kept only its "1" (the "2" cut 33 high), read as round 1 once the
+    // English round templates were learned from the round's own glyphs. The only such frame of the 926 English ones.
+    if !big.is_empty() && !short.is_empty() {
+        return None;
+    }
+    number(&chars(&big, tpl(templates::ROUND))).map(|n| n as i32).filter(|n| (1..=14).contains(n))
 }
 
 /// A panel number: the glyph height must be within `heights` (excludes the tooltip's card art). At another
@@ -908,6 +1031,10 @@ fn eye_lit(img: &Rgba, r: Rect) -> bool {
 /// The category and potion rarity given by the type text at the bottom of a card.
 pub fn type_of(text: &str) -> (Option<Category>, Option<PotionRarity>) {
     let t = norm(text);
+    #[cfg(feature = "en-vorax")]
+    if english() {
+        return read_en::type_of(&t);
+    }
     let rarity = if t.contains("普通") {
         Some(PotionRarity::Normal)
     } else if t.contains("魔法") {
@@ -933,6 +1060,10 @@ pub fn type_of(text: &str) -> (Option<Category>, Option<PotionRarity>) {
 /// The category given by the title.
 fn title_of(text: &str) -> Option<Category> {
     let t = norm(text);
+    #[cfg(feature = "en-vorax")]
+    if english() {
+        return read_en::title_of(&t);
+    }
     if !(t.contains('擇') || t.contains('選') || t.contains('種')) {
         return None;
     }
@@ -961,6 +1092,10 @@ fn distance(a: &str, b: &str) -> usize {
 
 /// The cards of `category` in the name table that have a Traditional Chinese name.
 fn candidates(category: Category) -> Vec<(usize, String)> {
+    #[cfg(feature = "en-vorax")]
+    if english() {
+        return read_en::candidates(category).to_vec();
+    }
     names().cards.iter().enumerate().filter(|(_, c)| c.category == category).filter_map(|(i, c)| Some((i, norm(c.zh.as_deref()?)))).collect()
 }
 
@@ -1014,6 +1149,10 @@ fn match_text(t: &str, category: Category, clipped: bool, tooltip: Option<usize>
     if t.chars().count() < 2 {
         return None;
     }
+    #[cfg(feature = "en-vorax")]
+    if english() {
+        return read_en::match_text(&t, category, clipped);
+    }
     let cands = candidates(category);
     let mut scored: Vec<(usize, usize, usize)> = cands.iter().map(|(i, z)| (*i, distance(&t, z), z.chars().count())).collect();
     scored.sort_by_key(|&(_, d, _)| d);
@@ -1051,6 +1190,10 @@ fn match_text(t: &str, category: Category, clipped: bool, tooltip: Option<usize>
 /// started with the full name). If exactly one card in the name table has its full name (3 characters or more)
 /// appearing within the first two characters, or all the others are parts of it, it is this card.
 fn name_in_effect(effect: &str, category: Category) -> Option<usize> {
+    #[cfg(feature = "en-vorax")]
+    if english() {
+        return read_en::name_in_effect(effect, category);
+    }
     // `麻` is also often read as `痳` (2026-11-04 11:31, round 8: the raised card `麻藥酊劑-異魔` had its name
     // read as `酊劑一異` and its effect text started with `痳藥酊劑異魔`); the name table has no card name
     // containing either of these two characters.
@@ -1061,6 +1204,19 @@ fn name_in_effect(effect: &str, category: Category) -> Option<usize> {
         .collect();
     let longest = hits.iter().max_by_key(|(_, z)| z.chars().count())?;
     hits.iter().all(|(_, z)| longest.1.contains(z.as_str())).then_some(longest.0)
+}
+
+/// Of the matches of a card's name rows (one per row, top to bottom), the card: an exact card name first, then a
+/// partial match; when none matched, the segment that looks most like a card name (one with an archetype suffix or
+/// rarity problem first, then the first segment).
+fn settle(tries: Vec<Result<(usize, How), String>>) -> Result<(usize, How), String> {
+    if let Some(ok) = tries.iter().find(|t| matches!(t, Ok((_, How::Name)))) {
+        return ok.clone();
+    }
+    if let Some(ok) = tries.iter().find(|t| t.is_ok()) {
+        return ok.clone();
+    }
+    tries.iter().find(|t| t.as_ref().is_err_and(|e| e.starts_with("對到"))).cloned().or_else(|| tries.into_iter().next()).unwrap_or_else(|| Err("卡名讀不到".into()))
 }
 
 /// Of the cards `hits` that different reads of one card name matched, the one whose whole name starts the effect
@@ -1076,6 +1232,10 @@ fn effect_among(hits: &[(usize, How)], effect: &str, category: Category) -> Opti
 /// (`更有可能出現高稀有度藥劑`, "more likely to show high-rarity potions") to print `稀有` ("rare"), and a
 /// non-rare one must have neither.
 fn kit_ok(card: &CardName, name_text: &str, effect: &str) -> bool {
+    #[cfg(feature = "en-vorax")]
+    if english() {
+        return read_en::kit_ok(card, name_text, effect);
+    }
     let Some(zh) = card.zh.as_deref().filter(|z| z.contains('箱')) else { return true };
     let (n, e) = (norm(name_text), norm(effect));
     let size = if zh.contains('大') { n.contains('大') || (e.contains('5') && !e.contains('3')) } else { n.contains('小') || (e.contains('3') && !e.contains('5')) };
@@ -1086,6 +1246,10 @@ fn kit_ok(card: &CardName, name_text: &str, effect: &str) -> bool {
 /// When a card name carries an archetype suffix (`-蠱蟲`, the Pest archetype), the suffix or the effect text must print the
 /// same archetype.
 fn species_ok(card: &CardName, name_text: &str, effect: &str) -> bool {
+    #[cfg(feature = "en-vorax")]
+    if english() {
+        return read_en::species_ok(card, name_text, effect);
+    }
     let Some((_, suffix)) = card.zh.as_deref().and_then(|z| z.split_once('-')) else { return true };
     if norm(name_text).contains(&norm(suffix)) {
         return true;
@@ -1129,12 +1293,20 @@ pub fn read_scaled(img: &Rgba, frame: Option<&Rgba>, ui: Option<f64>) -> Reading
 /// in part from [`RESULT_LABEL_WIDE`] ([`wide_result_label`]).
 fn both_result_buttons(buttons: &str) -> bool {
     let b = norm(buttons);
+    #[cfg(feature = "en-vorax")]
+    if english() {
+        return read_en::both_result_buttons(&b);
+    }
     b.contains("開始手術") && b.contains("結束手術")
 }
 
 /// The wider label crop shows the result screen's "final activity" label: `活性` read whole (frame-0062 of
 /// 2026-11-06_13-46-25 read `一最活性`, its `終` lost).
 fn wide_result_label(label: &str) -> bool {
+    #[cfg(feature = "en-vorax")]
+    if english() {
+        return read_en::wide_result_label(&norm(label));
+    }
     norm(label).contains("活性")
 }
 
@@ -1150,7 +1322,13 @@ fn read_text(img: &Rgba, text: Text) -> Reading {
     let mut problems = Vec::new();
 
     let round = round(&text);
-    let is_result = |label: &str, buttons: &str| norm(label).contains("最終活性") && ["開始手術", "結束手術"].iter().any(|b| norm(buttons).contains(b));
+    let is_result = |label: &str, buttons: &str| {
+        #[cfg(feature = "en-vorax")]
+        if english() {
+            return read_en::is_result(&norm(label), &norm(buttons));
+        }
+        norm(label).contains("最終活性") && ["開始手術", "結束手術"].iter().any(|b| norm(buttons).contains(b))
+    };
     // For a frame of another size, when the result screen was not recognized, its label and buttons are read
     // again from the reference as at 1440: on the 4K stand-in of the result screen the label read from the
     // frame kept only `最` (2026-11-06, trainingdata/vorax/frames t123.00 enlarged to 3840x2160).
@@ -1182,15 +1360,27 @@ fn read_text(img: &Rgba, text: Text) -> Reading {
         if result {
             reading.kind = Kind::Result;
             // The result screen's digits are one size bigger than the left panel's, so the glyphs differ more.
-            reading.ultimate = number(&chars(&text.glyphs(RESULT_VALUE, 20, Ink::Plain), templates::RESULT));
+            let glyphs = text.glyphs(RESULT_VALUE, 20, Ink::Plain);
+            reading.ultimate = number(&chars(&glyphs, tpl(templates::RESULT)));
+            // The English client's result digits are not learned well enough to read by template: OCR reads them.
+            #[cfg(feature = "en-vorax")]
+            if english() && reading.ultimate.is_none() {
+                reading.ultimate = read_en::result_by_ocr(&text, &glyphs);
+            }
         }
         return reading;
     }
 
     // Left panel: when covered by a tooltip this is card art here, the glyphs do not match the digit templates,
     // and it reads as None.
-    reading.ultimate = panel_number(&text, ULTIMATE, 15, 20..=28, templates::PANEL);
-    reading.next_reward = panel_number(&text, REWARD, 14, 17..=24, templates::REWARD);
+    #[allow(unused_mut)]
+    let mut heights = 20..=28;
+    #[cfg(feature = "en-vorax")]
+    if english() {
+        heights = read_en::PANEL_HEIGHTS;
+    }
+    reading.ultimate = panel_number(&text, ULTIMATE, 15, heights, tpl(templates::PANEL));
+    reading.next_reward = panel_number(&text, REWARD, 14, 17..=24, tpl(templates::REWARD));
     // If the tooltip reads any text, the panel is covered; if it is not covered and the green "+N" is still
     // there, the value is changing (when it cannot be read, say so as it is rather than calling it covered by
     // the tooltip).
@@ -1210,8 +1400,9 @@ fn read_text(img: &Rgba, text: Text) -> Reading {
         let archetype_icon = archetype_of(img, tank_icon(i)).filter(|&a| !text.ui() || a != Archetype::Agito || eye_lit(img, tank_icon(i)));
         let glow = glowing(img, i);
         let total_glyphs = text.glyphs(tank_total(i), 9, Ink::Label);
-        let raw_total = chars(&total_glyphs, templates::LABEL);
+        let raw_total = chars(&total_glyphs, tpl(templates::LABEL));
         let raw_values = values(&text, tank_values(i));
+        let (raw_total, raw_values) = neutral_labels(&text, i, raw_total, raw_values);
         // Empty tank: no name, icon or digits. Stray glyphs (unrecognized `?`) cut from the colour of the name
         // row, candle flames or the bright edge of the tank base do not count.
         let digits_in = |s: &str| s.chars().filter(|c| c.is_ascii_digit()).count();
@@ -1219,7 +1410,15 @@ fn read_text(img: &Rgba, text: Text) -> Reading {
             reading.tanks.push(Tank { empty: true, ..Tank::default() });
             continue;
         }
-        let monsters = &names().monsters;
+        // The English client's names against the English ones: without them an English monster's archetype came from
+        // its icon alone, and the Agito eye blinks (2026-11-08_08-51-00 rounds 1 to 7, tank 3 `Apostate` then `Sage`
+        // flipped between Agito and an unknown archetype from read to read).
+        #[allow(unused_mut)]
+        let mut monsters = &names().monsters;
+        #[cfg(feature = "en-vorax")]
+        if english() {
+            monsters = &names().monsters_en;
+        }
         let keys: Vec<String> = monsters.iter().map(|(m, _)| norm(m)).collect();
         let lookup = |t: &str| crate::reader::panels::best_match(&norm(t), &keys, 0.6).map(|(k, _)| &monsters[k]);
         let known = lookup(&three).or_else(|| lookup(&two));
@@ -1305,7 +1504,7 @@ fn read_text(img: &Rgba, text: Text) -> Reading {
         let gs = text.glyphs(REROLL, 12, Ink::Label);
         let gs: Vec<Glyph> = gs.into_iter().filter(|g| (12..=24).contains(&g.h()) && g.x1 - g.x0 >= 3).collect();
         reading.rerolls = match &gs[..] {
-            [g] => number(&chars(std::slice::from_ref(g), templates::REROLL)).map(|n| n as i32),
+            [g] => reroll_digit(g),
             _ => None,
         };
         if reading.rerolls.is_none() {
@@ -1446,6 +1645,15 @@ fn tank_problem(i: usize, t: &Tank) -> String {
 /// `卵殼藥粉`'s `使其+25數量` read as `具 + 25 數 量`, its `具` taken for an instrument, merged with the card's
 /// `魔法藥劑`, and the card dropped as not matching the title).
 fn card_anchors(types: &[Line]) -> Vec<(i32, i32, String)> {
+    #[cfg(feature = "en-vorax")]
+    if english() {
+        return read_en::card_anchors(types);
+    }
+    anchors_of(types)
+}
+
+/// The body of [`card_anchors`].
+fn anchors_of(types: &[Line]) -> Vec<(i32, i32, String)> {
     let effect_line = |t: &str| t.chars().any(|c| c.is_ascii_digit() || c == '+' || c == '＋');
     let mut lines: Vec<&Line> = types.iter().filter(|l| type_of(&l.text).0.is_some() && !effect_line(&l.text)).collect();
     lines.sort_by_key(|l| l.rect.x);
@@ -1845,6 +2053,19 @@ fn read_cards(text: &Text, category: Category, anchors: &[(i32, i32, String)], t
             slots.sort_by_key(|s| s.0);
         }
     }
+    if slots.len() == 1 && (slots[0].0 - CARD_X[1]).abs() <= 60 {
+        // Only one, in the middle: the card left there after a pick, or a choice screen whose other two type texts
+        // went unread (2026-11-08_08-45-58 round 2, the mouse on the third instrument: about 4 s of reads with one
+        // `Surgical Instrument` at 1416, read as resolving, and no advice; in the English samples 5 protocol offers
+        // and 1 instrument offer the same). The three default positions are read, and taken only when both side
+        // cards are named; otherwise the one card as before (a resolve, or the single instrument of a tutorial game).
+        let only = slots[0].clone();
+        let three: Vec<(i32, i32, String)> = CARD_X.iter().map(|&x| if x == CARD_X[1] { only.clone() } else { (x, 0, String::new()) }).collect();
+        let cards = read_cards(text, category, &three, tooltip);
+        if cards.len() == 3 && cards[0].index.is_some() && cards[2].index.is_some() {
+            return cards;
+        }
+    }
     if slots.len() == 1 && (slots[0].0 - CARD_X[1]).abs() > 60 {
         // Only one, and not in the exact middle: it may be the card taking effect (glow animation), or the type
         // text of the other two may not have been read. Try all three default positions, and if in the end two
@@ -1969,15 +2190,11 @@ fn read_cards(text: &Text, category: Category, anchors: &[(i32, i32, String)], t
             }
             rows.iter_mut().for_each(|r| r.sort_by_key(|l| l.rect.x));
             let tries: Vec<Result<(usize, How), String>> = rows.iter().map(|r| attempt_one(r)).collect();
-            if let Some(ok) = tries.iter().find(|t| matches!(t, Ok((_, How::Name)))) {
-                return ok.clone();
+            #[cfg(feature = "en-vorax")]
+            if english() {
+                return read_en::settle_rows(tries, read_en::two_rows(&rows).iter().map(|r| attempt_one(r)).collect());
             }
-            if let Some(ok) = tries.iter().find(|t| t.is_ok()) {
-                return ok.clone();
-            }
-            // None matched: report the segment that looks most like a card name (one with an archetype suffix or
-            // rarity problem first, then the first segment).
-            tries.iter().find(|t| t.as_ref().is_err_and(|e| e.starts_with("對到"))).cloned().or_else(|| tries.into_iter().next()).unwrap_or_else(|| Err("卡名讀不到".into()))
+            settle(tries)
         };
         let tries = &names_read[per_card * k..per_card * (k + 1)];
         let mut card = Card { category, index: None, id: None, en: None, zh: None, how: None, raw_name: joined(&tries[0]), raw_type: type_text.clone(), raw_effect: effect.clone(), why: None, x: *x, dy: *dy, raised: *dy <= RAISED_DY };
@@ -2007,7 +2224,12 @@ fn read_cards(text: &Text, category: Category, anchors: &[(i32, i32, String)], t
         // `青膽汁溶液` and `黏稠膽汁溶液`, the effect began `黏稠膽汁溶液`). A name from the effect that is none of
         // them leaves the card unknown.
         let found = match found {
-            Err(why) if hits.is_empty() => name_in_effect(&effect, category).filter(|&i| verify(i, "").is_ok()).map(|i| (i, How::Effect)).ok_or(why),
+            Err(why) if hits.is_empty() => {
+                let found = name_in_effect(&effect, category);
+                #[cfg(feature = "en-vorax")]
+                let found = found.or_else(|| read_en::family_by_effect(tries, &effect, category));
+                found.filter(|&i| verify(i, "").is_ok()).map(|i| (i, How::Effect)).ok_or(why)
+            }
             Err(why) if hits.len() > 1 => effect_among(&hits, &effect, category).filter(|&i| verify(i, "").is_ok()).map(|i| (i, How::Effect)).ok_or(why),
             other => other,
         };
@@ -2021,6 +2243,35 @@ fn read_cards(text: &Text, category: Category, anchors: &[(i32, i32, String)], t
             }
         }
         cards.push(card);
+    }
+    // A card whose damaged name leaves a few cards open is named by the words its effect text prints that only one of
+    // them does (the Traditional Chinese client: [`zh_by_effect_words`]; the English one: `read_en::by_effect_words`),
+    // when it passes the same checks as a name. All are decided on the hand as read, then set, so one card named here
+    // does not change how its neighbour is judged.
+    {
+        let by_words = |cards: &[Card], k: usize| -> Option<usize> {
+            #[cfg(feature = "en-vorax")]
+            if english() {
+                return read_en::by_effect_words(cards, k);
+            }
+            zh_by_effect_words(cards, k)
+        };
+        let named: Vec<(usize, usize)> = (0..cards.len())
+            .filter(|&k| cards[k].x != 0 && !cards[k].why.as_deref().is_some_and(|w| w.starts_with("類型字")))
+            .filter_map(|k| by_words(&cards, k).map(|i| (k, i)))
+            .filter(|&(k, i)| {
+                let (c, name) = (&cards[k], &names().cards[i]);
+                let rarity_ok = match (type_of(&c.raw_type).1, name.rarity) {
+                    (Some(seen), Some(r)) => seen == r || r == PotionRarity::Supreme,
+                    _ => true,
+                };
+                species_ok(name, &c.raw_name, &c.raw_effect) && kit_ok(name, &c.raw_name, &c.raw_effect) && rarity_ok
+            })
+            .collect();
+        for (k, i) in named {
+            cards[k].set(i, How::Effect);
+            cards[k].why = None;
+        }
     }
     // The card name read for an inferred card is the same as a neighbour's: most likely the position is off and
     // the neighbour was read, so do not guess.
@@ -2041,6 +2292,156 @@ fn read_cards(text: &Text, category: Category, anchors: &[(i32, i32, String)], t
         return vec![];
     }
     cards
+}
+
+/// A CJK ideograph (the range the Traditional Chinese card names and effect texts are written in).
+fn is_cjk(c: char) -> bool {
+    ('\u{4e00}'..='\u{9fff}').contains(&c)
+}
+
+/// A Traditional Chinese name read as [`zh_candidates`] compares it: spaces dropped, a `一` between two ideographs
+/// taken as `-` (OCR reads the dash of `細肢藥粉-骨衛兵` as `一`), and only ideographs and `-` kept.
+fn zh_name_letters(raw: &str) -> String {
+    let c: Vec<char> = raw.chars().filter(|c| !c.is_whitespace()).collect();
+    (0..c.len())
+        .map(|k| if c[k] == '一' && k > 0 && k + 1 < c.len() && is_cjk(c[k - 1]) && is_cjk(c[k + 1]) { '-' } else { c[k] })
+        .filter(|&c| is_cjk(c) || c == '-')
+        .collect()
+}
+
+/// The cards of `category` a damaged Traditional Chinese name read may be: those whose name (spaces dropped) holds the
+/// longest run (at least two characters) of [`zh_name_letters`]; also with one character cut off the front, the back
+/// or both (a neighbour's character), all of them together. `肢藥粉一` gives both Slender-Limb Powders.
+fn zh_candidates(raw: &str, category: Category) -> Vec<usize> {
+    let t: Vec<char> = zh_name_letters(raw).chars().collect();
+    let pool: Vec<(usize, Vec<char>)> = names().cards.iter().enumerate().filter(|(_, n)| n.category == category).filter_map(|(i, n)| Some((i, n.zh.as_deref()?.chars().filter(|c| !c.is_whitespace()).collect()))).collect();
+    let holds = |z: &[char], run: &[char]| z.windows(run.len()).any(|w| w == run);
+    let mut out: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
+    for (a, b) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+        let Some(text) = t.get(a..t.len().saturating_sub(b)) else { continue };
+        for len in (2..=text.len()).rev() {
+            let hits: Vec<usize> = pool.iter().filter(|(_, z)| text.windows(len).any(|run| holds(z, run))).map(|(i, _)| *i).collect();
+            if !hits.is_empty() {
+                out.extend(hits);
+                break;
+            }
+        }
+    }
+    out.into_iter().collect()
+}
+
+/// The words of a Traditional Chinese effect text as [`zh_by_effect_words`] compares them: spaces dropped, the name
+/// read cut off its front when it starts it, every pair of adjacent ideographs and every run of digits; plus the type
+/// text's rarity as `type:<rarity>` (`魔法藥劑` gives `type:魔法`).
+fn zh_effect_words(raw_name: &str, raw_effect: &str, raw_type: &str) -> std::collections::BTreeSet<String> {
+    let squash = |s: &str| s.chars().filter(|c| !c.is_whitespace()).collect::<String>();
+    let (name, mut effect) = (squash(raw_name), squash(raw_effect));
+    if !name.is_empty() && effect.starts_with(&name) {
+        effect = effect[name.len()..].to_string();
+    }
+    let chars: Vec<char> = effect.chars().collect();
+    let mut out = std::collections::BTreeSet::new();
+    for w in chars.windows(2) {
+        if is_cjk(w[0]) && is_cjk(w[1]) {
+            out.insert(w.iter().collect());
+        }
+    }
+    let mut k = 0;
+    while k < chars.len() {
+        let start = k;
+        while k < chars.len() && chars[k].is_ascii_digit() {
+            k += 1;
+        }
+        if k > start {
+            out.insert(chars[start..k].iter().collect());
+        } else {
+            k += 1;
+        }
+    }
+    let ty = squash(raw_type);
+    for rarity in ["普通", "魔法", "稀有", "ULT"] {
+        if ty.starts_with(rarity) {
+            out.insert(format!("type:{rarity}"));
+        }
+    }
+    out
+}
+
+/// For each of `cands`, the words of its effect text no other of them prints: in at least 60% of its known texts and
+/// less than 10% of every other's ([`templates_zh_effects::ZH_EFFECT_WORDS`]). Words of a name's family part (before
+/// its `-`, shared by the family) are left out; its archetype (`骨衛兵`, `覺醒者`) is what the effect text prints and
+/// counts. None when a candidate has fewer than two known effect texts.
+fn zh_distinguishing(cands: &[usize]) -> Option<Vec<std::collections::BTreeSet<&'static str>>> {
+    use templates_zh_effects::{Words, ZH_EFFECT_WORDS};
+    static STEMS: std::sync::OnceLock<std::collections::BTreeSet<String>> = std::sync::OnceLock::new();
+    let stems = STEMS.get_or_init(|| {
+        let mut s = std::collections::BTreeSet::new();
+        for n in &names().cards {
+            let Some(zh) = &n.zh else { continue };
+            let stem: Vec<char> = zh.chars().filter(|c| !c.is_whitespace()).take_while(|&c| c != '-').collect();
+            s.extend(stem.windows(2).filter(|w| is_cjk(w[0]) && is_cjk(w[1])).map(|w| w.iter().collect::<String>()));
+        }
+        s
+    });
+    let zh_of = |i: usize| names().cards[i].zh.as_deref().map(|z| z.chars().filter(|c| !c.is_whitespace()).collect::<String>());
+    let known: Vec<(u16, Words)> = cands.iter().map(|&i| ZH_EFFECT_WORDS.iter().find(|(z, _, _)| Some(z.to_string()) == zh_of(i)).map(|&(_, n, w)| (n, w))).collect::<Option<_>>()?;
+    if known.iter().any(|&(n, _)| n < 2) {
+        return None;
+    }
+    let share = |(n, words): (u16, Words), w: &str| words.iter().find(|(x, _)| *x == w).map_or(0.0, |&(_, c)| f32::from(c) / f32::from(n));
+    Some(
+        known
+            .iter()
+            .enumerate()
+            .map(|(k, &mine)| {
+                mine.1
+                    .iter()
+                    .map(|&(w, _)| w)
+                    .filter(|w| share(mine, w) >= 0.6 && !stems.contains(*w))
+                    .filter(|w| known.iter().enumerate().all(|(j, &other)| j == k || share(other, w) < 0.1))
+                    .collect()
+            })
+            .collect(),
+    )
+}
+
+/// The Traditional Chinese card `cards[k]`, not recognized by its name, is when its damaged name leaves a few cards
+/// open ([`zh_candidates`]) and its effect and type text print at least two distinguishing words
+/// ([`zh_distinguishing`]) of exactly one of them: `肢藥粉一` with `骨衛`, `衛兵` is 細肢藥粉-骨衛兵, `酊劑一異` with
+/// `異魔`, `50`, `機率` is 麻藥酊劑-異魔. The words the cards beside it print are left out first (overlapping cards'
+/// text runs into the effect text's area), except a neighbour whose name read is the same. Measured on the saved
+/// Traditional Chinese frames (3,916, 7,250 choice cards, 182 unread), each log folder judged by the other folders'
+/// words: 39 unread cards named, all right by eye; on 10,836 cut-name cases made from cards read by their whole name,
+/// 7,480 named and 0 wrong (one word alone named 6 wrong: a lone count like `4`).
+fn zh_by_effect_words(cards: &[Card], k: usize) -> Option<usize> {
+    let card = &cards[k];
+    if card.index.is_some() {
+        return None;
+    }
+    let cands = zh_candidates(&card.raw_name, card.category);
+    if cands.len() < 2 {
+        return None;
+    }
+    let mut seen = zh_effect_words(&card.raw_name, &card.raw_effect, &card.raw_type);
+    let mut order: Vec<usize> = (0..cards.len()).collect();
+    order.sort_by_key(|&j| cards[j].x);
+    let at = order.iter().position(|&j| j == k)?;
+    for side in [at.checked_sub(1), Some(at + 1)].into_iter().flatten() {
+        let Some(&j) = order.get(side) else { continue };
+        let n = &cards[j];
+        if n.zh.is_none() && zh_name_letters(&n.raw_name) == zh_name_letters(&card.raw_name) {
+            continue;
+        }
+        for w in zh_effect_words(&n.raw_name, &n.raw_effect, &n.raw_type) {
+            seen.remove(&w);
+        }
+    }
+    let words = zh_distinguishing(&cands)?;
+    let hits: Vec<(usize, usize)> = cands.iter().zip(&words).map(|(&i, ws)| (i, ws.iter().filter(|w| seen.contains(**w)).count())).filter(|&(_, n)| n > 0).collect();
+    match hits[..] {
+        [(i, n)] if n >= 2 => Some(i),
+        _ => None,
+    }
 }
 
 impl Card {
@@ -2325,6 +2726,40 @@ mod tests {
         assert_eq!(rarity_of([236.4, 176.8, 80.4]), Some(Rarity::Rare));
         // Between gold and red (a name that is fading).
         assert_eq!(rarity_of([222.0, 120.0, 98.0]), None);
+    }
+
+    /// The second read with the warm cast taken out ([`neutral_labels`]) only fills the `?`, and counts only when the
+    /// rows then multiply (the reads of the 2026-11-08 English game, round 5, `Putrid Fly`).
+    #[test]
+    fn a_reroll_digit_far_ahead_of_the_rest_is_read() {
+        let feat = |ch: char| templates::REROLL.iter().find(|t| t.ch == ch).unwrap().feat.to_vec();
+        let glyph = |feat: Vec<u8>| Glyph { x0: 0, x1: 8, y0: 0, y1: 16, feat };
+        assert_eq!(reroll_digit(&glyph(feat('1'))), Some(1));
+        // Half one digit, half another: neither is ahead, so no count.
+        let mix: Vec<u8> = feat('1').iter().zip(feat('2')).map(|(&a, b)| ((u16::from(a) + u16::from(b)) / 2) as u8).collect();
+        assert_eq!(reroll_digit(&glyph(mix)), None);
+        // The top third gone (a red shard across it): still the 1, far ahead of the rest.
+        let mut cut = feat('1');
+        cut[..digits::GW * digits::GH / 3].fill(0);
+        let (c, d, second) = digits::classify(&glyph(cut.clone()), templates::REROLL).unwrap();
+        if d > 42.0 && second - d >= 20.0 {
+            assert_eq!((c, reroll_digit(&glyph(cut))), ('1', Some(1)));
+        }
+    }
+
+    #[test]
+    fn a_second_read_only_fills_the_unknown_glyphs() {
+        assert_eq!(fill_unknowns("572?", "5724").as_deref(), Some("5724"));
+        // The 6 lost in the second read stays as first read.
+        assert_eq!(fill_unknowns("36x1?9", "3?x159").as_deref(), Some("36x159"));
+        // A character read differently, or another glyph count, throws the second read away.
+        assert_eq!(fill_unknowns("36x1?9", "38x159"), None);
+        assert_eq!(fill_unknowns("572?", "57224"), None);
+        assert!(multiplies("36x159", "5724"));
+        assert!(!multiplies("36x158", "5724"));
+        assert!(!multiplies("36x1?9", "5724"));
+        assert!(!multiplies("036x159", "5724"));
+        assert!(!multiplies("36159", "5724"));
     }
 
     /// Back-derivation of the tank values (raw text read in the 2026-11-03 ranked game): fix only one field, and
@@ -2699,6 +3134,113 @@ mod tests {
             assert_eq!(potion(s), None, "{s}");
         }
     }
+
+    /// [`zh_name_letters`] and [`zh_candidates`]: the dash read as `一` and a damaged name leave the cards it may be.
+    #[test]
+    fn a_damaged_chinese_name_leaves_the_cards_it_may_be() {
+        let idx = |zh: &str| names().cards.iter().position(|n| n.zh.as_deref() == Some(zh)).unwrap();
+        assert_eq!(zh_name_letters("細 肢 樂 粉 一 骨 衛 兵"), "細肢樂粉-骨衛兵");
+        assert_eq!(zh_name_letters("丷 生 敫 一 一 骨 ; 乒"), "丷生敫--骨乒");
+        assert_eq!(zh_name_letters("一 生 激"), "一生激", "a 一 at an end stays");
+        let mut slender = vec![idx("細肢藥粉-蠱蟲"), idx("細肢藥粉-骨衛兵")];
+        slender.sort();
+        // As read on 2026-11-06_20-03-09 (藥 read as 樂, the suffix lost).
+        assert_eq!(zh_candidates("細 肢 樂 粉 一", Category::Potion), slender);
+        let mut bone = vec![idx("孿生激素-骨衛兵"), idx("細肢藥粉-骨衛兵")];
+        bone.sort();
+        assert_eq!(zh_candidates("肢 一 骨 衛 兵", Category::Potion), bone);
+    }
+
+    /// [`zh_by_effect_words`] on hands of the saved Traditional Chinese frames, raw texts as read.
+    #[test]
+    fn a_damaged_chinese_name_is_named_by_the_words_only_one_card_prints() {
+        let idx = |zh: &str| names().cards.iter().position(|n| n.zh.as_deref() == Some(zh)).unwrap();
+        let potion = |x: i32, zh: Option<&str>, name: &str, ty: &str, effect: &str| {
+            let mut c = Card { category: Category::Potion, index: None, id: None, en: None, zh: None, how: None, raw_name: name.into(), raw_type: ty.into(), raw_effect: effect.into(), why: None, x, dy: 0, raised: false };
+            if let Some(zh) = zh {
+                c.set(idx(zh), How::Name);
+            }
+            c
+        };
+        // 2026-11-06_03-05-30 learn-0060: `肢藥一骨衛兵` with `骨衛`, `73` is 細肢藥粉-骨衛兵, not 孿生激素-骨衛兵.
+        let hand = vec![
+            potion(1203, Some("麻藥酊劑-異魔"), "擇 1 組 怪 物", "普 通 藥 劑", "選 擇 1 組 怪 物 , 變 異 為 、 異 魔 , 50 % 機 率 再 將 隨 機 1 組 怪 物 變 異 為 異 廑 通 藥 劑"),
+            potion(1417, None, "肢 藥 一 骨 衛 兵", "普 通 藥 劑", "肢 藥 粉 」 骨 衛 兵 組 骨 衛 兵 , 其 + 73 窄 數 量"),
+            potion(1629, Some("孿生激素-骨衛兵"), "生 · 一 骨 ; 乓", "普 通 藥 劑", "孿 生 : 衛 兵 選 擇 1 組 怪 物 , 變 異 為 骨 衛 兵 , 使 其 + 62 數 量 1"),
+        ];
+        assert_eq!(zh_by_effect_words(&hand, 1), Some(idx("細肢藥粉-骨衛兵")));
+        assert_eq!(zh_by_effect_words(&hand, 2), None, "a card named by its name is left as it is");
+        // 2026-11-03_16-00-02 learn-0017: `葟酊劑一異` with `異魔`, `50`, `機率` is 麻藥酊劑-異魔.
+        let hand = vec![
+            potion(1205, Some("脊髓溶液-覺醒者"), "髓 溶 液 一 覺", "", "髓 溶 液 : 覺 醒 添 加 1 組 覺 醒 者 力 〔 其 + 31 活 性 怪"),
+            potion(1416, Some("靶向異種激素"), "1 組 怪 物 移 除", "", "物 除 , 添 一 加 2 組 隨 機 種 群 的 魔 法 怪 物 , 使 其 + 25 數 量 普 通 藥 劑"),
+            potion(1630, None, "葟 酊 劑 一 異", "普 通 劑", "忝 麻 藥 一 異 魔 1 組 怪 物 , 變 異 為 量 魔 , 50 % 機 率 再 將 1 組 怪 物 變 異 為 異 魔"),
+        ];
+        assert_eq!(zh_by_effect_words(&hand, 2), Some(idx("麻藥酊劑-異魔")));
+        // One distinguishing word is not enough: with only `異魔` left the card stays unknown.
+        let mut thin = hand.clone();
+        thin[2].raw_effect = "異 魔".into();
+        assert_eq!(zh_by_effect_words(&thin, 2), None);
+    }
+
+    /// [`zh_effect_words`]: pairs of adjacent ideographs, numbers and the rarity, the name read cut off the front.
+    #[test]
+    fn chinese_effect_words_are_pairs_numbers_and_the_rarity() {
+        let w = zh_effect_words("細 肢", "細肢 添加1組 骨衛兵，其+73", "普通藥劑");
+        // Spaces are dropped first, so `1組 骨` gives the pair `組骨` too.
+        let want: std::collections::BTreeSet<String> = ["添加", "1", "組骨", "骨衛", "衛兵", "73", "type:普通"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(w, want);
+    }
+
+    /// [`ZH_EFFECT_WORDS`](templates_zh_effects::ZH_EFFECT_WORDS): every frame of the list in `ZH_LIST` (one path a
+    /// line, a tab and the page scale after it for an interface-scale frame) read as `vorax-read --list` reads it
+    /// (the OCR cache emptied before each), and the effect-text words ([`zh_effect_words`]) of every card read by its
+    /// whole name ([`How::Name`]) counted by card; the words in at least a tenth of a card's texts are written to
+    /// `ZH_EFFECTS_OUT`. Run with ASCENDANT_LANG=zh-TW.
+    #[test]
+    #[ignore]
+    fn learn_zh_effect_words() {
+        crate::lang::set(crate::lang::Lang::ZhTw);
+        let mut by: std::collections::BTreeMap<String, (u16, std::collections::BTreeMap<String, u16>)> = std::collections::BTreeMap::new();
+        let mut frames = 0;
+        for line in std::fs::read_to_string(std::env::var("ZH_LIST").unwrap()).unwrap().lines().filter(|l| !l.trim().is_empty()) {
+            let (file, page) = match line.split_once('\t') {
+                Some((f, p)) => (f, Some(p.trim().parse::<f64>().unwrap())),
+                None => (line, None),
+            };
+            let img = crate::reader::load_image_raw(std::path::Path::new(file)).unwrap();
+            crate::reader::ocr::clear_cache();
+            let reading = read_scaled(&to_reference(&img), Some(&img), page.map(super::super::ui_scale::from_page_scale));
+            frames += 1;
+            for c in reading.cards.iter().filter(|c| c.how == Some(How::Name) && !c.raw_effect.is_empty()) {
+                let Some(zh) = &c.zh else { continue };
+                let entry = by.entry(zh.chars().filter(|c| !c.is_whitespace()).collect()).or_default();
+                entry.0 += 1;
+                for w in zh_effect_words(&c.raw_name, &c.raw_effect, &c.raw_type) {
+                    *entry.1.entry(w).or_default() += 1;
+                }
+            }
+        }
+        let mut code = [
+            "//! The Traditional Chinese client's effect-text words by card, for telling apart the cards a damaged name leaves open",
+            "//! ([`super::zh_by_effect_words`]). Generated by `read::tests::learn_zh_effect_words` from the saved frames.",
+            "",
+            "/// (word, texts holding it) for every word in at least a tenth of a card's effect texts.",
+            "pub(crate) type Words = &'static [(&'static str, u16)];",
+            "",
+            "/// (card's Traditional Chinese name without spaces, effect texts counted, its words).",
+            "pub(crate) static ZH_EFFECT_WORDS: &[(&str, u16, Words)] = &[",
+        ]
+        .join("\n");
+        code.push('\n');
+        for (zh, (n, words)) in &by {
+            let kept: Vec<String> = words.iter().filter(|&(_, &c)| c * 10 >= *n).map(|(w, c)| format!("({w:?}, {c})")).collect();
+            code.push_str(&format!("    ({zh:?}, {n}, &[{}]),\n", kept.join(", ")));
+        }
+        code.push_str("];\n");
+        std::fs::write(std::env::var("ZH_EFFECTS_OUT").unwrap(), code).unwrap();
+        println!("{frames} frames, {} cards, {} texts", by.len(), by.values().map(|v| v.0 as usize).sum::<usize>());
+    }
 }
 
 // ---------------------------------------------------------------------------- endgame battle
@@ -2858,8 +3400,9 @@ fn battle_wave(text: &str) -> Option<(u32, u32)> {
     (1..=BATTLE_WAVES).contains(&w).then_some((w, BATTLE_WAVES))
 }
 
-/// The 15 of "(+15%)". A protocol's bonus is at most about ±60%: a 415% where "+" was read as "4" has the
-/// leading 4 removed, and anything else over 100 counts as unreadable.
+/// The 15 of "(+15%)": the reward tiers' Antidote Vial drop bonus (854k gives +15%), not a share of the bonus, so it
+/// is small and never negative in practice. A 415% where "+" was read as "4" has the leading 4 removed, and anything
+/// else over 100 counts as unreadable.
 fn battle_percent(text: &str) -> Option<i32> {
     let t: String = text.chars().filter(|c| !c.is_whitespace()).collect();
     if !t.contains('%') {

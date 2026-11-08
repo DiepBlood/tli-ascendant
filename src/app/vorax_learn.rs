@@ -183,7 +183,10 @@ pub fn unknowns(r: &Reading, icons: impl FnOnce() -> Vec<Vec<f32>>) -> Vec<Unkno
             region: card_region(c.x),
         });
     }
-    let monsters = &names().monsters;
+    // The client's own monster names: the English reader names a tank by the table's English name, so against the
+    // Traditional Chinese ones every English monster was logged and saved as unknown (2026-11-08 live-log scan: the
+    // 19:18 build's 11-33-51 game still saved Penance Patriarch, Maw-Worm, Archer and Pilgrim).
+    let monsters = if english() { &names().monsters_en } else { &names().monsters };
     for (i, t) in r.tanks.iter().enumerate().take(TANK_X.len()) {
         if t.empty {
             continue;
@@ -243,24 +246,47 @@ pub fn tooltip_has(tip: &str, zh: &str) -> bool {
     !z.is_empty() && (tip.contains(&z) || (zh.contains('-') && tip.contains(&norm(&zh.replace('-', "一")))))
 }
 
-/// The card matched by the tooltip (English name): the one in the hand whose Traditional Chinese name appears in
-/// the tooltip raw text ([`tooltip_has`]).
+/// The reader reads the English client ([`read::english`]).
+#[cfg(feature = "en-vorax")]
+fn english() -> bool {
+    read::english()
+}
+
+/// Never without the feature `en-vorax`.
+#[cfg(not(feature = "en-vorax"))]
+fn english() -> bool {
+    false
+}
+
+/// The name a card prints on the client read: the English client's ([`crate::vorax::names::CardName::printed_en`]),
+/// the Traditional Chinese otherwise (None when the name file has no zh for it).
+fn printed(card: &crate::vorax::names::CardName) -> Option<&str> {
+    if english() { Some(card.printed_en()) } else { card.zh.as_deref() }
+}
+
+/// The card matched by the tooltip (English name): the one in the hand whose printed name ([`printed`]) appears in
+/// the tooltip raw text ([`tooltip_has`]). On the English client the English name: with the Traditional Chinese one
+/// no English tooltip ever matched and each was saved (2026-11-08 live-log scan, 177 tooltips).
 pub fn tooltip_match(r: &Reading) -> Option<String> {
     let tip = norm(&r.tooltip);
     if tip.is_empty() {
         return None;
     }
-    r.cards.iter().find(|c| c.zh.as_deref().is_some_and(|z| tooltip_has(&tip, z))).and_then(|c| c.en.clone())
+    fn name(c: &read::Card) -> Option<&str> {
+        if english() { c.index.and_then(|i| names().cards.get(i)).map(|n| n.printed_en()) } else { c.zh.as_deref() }
+    }
+    r.cards.iter().find(|c| name(c).is_some_and(|z| tooltip_has(&tip, z))).and_then(|c| c.en.clone())
 }
 
-/// The tooltip raw text contains some Traditional Chinese name from the name table (card or monster,
-/// [`tooltip_has`]). Cards whose zh is blank in the name file, and tooltips whose text could not be read (for
+/// The tooltip raw text contains some name from the name table the client prints (card or monster, [`printed`] and
+/// [`tooltip_has`]). Cards with no name in the client's language, and tooltips whose text could not be read (for
 /// example the tooltip of a held instrument, where the card name is not at the `TOOLTIP_NAME` position) all fail
 /// to match.
 pub fn tooltip_named(raw: &str) -> bool {
     let tip = norm(raw);
     let n = names();
-    !tip.is_empty() && n.cards.iter().filter_map(|c| c.zh.as_deref()).chain(n.monsters.iter().map(|(m, _)| m.as_str())).any(|z| tooltip_has(&tip, z))
+    let monsters = if english() { &n.monsters_en } else { &n.monsters };
+    !tip.is_empty() && n.cards.iter().filter_map(printed).chain(monsters.iter().map(|(m, _)| m.as_str())).any(|z| tooltip_has(&tip, z))
 }
 
 /// Room (reference pixels) the tooltip crop leaves on its right and bottom past the scaled [`TOOLTIP`]: at s 1.26
@@ -303,9 +329,11 @@ fn monster_tooltip(frame: &Rgba, s: Option<f64>) -> bool {
     monster_text(&lines.iter().map(|l| l.text.as_str()).collect::<Vec<_>>().join(""))
 }
 
-/// The OCR text of the band under a tooltip's name says `總活性` (spaces and punctuation ignored, `總活` enough).
+/// The OCR text of the band under a tooltip's name says `總活性` (spaces and punctuation ignored, `總活` enough), or
+/// the English client's `Total Activity` (`totalactiv` enough; 2026-11-08_06-46-26 learn-0060-crop, Thornscale).
 fn monster_text(text: &str) -> bool {
-    norm(text).contains("總活")
+    let t = norm(text);
+    t.contains("總活") || t.to_lowercase().contains("totalactiv")
 }
 
 /// Convert a region in reference coordinates (2560x1440) to pixels of a `w`x`h` frame (same as `read::to_frame`),
@@ -874,6 +902,51 @@ mod tests {
         let mut r = reading();
         r.cards.remove(0);
         assert!(unknowns(&r, || panic!("not needed")).is_empty());
+    }
+
+    /// The English client (2026-11-08 live-log scan): a monster the English table names is not unknown, a tooltip
+    /// naming a hand's card by what the English client prints matches it, and a monster's tooltip is told by its
+    /// `Total Activity`. The Traditional Chinese reading of the same is unchanged.
+    #[cfg(feature = "en-vorax")]
+    #[test]
+    fn an_english_game_knows_its_monsters_and_tooltips() {
+        use vorax::{Archetype, Rarity};
+        let known = |name: &str| Tank {
+            empty: false,
+            name: Some(name.into()),
+            raw_name: name.replace(' ', ""),
+            archetype: Some(Archetype::Agito),
+            rarity: Some(Rarity::Magic),
+            activity: Some(5),
+            quantity: Some(24),
+            total: Some(120),
+            ..Tank::default()
+        };
+        let mut r = reading();
+        r.cards.clear();
+        r.tanks[0] = known("Apostate");
+        r.tanks[1] = known("Penance Patriarch");
+        r.tanks[2] = known("Not A Monster");
+        let monsters = |r: &Reading| unknowns(r, || panic!("not needed")).iter().filter(|u| u.what == What::Monster).map(|u| u.raw_name.clone()).collect::<Vec<_>>();
+        crate::vorax::read::set_english_here(Some(true));
+        assert_eq!(monsters(&r), ["NotAMonster"]);
+        // The card the English client prints as `The Holiest Water`, and English monster and card names in a tooltip.
+        let holy = names().cards.iter().position(|c| c.en == "Purest Holy Water").unwrap();
+        let mut r = reading();
+        r.cards[1].index = Some(holy);
+        r.cards[1].en = Some("Purest Holy Water".into());
+        r.tooltip = "The Holiest Water".into();
+        assert_eq!(tooltip_match(&r).as_deref(), Some("Purest Holy Water"));
+        assert!(tooltip_named("Red-Plague Cerberus") && tooltip_named("The Holiest Water") && !tooltip_named("Nothing Here"));
+        assert!(monster_text("Agito Total Activity 864"));
+        assert!(!monster_text("Select 1 group(s) of monsters"));
+        // The Traditional Chinese client: the English names are not the table's, so they stay unknown as before.
+        crate::vorax::read::set_english_here(Some(false));
+        let mut r = reading();
+        r.cards.clear();
+        r.tanks[0] = known("Apostate");
+        assert_eq!(monsters(&r), ["Apostate"]);
+        crate::vorax::read::set_english_here(None);
     }
 
     /// The 2026-11-06 12:23 game's tooltips: a hyphen read as `一` still names the card (only at the hyphen's place),

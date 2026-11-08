@@ -16,6 +16,26 @@ pub fn language() -> Option<String> {
     imp::language()
 }
 
+/// The game language an OCR language tag reads: "en", "en-US"... English; "zh-Hant-TW", "zh-TW", "zh-Hant", "zh-HK"
+/// Traditional Chinese; None for any other tag.
+pub fn game_lang(tag: &str) -> Option<Lang> {
+    let tag = tag.to_ascii_lowercase();
+    if tag.starts_with("en") {
+        Some(Lang::En)
+    } else if ["zh-hant", "zh-tw", "zh-hk"].iter().any(|p| tag.starts_with(p)) {
+        Some(Lang::ZhTw)
+    } else {
+        None
+    }
+}
+
+/// The game client language the engine reads now: its tag's [`game_lang`]. It follows the window language, except
+/// that with no OCR language of it installed Windows falls back to a profile language, and that one is what is
+/// read. None with no OCR at all or a tag of another language.
+pub fn client_language() -> Option<Lang> {
+    language().as_deref().and_then(game_lang)
+}
+
 /// Lines of a read image with their boxes (x, y, w, h) in its pixels.
 type Lines = Vec<(String, [f32; 4])>;
 
@@ -288,15 +308,35 @@ mod imp {
     use crate::lang::{self, Lang};
     use std::cell::RefCell;
     use std::sync::{Arc, Mutex, OnceLock, mpsc};
+    use std::time::{Duration, Instant};
     use windows::Graphics::Imaging::{BitmapAlphaMode, BitmapPixelFormat, SoftwareBitmap};
     use windows::Media::Ocr::{OcrEngine, OcrResult};
     use windows::Storage::Streams::DataWriter;
     use windows::core::Result;
 
+    /// How long an engine that does not read the set language (the profile
+    /// languages' fallback, or none) is kept before the fitting one is looked
+    /// for again.
+    const RETRY: Duration = Duration::from_secs(2);
+
+    /// The longest wait between two looks for the fitting engine: with no OCR of the set language installed at all,
+    /// every thread (the window's too) would otherwise make an engine again every [`RETRY`]; the wait doubles from
+    /// [`RETRY`] up to this.
+    const RETRY_MAX: Duration = Duration::from_secs(60);
+
+    /// A thread's engine: the language it was made for, the engine, and for an engine that does not read that
+    /// language when it was made and how long to wait before looking again (see [`ENGINE`]).
+    type Slot = (Lang, Option<OcrEngine>, Option<(Instant, Duration)>);
+
     thread_local! {
-        /// This thread's engine and the language it was made for, made
-        /// again when the set language changes.
-        static ENGINE: RefCell<Option<(Lang, Option<OcrEngine>)>> = const { RefCell::new(None) };
+        /// This thread's engine, the language it was made for, and for an
+        /// engine that does not read that language when it was made: made
+        /// again when the set language changes, and an unfitting one again
+        /// after [`RETRY`], then after twice as long up to [`RETRY_MAX`] (a listing of the installed languages that failed
+        /// once must not leave a thread reading in the profile language for
+        /// good: on 2026-11-08 the 1.1.0 test build read a whole Vorax round
+        /// of the English client as Traditional Chinese).
+        static ENGINE: RefCell<Option<Slot>> = const { RefCell::new(None) };
     }
 
     /// Runs `f` on this thread's engine for the set language.
@@ -304,10 +344,21 @@ mod imp {
         ENGINE.with(|cell| {
             let mut slot = cell.borrow_mut();
             let want = lang::lang();
-            if slot.as_ref().is_none_or(|(made_for, _)| *made_for != want) {
-                *slot = Some((want, engine(want)));
+            let stale = |made_for: &Lang, unfit: &Option<(Instant, Duration)>| *made_for != want || unfit.is_some_and(|(at, wait)| at.elapsed() >= wait);
+            if slot.as_ref().is_none_or(|(made_for, _, unfit)| stale(made_for, unfit)) {
+                // The wait before this look, when this thread's engine for the same language did not fit.
+                let waited = slot.as_ref().and_then(|(made_for, _, unfit)| unfit.filter(|_| *made_for == want).map(|(_, wait)| wait));
+                let e = engine(want);
+                let fitting = e.as_ref().and_then(|e| e.RecognizerLanguage().ok()?.LanguageTag().ok()).is_some_and(|t| super::fits(&t.to_string(), want));
+                if fitting && waited.is_some() {
+                    // What the unfitting engine read is cached under the set language and would keep coming back for
+                    // a crop that looks the same (a hit is not written again, so it is never pushed out): read again.
+                    super::clear_cache();
+                }
+                let next = waited.map_or(RETRY, |w| (w * 2).min(RETRY_MAX));
+                *slot = Some((want, e, (!fitting).then(|| (Instant::now(), next))));
             }
-            f(slot.as_ref().and_then(|(_, e)| e.as_ref()))
+            f(slot.as_ref().and_then(|(_, e, _)| e.as_ref()))
         })
     }
 

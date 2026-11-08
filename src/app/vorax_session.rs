@@ -566,8 +566,8 @@ const WHY_SHOWN: usize = 4;
 const FRAME_QUALITY: u8 = 92;
 /// Windows THREAD_PRIORITY_BELOW_NORMAL: the solver thread runs below normal priority so the game keeps its frame rate.
 const BELOW_NORMAL: i32 = -1;
-/// The note at the top of the window when the game client is not Traditional Chinese (the window is English then, so both languages are written).
-const NOT_ZH: &str = "Vorax advice reads the 繁體中文 game client only; Tartarus goes on as usual. 渴血手術的即時建議只讀繁中客戶端，塔羅斯照常。";
+/// The note at the top of the window when the game client is one the reader does not read (neither Traditional Chinese nor, with the feature `en-vorax`, English; both languages are written).
+const NOT_ZH: &str = "Vorax advice reads the 繁體中文 and English game clients only; Tartarus goes on as usual. 渴血手術的即時建議只讀繁中與英文客戶端，塔羅斯照常。";
 
 fn t(zh: &'static str, en: &'static str) -> &'static str {
     if crate::lang::zh() { zh } else { en }
@@ -584,6 +584,19 @@ struct Done {
     s: Option<f64>,
     /// Features of the held icons (left to right): computed only when there are unrecognized icons (not counting the ones revealed at the start), for observe mode.
     icons: Option<Vec<Vec<f32>>>,
+    /// Diagnostics: the client the reader read as ([`read::english`]), the global language and the number of reader
+    /// switches ([`read::english_sets`]) when the read started.
+    client: Value,
+}
+
+/// Diagnostics of a read: `english` (the reader read the English client), `lang` (the global language) and `sets`
+/// (reader switches so far, 0 without the feature `en-vorax`).
+fn read_client() -> Value {
+    #[cfg(feature = "en-vorax")]
+    let sets = read::english_sets();
+    #[cfg(not(feature = "en-vorax"))]
+    let sets = 0;
+    json!({ "english": read::english(), "lang": crate::lang::lang().key(), "sets": sets })
 }
 
 /// Read one frame (converted to the reference size, then read) of a game drawn at interface scale `ui` (see
@@ -592,12 +605,13 @@ struct Done {
 /// reference the reading used.
 fn read_frame(frame: Rgba, at: i64, trigger: String, ui: Option<f64>) -> Done {
     let clock = Instant::now();
+    let client = read_client();
     let reference = read::to_reference(&frame);
     let scaled = crate::vorax::ui_scale::read(&reference, Some(&frame), ui);
     let reading = scaled.reading;
     let read_ms = clock.elapsed().as_millis() as u64;
     let icons = reading.held.iter().any(|h| h.id.is_none() && !h.opening).then(|| crate::vorax::icon_features(scaled.unscaled.as_ref().unwrap_or(&reference)));
-    Done { reading, frame, at, trigger, read_ms, s: scaled.s, icons }
+    Done { reading, frame, at, trigger, read_ms, s: scaled.s, icons, client }
 }
 
 /// The result of one solve.
@@ -1317,13 +1331,15 @@ fn battle_fields(b: &read::Battle, board: Option<i64>) -> Value {
     })
 }
 
-/// Status line: `終局戰鬥 第 2/3 波：568.5k＋221.2k（+39%），下一格 854.0k` (endgame battle, wave 2/3: 568.5k + 221.2k (+39%), next tier 854.0k).
+/// Status line: `終局戰鬥 第 2/3 波：568.5k＋221.2k，掉落 +15%，下一格 854.0k` (endgame battle, wave 2/3: 568.5k + 221.2k,
+/// drops +15%, next tier 854.0k). The `(+15%)` the game shows is the reward tiers' drop bonus, not the bonus's share of
+/// the activity (see `vorax_view::with_drops`); it was written as that share until 2026-11-08.
 fn battle_line(b: &read::Battle) -> String {
     // Rounded down, lower case k: same format as vorax_view::battle_k, so 1,116,900 never reads as 1.12M.
     let k = |v: Option<f64>| v.map_or_else(|| "?".to_string(), |v| if v >= 1e6 { format!("{:.2}M", (v / 1e4).floor() / 100.0) } else { format!("{:.1}k", (v / 100.0).floor() / 10.0) });
     let wave = b.wave.map_or_else(String::new, |(w, n)| format!(" 第 {w}/{n} 波"));
-    let share = match (b.activity, b.bonus) {
-        (Some(a), Some(x)) if a > 0.0 => format!("（+{:.0}%）", x / a * 100.0),
+    let share = match b.percent {
+        Some(p) if p >= 0 => format!("，掉落 +{p}%"),
         _ => String::new(),
     };
     let next = match b.next {
@@ -1381,6 +1397,13 @@ const BATTLE_ROW_MS: i64 = 5000;
 /// If the agreed battle read time has passed by this much and still no frame has arrived (auto read is off, or the `read_in` frame did not come):
 /// [`VoraxSession::poll`] asks for the next one instead. When the UI repaints per [`VoraxSession::wants_read_in`] it waits this much longer.
 pub const READ_IN_LATE_MS: u64 = 500;
+
+/// How many times a choice screen read with a problem is read again while it stays the same (see `retry`).
+const RETRY_READS: u32 = 6;
+
+/// How long after the surgery page opens an `other` frame asks for the next one at once, and how soon (see `handle`).
+const BOARD_EARLY_MS: i64 = 1500;
+const BOARD_EARLY_EVERY_MS: u64 = 100;
 
 /// Tracking of one endgame battle (during [`Mode::Battle`]).
 #[derive(Default)]
@@ -1495,6 +1518,8 @@ pub struct VoraxSession {
     config: Config,
     mode: Mode,
     log: Option<RunLog>,
+    /// Diagnostics: the last [`VoraxSession::point_reader`] (when, which client, the OCR tag), carried on `vorax_read` rows.
+    point: std::sync::Mutex<Value>,
     notify: Option<Arc<dyn Fn() + Send + Sync>>,
     view: View,
     /// Time of the last cue or frame (UTC milliseconds).
@@ -1503,6 +1528,10 @@ pub struct VoraxSession {
     /// How long until a frame is wanted (one per second in the endgame battle): handed to `Watcher::read_in`.
     read_in: Option<Duration>,
     news: Option<(bool, bool)>,
+    /// The signature of a choice screen read with a problem, and how many times it was read so (see `RETRY_READS`).
+    retry: (String, u32),
+    /// When the mode last became Board (the surgery page opened, see `BOARD_EARLY_MS`).
+    board_at: i64,
     /// Background read, and the latest frame that arrived during the read.
     scan: Option<Receiver<Done>>,
     queued: Option<(Rgba, i64, String)>,
@@ -1526,6 +1555,8 @@ pub struct VoraxSession {
     /// When the current stretch of value ticking (`ultimate_pending`) started, and whether the stuck-log row was written; None when not ticking, or
     /// after a confirm or reroll.
     pending_since: Option<(i64, bool)>,
+    /// The signature of the board `pending_since` is timed on: another board starts the stretch again.
+    pending_sig: Option<String>,
     gate: Option<Gate>,
     game: Game,
     /// The game whose board was closed midway and is waiting to be resumed.
@@ -1547,8 +1578,8 @@ pub struct VoraxSession {
     learn: Learn,
     /// Enter the mode only on a Traditional Chinese client (unit tests turn this off, so the global language setting is not touched).
     require_zh: bool,
-    /// Private builds only: on another client language with observe mode on, the game is entered to save whole
-    /// frames and nothing is read ([`samples::Samples`]).
+    /// Private builds only: on a client language Vorax does not read (see `start_samples`) with observe mode on, the
+    /// game is entered to save whole frames and nothing is read ([`samples::Samples`]).
     #[cfg(feature = "dev-samples")]
     samples: Option<samples::Samples>,
     /// Unit tests: the client language seen by `require_zh` (None: the global setting).
@@ -1576,12 +1607,15 @@ impl VoraxSession {
             config,
             mode: Mode::Off,
             log,
+            point: std::sync::Mutex::new(Value::Null),
             notify: None,
             view,
             clock: 0,
             read_next: false,
             read_in: None,
             news: None,
+            retry: (String::new(), 0),
+            board_at: 0,
             scan: None,
             queued: None,
             solve: None,
@@ -1594,6 +1628,7 @@ impl VoraxSession {
             moves: 0,
             deals: 0,
             pending_since: None,
+            pending_sig: None,
             gate: None,
             game: Game::default(),
             paused,
@@ -1795,18 +1830,62 @@ impl VoraxSession {
         change
     }
 
-    /// The client is Traditional Chinese (the interface language, which follows the game client); unit tests set it
-    /// with `test_zh` instead of the global language setting.
-    fn client_zh(&self) -> bool {
+    /// The game client language the reader reads: the language of the OCR engine made for the window language (the
+    /// user picks it to be the game client's; with no OCR language of it installed Windows falls back to a profile
+    /// language, and that one is what is read, see `crate::reader::ocr::client_language`); the window language when
+    /// there is no OCR at all; None for a language the reader does not know. Unit tests set it with `test_zh`
+    /// (Traditional Chinese or English) instead of the global language setting.
+    pub fn client_language(&self) -> Option<crate::lang::Lang> {
         #[cfg(test)]
         if let Some(zh) = self.test_zh {
-            return zh;
+            return Some(if zh { crate::lang::Lang::ZhTw } else { crate::lang::Lang::En });
         }
-        crate::lang::zh()
+        Self::client_of(crate::reader::ocr::language().as_deref())
     }
 
-    /// Another client language: private builds with observe mode on enter the game anyway, to save whole frames as
-    /// samples ([`samples::Samples`]); the status still says the advice reads the Traditional Chinese client only.
+    /// The client an OCR language tag reads (see [`VoraxSession::client_language`]): the window language when there is
+    /// no OCR at all.
+    fn client_of(tag: Option<&str>) -> Option<crate::lang::Lang> {
+        match tag {
+            Some(tag) => crate::reader::ocr::game_lang(tag),
+            None => Some(crate::lang::lang()),
+        }
+    }
+
+    /// The client is Traditional Chinese ([`VoraxSession::client_language`]).
+    fn client_zh(&self) -> bool {
+        self.client_language() == Some(crate::lang::Lang::ZhTw)
+    }
+
+    /// Points the reader at the client ([`VoraxSession::client_language`]): the English client with the feature
+    /// `en-vorax` (on by default since 1.1.0) and an English client, the Traditional Chinese one otherwise
+    /// (`vorax::read::english`).
+    /// Called before every frame (see `read`), on entering the mode and when the window language is switched. Returns whether it
+    /// reads the English client.
+    fn point_reader(&self) -> bool {
+        // The OCR language is asked once: it is called before every frame.
+        let ocr = crate::reader::ocr::language();
+        #[cfg(test)]
+        let client = if self.test_zh.is_some() { self.client_language() } else { Self::client_of(ocr.as_deref()) };
+        #[cfg(not(test))]
+        let client = Self::client_of(ocr.as_deref());
+        let english = cfg!(feature = "en-vorax") && client == Some(crate::lang::Lang::En);
+        // Diagnostics: why the reader reads the client it does (the OCR language tag the client was told from), carried
+        // on every later `vorax_read` row as `point` (not a row of its own: no folder is opened for it).
+        if let Ok(mut point) = self.point.lock() {
+            *point = json!({ "atMs": now_ms(), "english": english, "client": client.map(|l| l.key()), "ocr": ocr, "lang": crate::lang::lang().key() });
+        }
+        // Unit tests set it for their own thread: reading tests of the other client run alongside.
+        #[cfg(all(feature = "en-vorax", not(test)))]
+        crate::vorax::read::set_english(english);
+        #[cfg(all(feature = "en-vorax", test))]
+        crate::vorax::read::set_english_here(Some(english));
+        english
+    }
+
+    /// A client language Vorax does not read (neither Traditional Chinese nor, with `en-vorax`, English): private
+    /// builds with observe mode on enter the game anyway, to save whole frames as samples ([`samples::Samples`]); the
+    /// status still shows the NOT_ZH note (only the Traditional Chinese and English clients are read).
     /// Other builds never do.
     #[cfg(feature = "dev-samples")]
     fn start_samples(&mut self) -> bool {
@@ -1844,14 +1923,17 @@ impl VoraxSession {
             if !self.config.enabled {
                 return ModeChange::None;
             }
-            if self.require_zh && !self.client_zh() && !self.start_samples() {
+            // The reader reads the client it is given (vorax::read::english): the Traditional Chinese one, or with
+            // the feature `en-vorax` (on by default since 1.1.0) the English one too; any other client is not entered (NOT_ZH).
+            let english = self.point_reader();
+            if self.require_zh && !self.client_zh() && !english && !self.start_samples() {
                 self.view.blocked = Some(NOT_ZH.to_string());
                 self.bump();
                 return ModeChange::None;
             }
             // A Traditional Chinese client (or the check off) reads as usual: no samples.
             #[cfg(feature = "dev-samples")]
-            if !self.require_zh || self.client_zh() {
+            if !self.require_zh || self.client_zh() || english {
                 self.samples = None;
             }
             match self.paused.take() {
@@ -1887,6 +1969,9 @@ impl VoraxSession {
         }
         if to == Mode::Board && cue == Some(Cue::Page(Page::Main, PageState::Run)) {
             self.game.board_run = true;
+        }
+        if to == Mode::Board && from != Mode::Board {
+            self.board_at = at;
         }
         self.mode = to;
         // Leaving keeps the sampler: a pause, or the surgery page closed and opened to skip an animation, is the same
@@ -2412,6 +2497,12 @@ impl VoraxSession {
             return;
         }
         self.clock = self.clock.max(at_ms);
+        // The reader is pointed at the client again before every frame, not only on entering: on 2026-11-08 the test
+        // build of 1.1.0 read a whole round of the English client with the Traditional Chinese templates (every screen
+        // `other`) until the game was left and entered again. A wrong pointing now costs one frame at most. Unit tests
+        // point the reader themselves (`test_zh`, `set_english_here`), so this is not done under test.
+        #[cfg(not(test))]
+        self.point_reader();
         // Collecting samples: the frame may be saved, and is never read; none of the resolve animation (the battle
         // has no gate).
         #[cfg(feature = "dev-samples")]
@@ -2735,6 +2826,26 @@ impl VoraxSession {
         let sig = signature(&r);
         let steady = self.last_sig.as_deref() == Some(sig.as_str());
         self.news = Some((!steady, false));
+        // A choice screen read with a problem (a field missing, such as the rerolls or a card name) is read again
+        // after a while even if nothing on screen moves: auto read waits for a change, so on 2026-11-08 (English
+        // client, round 6) a hand read without its rerolls had no advice for 2 s, until the player moved the mouse
+        // onto a card. Waits 250, 500 ms, then 1 s each, at most RETRY_READS times for the same reading.
+        if r.kind.is_choice() && !r.problems.is_empty() {
+            let n = if self.retry.0 == sig { self.retry.1 + 1 } else { 1 };
+            self.retry = (sig.clone(), n);
+            if n <= RETRY_READS && self.read_in.is_none() {
+                self.read_in = Some(Duration::from_millis(250 << (n - 1).min(2)));
+            }
+        } else {
+            self.retry = (String::new(), 0);
+        }
+        // Right after the surgery page opens again (the game closes and opens it around every pick), the first frame
+        // still shows the page coming in (`other`); auto read then waits for the screen to stop moving, and the hand
+        // was read about 0.45 s after the page opened, advice at 0.8 s (2026-11-08). Within BOARD_EARLY_MS of the page
+        // opening, an `other` frame asks for the next one at once.
+        if self.mode == Mode::Board && r.kind == Kind::Other && d.at - self.board_at < BOARD_EARLY_MS && self.read_in.is_none() {
+            self.read_in = Some(Duration::from_millis(BOARD_EARLY_EVERY_MS));
+        }
         self.last_sig = Some(sig.clone());
         self.view.kind = Some(r.kind);
         if r.kind.is_choice() {
@@ -2812,7 +2923,7 @@ impl VoraxSession {
         self.log_event(
             "vorax_read",
             d.at,
-            json!({ "trigger": d.trigger, "readMs": d.read_ms, "frame": frame, "size": [size.0, size.1], "reading": &r, "signature": sig, "steady": steady, "gate": self.gate.is_some(), "raised": raised }),
+            json!({ "trigger": d.trigger, "readMs": d.read_ms, "frame": frame, "size": [size.0, size.1], "reading": &r, "signature": sig, "steady": steady, "gate": self.gate.is_some(), "raised": raised, "client": d.client, "point": self.point.lock().map(|p| p.clone()).unwrap_or(Value::Null) }),
         );
         // An early solve (or solving while it ticks) is for another board: if this read's signature differs it is dropped, and one in progress is also told to give up
         // (when a half-dealt hand is read mid deal animation, the new one need not queue behind it).
@@ -2962,6 +3073,32 @@ impl VoraxSession {
         if !r.ultimate_pending {
             self.pending_since = None;
         }
+        // The green "+N" is not always a value counting. After a reroll (191 of 201 frames), or a pick that left the
+        // final activity unchanged, the game shows "+0" over it, and on all 201 frames read the value did not change
+        // again on the same board (all logs to 2026-11-07); it may stay until the value next changes. The value read
+        // equal to the tanks' sum is settled: on 113 reads flagged counting with the final activity equal to the sum it
+        // never changed again on the same board, while the flag took 1.0 s (median, 4.9 s at most) to clear. Where the
+        // "+0" covers the digits so they are not read, the flag on one steady board for longer than PENDING_MAX_MS is
+        // taken as settled too (2026-11-07_17-59-47 round 8: the advice solved meanwhile came 6.2 s late, only when a
+        // tooltip covered the panel; 2026-11-03_15-45-04 the same, 5 s). Settled, the advice shows; the solver input
+        // takes the tanks' sum.
+        if r.ultimate_pending && self.pending_sig.as_deref() != Some(sig.as_str()) {
+            (self.pending_since, self.pending_sig) = (None, Some(sig.clone()));
+        }
+        let mut r = r;
+        if r.ultimate_pending && r.ultimate.is_some() && r.ultimate == r.tank_sum {
+            r.ultimate_pending = false;
+        }
+        if r.ultimate_pending
+            && let Some((since, logged)) = self.pending_since
+            && at - since > PENDING_MAX_MS
+        {
+            r.ultimate_pending = false;
+            if !logged {
+                self.pending_since = Some((since, true));
+                self.log_event("vorax_pending_stuck", at, json!({ "since": timestamp(at_time(since)), "ms": at - since, "settled": true }));
+            }
+        }
         if let Some(round) = r.round {
             self.game.rounds_seen.insert(round);
         }
@@ -3041,15 +3178,10 @@ impl VoraxSession {
             _ if r.ultimate_pending => {
                 // The next read after ticking stops is the one that solves, so another read is requested right away: scheduled reads all land while the value is still ticking,
                 // after that we would wait for mouse movement or other events before reading, and the advice after a reroll was up to 5 seconds late (2026-11-03 ranked game).
-                // Once ticking continues beyond PENDING_MAX_MS (tonight 66 times, almost all within 1 second) fall back to the original schedule, so that when
-                // "+N" is misread as always present, it does not turn into nonstop full-speed capture plus OCR.
-                let (since, logged) = *self.pending_since.get_or_insert((at, false));
-                if at - since <= PENDING_MAX_MS {
-                    self.read_next = true;
-                } else if !logged {
-                    self.pending_since = Some((since, true));
-                    self.log_event("vorax_pending_stuck", at, json!({ "since": timestamp(at_time(since)), "ms": at - since }));
-                }
+                // Ticking on one board for longer than PENDING_MAX_MS is taken as settled in steady() (and logged there), so
+                // a "+N" misread as always present does not turn into nonstop full-speed capture plus OCR.
+                self.pending_since.get_or_insert((at, false));
+                self.read_next = true;
                 // The same board that already got advice (the signature does not include the final activity): keep the advice and boxes as they are, no flicker.
                 let advised = self.advised.as_ref().is_some_and(|a| self.stable.as_ref().is_some_and(|s| s.sig == a.sig));
                 if !advised {
@@ -3446,11 +3578,13 @@ impl VoraxSession {
     }
 
     /// The window language was switched, so OCR is made again for it: the window row is written again with the new
-    /// `ocr` (as Tartarus's [`super::session::Session::log_language`]); nothing before the first window row.
+    /// `ocr` (as Tartarus's [`super::session::Session::log_language`]; nothing before the first window row), and the
+    /// reader reads the new client from the next frame on, mid game too ([`VoraxSession::point_reader`]).
     pub fn log_language(&mut self) {
         if let Some(log) = &mut self.log {
             log.set_ocr(crate::reader::ocr::language());
         }
+        self.point_reader();
     }
 
     /// The boxes drawn by the window changed: write one `vorax_view` row; `fields` is a JSON object, and `best`,
@@ -3649,11 +3783,45 @@ mod tests {
         assert_eq!(s.note_cue(Cue::Page(Page::Main, PageState::Run), Some(1)), ModeChange::None);
         assert!(!s.active() && s.view().blocked.is_none());
         let mut s = session();
-        s.require_zh = true;
-        if !crate::lang::zh() {
+        (s.require_zh, s.test_zh) = (true, Some(false));
+        // With the feature `en-vorax` (on by default since 1.1.0) the English client is read too (see an_english_client_is_read_with_en_vorax).
+        if !cfg!(feature = "en-vorax") {
             assert_eq!(s.note_cue(Cue::Page(Page::Main, PageState::Run), Some(1)), ModeChange::None);
             assert!(!s.active() && s.view().blocked.is_some());
         }
+    }
+
+    /// Switching the window language mid game points the reader at the new client from the next frame on, without
+    /// leaving and entering the mode again ([`VoraxSession::log_language`]).
+    #[cfg(feature = "en-vorax")]
+    #[test]
+    fn a_language_switch_mid_game_points_the_reader_at_the_new_client() {
+        let mut s = session();
+        s.test_zh = Some(true);
+        assert_eq!(s.note_cue(Cue::Page(Page::Main, PageState::Run), Some(1)), ModeChange::Entered);
+        assert!(!crate::vorax::read::english());
+        s.test_zh = Some(false);
+        s.log_language();
+        assert!(s.active() && crate::vorax::read::english());
+        s.test_zh = Some(true);
+        s.log_language();
+        assert!(s.active() && !crate::vorax::read::english());
+        crate::vorax::read::set_english_here(None);
+    }
+
+    /// [`VoraxSession::client_language`]: the test value when set; the OCR engine's tag is read as a game language
+    /// (`crate::reader::ocr::game_lang`), another script's being none the reader knows.
+    #[test]
+    fn the_client_language_is_the_one_read() {
+        use crate::lang::Lang;
+        use crate::reader::ocr::game_lang;
+        let mut s = session();
+        s.test_zh = Some(false);
+        assert_eq!(s.client_language(), Some(Lang::En));
+        s.test_zh = Some(true);
+        assert_eq!(s.client_language(), Some(Lang::ZhTw));
+        assert_eq!([game_lang("en-US"), game_lang("en-GB"), game_lang("zh-Hant-TW"), game_lang("zh-TW"), game_lang("zh-HK")], [Some(Lang::En), Some(Lang::En), Some(Lang::ZhTw), Some(Lang::ZhTw), Some(Lang::ZhTw)]);
+        assert_eq!([game_lang("ja-JP"), game_lang("zh-Hans-CN"), game_lang("ru")], [None, None, None]);
     }
 
     #[test]
@@ -3756,7 +3924,42 @@ mod tests {
     /// Hand one read directly to `handle` (without going through OCR).
     fn feed(s: &mut VoraxSession, r: Reading, at: i64) {
         s.clock = s.clock.max(at);
-        s.handle(Done { reading: r, frame: Rgba { w: 16, h: 9, data: vec![0; 16 * 9 * 4] }, at, trigger: "auto".into(), read_ms: 0, s: None, icons: None });
+        s.handle(Done { reading: r, frame: Rgba { w: 16, h: 9, data: vec![0; 16 * 9 * 4] }, at, trigger: "auto".into(), read_ms: 0, s: None, icons: None, client: Value::Null });
+    }
+
+    /// A choice screen read with a problem (here the rerolls unread) asks for another frame after 250 ms, 500 ms,
+    /// then 1 s each, at most RETRY_READS times while it reads the same; a complete reading asks for none, and a
+    /// changed reading starts over (2026-11-08: a hand without its rerolls had no advice until the mouse moved).
+    #[test]
+    fn a_choice_screen_read_with_a_problem_is_read_again() {
+        let mut s = session();
+        s.note_cue(page(Page::Intro, PageState::Run), Some(10));
+        s.note_cue(page(Page::Main, PageState::Run), Some(12));
+        let unread = || Reading { rerolls: None, problems: vec!["重擲次數讀不到".to_string()], ..potion_board(false, Some(108), 36) };
+        let mut waits = Vec::new();
+        for at in 20..30 {
+            feed(&mut s, unread(), at);
+            waits.push(s.wants_read_in().map(|d| d.as_millis()));
+        }
+        assert_eq!(waits[..7], [Some(250), Some(500), Some(1000), Some(1000), Some(1000), Some(1000), None], "{waits:?}");
+        feed(&mut s, potion_board(false, Some(108), 36), 40);
+        assert_eq!(s.wants_read_in(), None, "complete: no more reads");
+        feed(&mut s, unread(), 41);
+        assert_eq!(s.wants_read_in(), Some(Duration::from_millis(250)), "a new problem starts over");
+    }
+
+    /// Right after the surgery page opens, a frame still showing it come in (`other`) asks for the next frame at once;
+    /// later an `other` frame waits for auto read as before.
+    #[test]
+    fn the_page_coming_in_is_read_again_at_once() {
+        let mut s = session();
+        s.note_cue(page(Page::Intro, PageState::Run), Some(10));
+        s.note_cue(page(Page::Main, PageState::Run), Some(1_000));
+        let other = || Reading { kind: Kind::Other, round: None, cards: vec![], tanks: vec![], ..potion_board(false, None, 36) };
+        feed(&mut s, other(), 1_090);
+        assert_eq!(s.wants_read_in(), Some(Duration::from_millis(BOARD_EARLY_EVERY_MS)));
+        feed(&mut s, other(), 1_000 + BOARD_EARLY_MS + 10);
+        assert_eq!(s.wants_read_in(), None, "too late: auto read as before");
     }
 
     /// While the log gives no interface scale, the scale a frame was measured and read at is used for the next
@@ -3768,7 +3971,7 @@ mod tests {
         s.note_cue(page(Page::Main, PageState::Run), Some(12));
         let read_at = |s: &mut VoraxSession, scale: Option<f64>, at: i64| {
             s.clock = s.clock.max(at);
-            s.handle(Done { reading: potion_board(false, Some(108), 36), frame: Rgba { w: 16, h: 9, data: vec![0; 16 * 9 * 4] }, at, trigger: "auto".into(), read_ms: 0, s: scale, icons: None });
+            s.handle(Done { reading: potion_board(false, Some(108), 36), frame: Rgba { w: 16, h: 9, data: vec![0; 16 * 9 * 4] }, at, trigger: "auto".into(), read_ms: 0, s: scale, icons: None, client: Value::Null });
         };
         assert_eq!(s.ui(), None);
         read_at(&mut s, Some(1.26), 20);
@@ -4547,7 +4750,7 @@ mod tests {
         s.note_cue(Cue::Fight, Some(3_100));
         assert_eq!(s.view().status, Status::Battle);
         let reading = Reading { kind: Kind::Result, ultimate: Some(905_500), ..potion_board(false, None, 12) };
-        tx.send(Done { reading, frame: Rgba { w: 16, h: 9, data: vec![0; 16 * 9 * 4] }, at: 3_000, trigger: "auto".into(), read_ms: 0, s: None, icons: None }).unwrap();
+        tx.send(Done { reading, frame: Rgba { w: 16, h: 9, data: vec![0; 16 * 9 * 4] }, at: 3_000, trigger: "auto".into(), read_ms: 0, s: None, icons: None, client: Value::Null }).unwrap();
         s.poll(3_300);
         assert_eq!(s.view().status, Status::Battle);
         assert_eq!(s.battle.board, Some(905_500));
@@ -4788,6 +4991,45 @@ mod tests {
         assert_eq!(advice.len(), 1, "one solve");
         assert_eq!(advice[0]["early"], json!(true));
         assert!(rows.iter().all(|r| r["kind"] != "vorax_early_dropped"));
+    }
+
+    /// The green "+N" over a final activity that already equals the tanks' sum (the "+0" a reroll leaves, or a "+N"
+    /// left after the count): settled at once, the advice solved meanwhile shows without waiting for the flag to clear.
+    #[test]
+    fn a_counting_flag_over_the_final_sum_does_not_hold_the_advice() {
+        let (mut s, root) = logged("plus-zero-sum");
+        feed(&mut s, potion_board(true, Some(420), 12), 2_000);
+        feed(&mut s, potion_board(true, Some(510), 12), 2_060);
+        assert!(s.early.is_some() && s.view().advice.is_none(), "counting below the sum: wait");
+        feed(&mut s, potion_board(true, Some(600), 12), 2_120);
+        assert_eq!(s.view().status, Status::Advised);
+        assert!(s.view().advice.is_some() && !s.view().boxes.is_empty());
+        let rows = rows_of(s, &root);
+        assert!(kinds(&rows, "vorax_pending_stuck").is_empty());
+        assert_eq!(kinds(&rows, "vorax_advice").len(), 1);
+    }
+
+    /// The green "+0" a reroll leaves over an unchanged final activity, read as counting on one steady board: past
+    /// PENDING_MAX_MS it counts as settled and the advice solved meanwhile shows (2026-11-07_17-59-47 round 8 waited
+    /// 6.2 s, until a tooltip covered the panel). A new board starts the wait again.
+    #[test]
+    fn a_plus_zero_left_on_a_steady_board_does_not_hold_the_advice() {
+        let (mut s, root) = logged("plus-zero");
+        feed(&mut s, potion_board(true, None, 12), 2_000);
+        feed(&mut s, potion_board(true, None, 12), 2_060);
+        assert!(s.early.is_some() && s.view().advice.is_none());
+        feed(&mut s, potion_board(true, None, 12), 2_000 + PENDING_MAX_MS);
+        assert!(s.view().advice.is_none(), "still within the wait");
+        feed(&mut s, potion_board(true, None, 12), 2_100 + PENDING_MAX_MS);
+        assert_eq!(s.view().status, Status::Advised);
+        assert!(s.view().advice.is_some() && !s.view().boxes.is_empty());
+        // Another board, counting: not settled by the earlier stretch.
+        feed(&mut s, potion_board(true, None, 20), 2_200 + PENDING_MAX_MS);
+        feed(&mut s, potion_board(true, None, 20), 2_260 + PENDING_MAX_MS);
+        assert_eq!(s.view().status, Status::Resolving);
+        let rows = rows_of(s, &root);
+        let stuck = kinds(&rows, "vorax_pending_stuck");
+        assert_eq!((stuck.len(), &stuck[0]["settled"]), (1, &json!(true)));
     }
 
     /// After ticking stops, the final activity and the tank sum do not add up (misread): the result computed during ticking is not shown, and the usual flow says unreadable.
@@ -5559,7 +5801,7 @@ mod tests {
     /// game to save frames and reads none (no `vorax_read`, no advice), the note shows under NOT_ZH; the surgery
     /// page closed and opened again (the skip-animation pattern, a pause and a resume) keeps the game's counts and
     /// its last frame, so the same screen is not saved again; a deal makes the next new screen a key frame.
-    #[cfg(feature = "dev-samples")]
+    #[cfg(all(feature = "dev-samples", not(feature = "en-vorax")))]
     #[test]
     fn samples_save_frames_and_read_nothing() {
         use PageState::{Destory, Run};
@@ -5615,8 +5857,9 @@ mod tests {
 
     /// Private builds only, as 2026-11-07_14-43-32: collecting samples, the board closed after the last confirm and
     /// the result page 0.67 s on takes the paused game back into Result (no round is read, its picks tell), so the
-    /// page is saved; start surgery goes on into the battle.
-    #[cfg(feature = "dev-samples")]
+    /// page is saved; start surgery goes on into the battle. Not with en-vorax: an English client is then read for
+    /// advice instead of collecting samples.
+    #[cfg(all(feature = "dev-samples", not(feature = "en-vorax")))]
     #[test]
     fn collecting_samples_the_result_page_takes_the_game_back() {
         let (mut s, root) = english_observing("reward");
@@ -5644,9 +5887,31 @@ mod tests {
         assert!(s.paused.is_some());
     }
 
-    /// Without the feature (the public build), as in 1.0.2: an English client with observe mode on and a log folder
+    /// Without the feature (--no-default-features; the public build before 1.1.0), as in 1.0.2: an English client with observe mode on and a log folder
     /// does not enter the game, shows NOT_ZH alone, and saves nothing.
-    #[cfg(not(feature = "dev-samples"))]
+    /// With `en-vorax` (the default since 1.1.0): an English client with observe mode on and a log folder enters the game to
+    /// be read (the English client's reading, vorax::read::english), with no note and no samples; a Traditional
+    /// Chinese one after it is read as the Traditional Chinese client again.
+    #[cfg(feature = "en-vorax")]
+    #[test]
+    fn an_english_client_is_read_with_en_vorax() {
+        use PageState::{Destory, Run};
+        let (mut s, root) = english_observing("en-vorax");
+        assert_eq!(s.note_cue(page(Page::Main, Run), Some(1_000)), ModeChange::Entered);
+        assert!(s.active() && s.view().blocked.is_none(), "{:?}", s.view().blocked);
+        assert!(crate::vorax::read::english());
+        #[cfg(feature = "dev-samples")]
+        assert!(s.samples.is_none());
+        assert_eq!(s.note_cue(page(Page::Main, Destory), Some(2_000)), ModeChange::Left);
+        s.test_zh = Some(true);
+        assert_eq!(s.note_cue(page(Page::Main, Run), Some(3_000)), ModeChange::Entered);
+        assert!(!crate::vorax::read::english());
+        crate::vorax::read::set_english_here(None);
+        assert!(files_named(&root, "sample").is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(not(any(feature = "dev-samples", feature = "en-vorax")))]
     #[test]
     fn an_english_client_saves_nothing_without_the_feature() {
         use PageState::Run;
@@ -6483,7 +6748,7 @@ mod tests {
     /// Hand one read to `handle` with a frame of one gray level (two levels are plainly different screens).
     fn feed_gray(s: &mut VoraxSession, r: Reading, at: i64, gray: u8) {
         s.clock = s.clock.max(at);
-        s.handle(Done { reading: r, frame: Rgba { w: 64, h: 36, data: vec![gray; 64 * 36 * 4] }, at, trigger: "auto".into(), read_ms: 0, s: None, icons: None });
+        s.handle(Done { reading: r, frame: Rgba { w: 64, h: 36, data: vec![gray; 64 * 36 * 4] }, at, trigger: "auto".into(), read_ms: 0, s: None, icons: None, client: Value::Null });
     }
 
     fn other_read() -> Reading {

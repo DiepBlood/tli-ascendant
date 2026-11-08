@@ -272,6 +272,33 @@ pub fn game_in_front(title: &str) -> bool {
     !front.is_invalid() && (ours(front) || find(title) == Some(front))
 }
 
+/// The foreground window as `exe/class` (the program's file name when it is one of Windows' own, else `other`, and
+/// the window class; never its title), for the
+/// run log when the game is not in front: a window of the game that stopped answering is shown by Windows as a
+/// `Ghost` window of another process (2026-11-08: with the CPU full the advice box was hidden 4 s while the player
+/// never left the game). None when there is no foreground window.
+pub fn front_window() -> Option<String> {
+    // SAFETY: plain Win32 calls; class is a valid buffer.
+    let front = unsafe { GetForegroundWindow() };
+    if front.is_invalid() {
+        return None;
+    }
+    let mut class = [0u16; 64];
+    // SAFETY: as above.
+    let len = unsafe { GetClassNameW(front, &mut class) };
+    let class = String::from_utf16_lossy(&class[..len.max(0) as usize]);
+    // Only Windows' own programs are named: the run log goes into a player's report, and which other programs they run
+    // is none of its business; the class alone tells a Chromium window, a console and so on apart.
+    const WINDOWS: [&str; 9] = ["explorer.exe", "dwm.exe", "csrss.exe", "shellexperiencehost.exe", "startmenuexperiencehost.exe", "searchhost.exe", "textinputhost.exe", "applicationframehost.exe", "lockapp.exe"];
+    let exe = process_file(window_pid(front)).map(|e| e.to_ascii_lowercase());
+    let exe = match exe {
+        Some(e) if WINDOWS.contains(&e.as_str()) => e,
+        Some(_) => "other".to_string(),
+        None => "?".to_string(),
+    };
+    Some(format!("{exe}/{class}"))
+}
+
 /// Whether `hwnd` is one of this process's windows.
 pub(crate) fn ours(hwnd: HWND) -> bool {
     // SAFETY: a plain Win32 call.

@@ -10,7 +10,7 @@ use crate::engine::rules::treasure_picks;
 use crate::engine::text::{cell_label, cell_list, inmate_name, instrument, instrument_term, theme_name, tool_name};
 use crate::lang::{tr, trf};
 use crate::reader::model::{RUN_DAYS, Warning, WarningKind, iron_law_days, least_sure, to_model};
-use crate::reader::panels::{Panels, Screen, Spot, card_places, card_spot, check_doors, read_panels_titled, two_card_row};
+use crate::reader::panels::{Panels, Screen, Spot, card_places, card_spot, check_doors, read_panels_titled, same_card_place, two_card_row};
 use crate::reader::scene::{CELLS, Scene, read_scene};
 use crate::reader::layout::{Layout, is_16_9, lay_out_found};
 use crate::reader::click;
@@ -458,6 +458,53 @@ fn fill_doors(doors: &mut [Option<u8>], was: &Reading, days: Option<u32>, warden
             *door = door.or(u8::try_from(n + 1).ok());
         }
     }
+}
+
+/// A patrol's row of door cards taken in full (see [`keep_row`]): the days counter and the Warden's cell (screen
+/// numbering) it was read on, the instruments held then, and each card's door and spot, left to right.
+#[derive(Clone, Debug)]
+struct FullRow {
+    days: u32,
+    warden: u8,
+    tools: Vec<Tool>,
+    doors: Vec<(u8, SpotAt)>,
+}
+
+impl FullRow {
+    /// The row a patrol read gives, when it is whole: every card's door read, three cards or two at the two-card
+    /// places (see [`two_card_row`]), the row not altered by `check_doors`, and the days counter and the Warden read.
+    fn of(panels: &Panels, warden: Option<u8>, tools: &[Tool]) -> Option<FullRow> {
+        let (days, warden) = (panels.days?, warden?);
+        let doors: Vec<(u8, SpotAt)> = panels.spots.iter().filter_map(|s| if let Spot::Door(d) = s.0 { Some((d, s.clone())) } else { None }).collect();
+        let xs: Vec<i32> = doors.iter().map(|(_, s)| s.2.0).collect();
+        let whole = panels.doors.iter().all(Option::is_some) && doors.len() == panels.doors.len() && (doors.len() == 3 || two_card_row(&xs));
+        (whole && !panels.doors_fixed).then(|| FullRow { days, warden, tools: tools.to_vec(), doors })
+    }
+}
+
+/// A door card the player holds the mouse down on goes dark, smaller and pressed, and its name drops out of the read:
+/// on 2026-11-07_19-12-04 day 1 "去2號" was held for 2.7 s and 2.2 s, the reads gave only 04 and 05, and after
+/// DOORS_SETTLE the advice moved from 02 to 05, then back as the card lit again (twice, the run check's "advice
+/// changed while the mark was lit"). A card cannot leave the row within one patrol, so a patrol read on the same days
+/// counter, Warden's cell and held instruments as `row`, whose doors read (`panels`) are fewer than the row's and each
+/// the row's door at the same place, is the row: the doors and their spots are put back, at once (no wait; the row
+/// was taken, and its advice stands). A new day changes the counter and the Warden's cell; an instrument taken that
+/// drops a die changes the instruments, and its cards move to the two-card places. Gives whether it put any back.
+fn keep_row(panels: &mut Panels, row: Option<&FullRow>, warden: Option<u8>, tools: &[Tool]) -> bool {
+    let Some(row) = row else { return false };
+    if panels.screen != Screen::Patrol || panels.days != Some(row.days) || warden != Some(row.warden) || tools != row.tools.as_slice() {
+        return false;
+    }
+    let read: Vec<(u8, i32)> = panels.spots.iter().filter_map(|(spot, _, (x, _))| if let Spot::Door(d) = spot { Some((*d, *x)) } else { None }).collect();
+    let known = panels.doors.iter().flatten().count();
+    let fits = |&(d, x): &(u8, i32)| row.doors.iter().any(|(rd, s)| *rd == d && same_card_place(s.2.0, x));
+    if read.is_empty() || known != read.len() || read.len() >= row.doors.len() || !read.iter().all(fits) {
+        return false;
+    }
+    panels.doors = row.doors.iter().map(|(d, _)| Some(*d)).collect();
+    panels.spots.retain(|(spot, _, _)| !matches!(spot, Spot::Door(_)));
+    panels.spots.extend(row.doors.iter().map(|(_, s)| s.clone()));
+    true
 }
 
 /// Puts the model's objective at its target, as the game's log says it
@@ -1446,6 +1493,8 @@ pub struct Session {
     /// The cards of a patrol read with fewer than three, and since when, see
     /// [`DOORS_SETTLE`].
     short_doors: Option<(Vec<u8>, std::time::Instant)>,
+    /// The patrol's row of door cards last taken in full, see [`keep_row`].
+    full_row: Option<FullRow>,
     /// The settled advice last shown, with its reading's screen and day,
     /// until a decision or a bite: see [`Session::shown_advice`].
     held: Option<(HeldKey, Advice)>,
@@ -1727,6 +1776,7 @@ impl Session {
             chain_armed: false,
             moved_from: None,
             short_doors: None,
+            full_row: None,
             held: None,
             advice_steady: false,
             last_best: None,
@@ -2132,6 +2182,8 @@ impl Session {
             panels.screen = Screen::Unknown;
             self.read_in = Some(until.saturating_duration_since(std::time::Instant::now()) + DOORS_MARGIN);
         }
+        // A card held down drops out of the read: the row taken in full stands (see `keep_row`).
+        keep_row(&mut panels, self.full_row.as_ref(), scene.warden, &self.tools);
         if panels.screen == Screen::Patrol {
             let doors: Vec<u8> = panels.doors.iter().flatten().copied().collect();
             // Two door cards in the centred two-card positions are already a full row, so do not wait for a third: a
@@ -2157,6 +2209,11 @@ impl Session {
                 }
             } else {
                 self.short_doors = None;
+            }
+            if panels.screen == Screen::Patrol
+                && let Some(row) = FullRow::of(&panels, scene.warden, &self.tools)
+            {
+                self.full_row = Some(row);
             }
         }
         // Nor does one follow the day's manage step at its count: the board
@@ -4933,6 +4990,7 @@ impl Session {
         self.cards_seen.clear();
         self.fresh_at = None;
         self.short_doors = None;
+        self.full_row = None;
         self.short_offer = None;
         self.full_offer = None;
         self.rerolled = None;
@@ -4998,6 +5056,8 @@ impl Session {
         });
         self.run_over_at = Some(std::time::Instant::now());
         self.ended = None;
+        // The next run's first patrol must not take this run's last row (see `keep_row`).
+        self.full_row = None;
         if let Some(log) = &mut self.log
             && self.reading.as_ref().is_some_and(|r| r.model.day >= r.model.max_days)
         {

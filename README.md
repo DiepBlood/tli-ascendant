@@ -3,7 +3,7 @@
 《火炬之光：無限》（Torchlight: Infinite）的 Windows 輔助視窗，支援兩種玩法：
 
 - **塔羅斯（Tartarus）**：讀取監獄盤面，建議下一步要去哪一格、吃掉或替換哪個囚犯、選哪個刑具或典獄長寶藏獎勵，以及要不要重新隨機。
-- **渴血手術（Vorax）**：讀取藥劑卡、水箱與手術用具，建議這一手選哪張卡、加到哪個水箱，並顯示每個選項達到 840k 的機率與平均分數；終局戰鬥時顯示波次、活性與加成。
+- **渴血手術（Vorax）**：讀取藥劑卡、水箱與手術用具，建議這一手選哪張卡、加到哪個水箱，並顯示每個選項達到 840k 的機率與平均分數；終局戰鬥時顯示波次、活性、加成與解藥瓶掉落加成。
 
 > 非官方工具，與《火炬之光：無限》的開發商、發行商無關，也未經其認可。
 > Ascendant 只讀取遊戲視窗的畫面和遊戲自己寫出的日誌：不碰遊戲的記憶體、檔案或網路，也不會替你點擊或打字。
@@ -17,13 +17,13 @@ English summary at the [end of this page](#english).
 | 功能 | 繁中客戶端 | 英文客戶端 |
 |---|---|---|
 | 塔羅斯：讀盤面與建議 | 支援 | 支援，測試較少 |
-| 渴血手術：讀卡片、水箱與建議（含終局戰鬥） | 支援 | 不支援：視窗頂端會顯示提示，塔羅斯照常 |
+| 渴血手術：讀卡片、水箱與建議（含終局戰鬥） | 支援 | 支援，測試較少：卡名讀不準時顯示讀不到，不亂猜；終局戰鬥面板已實測 |
 | 進度頁：累積次數、可玩局數 | 支援 | 應可使用（讀遊戲日誌裡不分語言的數值），尚未實測 |
 | 本局頁：運氣／決策分析 | 支援 | 支援 |
 | 本局頁：匯出這一局（回報資料） | 支援 | 支援 |
 
 - 本局頁的分析要用當局遊玩時的語言設定來看；語言不同時會提示先到設定頁切換。
-- 作者平常都用**繁中客戶端**測試，所以繁中客戶端的畫面辨識與分析最完整，也最推薦。遇到讀錯請回報（方法見下方[回報問題](#回報問題)）。
+- 作者平常都用**繁中客戶端**測試，所以繁中客戶端的畫面辨識與分析最完整，也最推薦。英文客戶端的渴血讀取是 1.1.0 新增的：回合約 97%、選卡畫面的卡名約 98% 讀得到，人工抽樣沒有讀錯，但讀不到的卡會多一些，建議看一眼再選。遇到讀錯請回報（方法見下方[回報問題](#回報問題)）。
 
 ## 下載前請先看
 
@@ -50,8 +50,6 @@ English summary at the [end of this page](#english).
   Add-WindowsCapability -Online -Name "Language.OCR~~~zh-TW~0.0.1.0"
   Add-WindowsCapability -Online -Name "Language.OCR~~~en-US~0.0.1.0"
   ```
-
-- 渴血的建議只支援**繁中客戶端**；塔羅斯兩種語言都支援。各功能的語言支援見[支援的語言](#支援的語言)。
 
 ## 安裝與使用
 
@@ -104,10 +102,10 @@ English summary at the [end of this page](#english).
 
 1. 在 Ascendant 的**本局頁**頂端的選單選要回報的那一局（「最近一局」就是剛打完的那局），再按下方「**匯出這一局**」卡片裡的「**準備匯出**」。沒打完的局不會匯出，卡片會提示改選一局。
 2. 畫面會先列出 zip 裡的內容給你看，這時還沒有存任何檔案；確認後按「**存檔並開啟資料夾**」才會寫入。zip 存在 `Ascendant.exe` 所在的資料夾（該資料夾不能寫入時改存到 `%APPDATA%\Ascendant`），檔案大小最多 20 MB。
-3. 到本 repo 的 [Issues](../../issues/new/choose) 開新問題，填寫表單，並把這個 zip 拖進附件欄。
+3. 到本 repo 的 [Issues](../../issues/new/choose) 開新問題，填寫表單（含遊戲客戶端語言），並把這個 zip 拖進附件欄。英文客戶端的渴血讀錯時，請在描述裡寫下讀錯的卡名與正確的卡名。
 
 這個 zip 只含文字紀錄（`log.jsonl`、`report.txt`）與遊戲截圖：
-- 塔羅斯的監獄盤面、渴血的選卡與結算畫面是**整張遊戲畫面**（最多 1280 寬，超過 20 MB 時再縮小）。塔羅斯的整張畫面會先把右下角（UID）與左下角（聊天、伺服器與識別碼）塗黑；渴血的選卡與結算畫面是全螢幕介面，畫面上沒有 UID 和聊天，不另外塗黑。其他畫面只裁出盤面，渴血終局戰鬥只有裁切過的面板。
+- 塔羅斯的監獄盤面、渴血的選卡與結算畫面是**整張遊戲畫面**（最多 1280 寬，超過 20 MB 時再縮小）。塔羅斯的整張畫面會先把右下角（UID）與左下角（聊天、伺服器與識別碼）塗黑；渴血的選卡與結算畫面（繁中與英文客戶端相同）是全螢幕介面，畫面上沒有 UID 和聊天，不另外塗黑。其他畫面只裁出盤面，渴血終局戰鬥只有裁切過的面板。
 - 文字紀錄會去掉遊戲視窗標題、本機路徑、Windows 使用者名稱與 15 位以上的長數字（玩家 ID 的格式）。
 
 整張畫面仍可能拍到角色名稱等你不想公開的內容，請在按「存檔並開啟資料夾」之前先看過列出的內容。請只附這個 zip（或單張截圖），不要附 exe 或其他壓縮檔。
@@ -134,7 +132,7 @@ cargo build --release --bin ascendant-cli   # 命令列工具
 Ascendant is a Windows companion app for *Torchlight: Infinite*, modified from [arcasti/tli-warden](https://github.com/arcasti/tli-warden). It reads the game window and recommends moves for two modes:
 
 - **Tartarus**: which destination to take, which Inmate to consume or replace, which Torture Instrument or Warden's Treasure reward to pick, and when to re-roll.
-- **Vorax**: which card to pick and which tank to add it to, with each option's chance to reach 840k and its average score, plus the endgame battle's wave, activity and bonus. Vorax advice needs the Traditional Chinese game client.
+- **Vorax**: which card to pick and which tank to add it to, with each option's chance to reach 840k and its average score, plus the endgame battle's wave, activity, bonus and Antidote Vial drop bonus. Vorax advice works on both the Traditional Chinese and the English game client.
 
 Unofficial and not affiliated with the game's developers or publishers. It only reads pixels from the game window and the game's own log; it never touches the game's memory, files or network traffic, and never clicks or types for you.
 
@@ -143,18 +141,18 @@ Unofficial and not affiliated with the game's developers or publishers. It only 
 | Feature | Traditional Chinese client | English client |
 |---|---|---|
 | Tartarus: board reading and advice | yes | yes, less tested |
-| Vorax: cards, tanks and advice (endgame battle included) | yes | no: a notice shows at the top, Tartarus goes on as usual |
+| Vorax: cards, tanks and advice (endgame battle included) | yes | yes, less tested: a card that cannot be read reliably shows as unread instead of a guess; the endgame battle panel was tested in live games |
 | Progress tab: counts and games left | yes | should work (it reads language-neutral values from the game log), not tested yet |
 | Run tab: luck vs decisions | yes | yes |
 | Run tab: Export this run (report data) | yes | yes |
 
-A run is reviewed in the language it was played in; when the setting differs, the Run tab asks you to switch it first. The Traditional Chinese client is the most tested and is recommended.
+A run is reviewed in the language it was played in; when the setting differs, the Run tab asks you to switch it first. The Traditional Chinese client is the most tested and is recommended. Vorax on the English client is new in 1.1.0: the round is read about 97% of the time and card names on the choice screen about 98%, with 0 misreads in a manual spot check, but more cards show as unread, so glance at the board before you pick.
 
 **Requirements**: Windows 10 or 11; the game at 16:9 or wider, fullscreen, borderless or windowed (a narrower screen is not read); the Windows OCR language matching the game client (`en-US` or `zh-TW`). The app has "Install Traditional Chinese OCR" and "Install English OCR" buttons (they show a Windows administrator prompt; then reopen Ascendant, restarting Windows first if Windows asks); the PowerShell commands above are the manual fallback.
 
 **Safe download**: only download from this repo's [Releases](../../releases) page. If you already have Ascendant, put the release files you downloaded (at least `Ascendant.exe`, `SHA256SUMS.txt` and `SHA256SUMS.txt.sig`) in one folder and check them with "Verify downloaded files..." in the settings page's "Updates" group, which checks the signature, `Ascendant.exe` and every other signed file that is in the folder: only "Verified" means the author released them, and a warning under it ("the folder also holds..." or "an older version") must be dealt with before running: move `Ascendant.exe` to a folder of its own, or download the latest version instead (comparing `Get-FileHash` with an unverified `SHA256SUMS.txt` proves nothing). On a first install nothing can check the signature yet, so trust rests on the source and on the release key fingerprint published on the "發行公鑰指紋" line above: compare it with the one in the About section and delete the program if it differs (a match alone does not prove the file genuine). The exe is not code-signed, so SmartScreen may warn: choose "More info" then "Run anyway" only once you know the file came from this repo's Releases. See [SECURITY.md](SECURITY.md).
 
-**Reporting a problem**: on the Run tab, pick the run in the picker at the top ("Latest run" is the game that just ended), then press "Prepare" in the "Export this run" card below; an unfinished run is not exported, and the card asks you to pick another. Its contents are listed first and nothing is written until you press "Save and open folder"; the zip (at most 20 MB) is saved next to `Ascendant.exe`, or in `%APPDATA%\Ascendant` when that folder cannot be written. Drag it into the [issue form](../../issues/new/choose). It holds text logs (with no window titles, local paths, user names or 15-digit-plus numbers) and game screenshots: Tartarus prison boards and Vorax choice and result screens are whole frames, at most 1280 wide and smaller if over 20 MB; the Tartarus ones have the bottom right (UID) and bottom left (chat, server and id line) blacked out, while the Vorax choice and result screens are full-screen menus that show no UID or chat; other screens are cut to the board, and the Vorax endgame battle only as its cropped panel. A whole frame can still show things such as character names, so look the list over before saving. Attach nothing else.
+**Reporting a problem**: on the Run tab, pick the run in the picker at the top ("Latest run" is the game that just ended), then press "Prepare" in the "Export this run" card below; an unfinished run is not exported, and the card asks you to pick another. Its contents are listed first and nothing is written until you press "Save and open folder"; the zip (at most 20 MB) is saved next to `Ascendant.exe`, or in `%APPDATA%\Ascendant` when that folder cannot be written. Drag it into the [issue form](../../issues/new/choose). In the form, give the game client language; for a Vorax misread on the English client, also say which card was read wrongly and what it should be. It holds text logs (with no window titles, local paths, user names or 15-digit-plus numbers) and game screenshots: Tartarus prison boards and Vorax choice and result screens are whole frames, at most 1280 wide and smaller if over 20 MB; the Tartarus ones have the bottom right (UID) and bottom left (chat, server and id line) blacked out, while the Vorax choice and result screens are full-screen menus that show no UID or chat; other screens are cut to the board, and the Vorax endgame battle only as its cropped panel. A whole frame can still show things such as character names, so look the list over before saving. Attach nothing else.
 
 **Use**:
 
