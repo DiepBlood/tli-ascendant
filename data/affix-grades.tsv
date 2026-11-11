@@ -1,0 +1,146 @@
+# Map affixes (Netherrealm Resonance), one line per sentence. Game text only.
+# grade<TAB>ids<TAB>English<TAB>Chinese; # in the text = a rolled number; empty = not seen yet.
+# Since 1.2.0 an affix the user has not graded is framed in the colour the game shows it in: the grade column is the
+# grade this table set before 1.2.0 (kept for users who had those defaults), `game` for a sentence it had none for.
+danger	3500300,ocr-zh-2	When Magic and Rare monsters take damage, there is a #% chance to inflict Scorch on you. Lasts for #s. Interval: #s	魔法和稀有怪物受到傷害時，#% 機率對玩家施加燒灼，持續 # 秒，間隔 # 秒
+danger	3500301	When Magic and Rare monsters are defeated, there is a #% chance to inflict Numbed on you. Lasts for #s. #% additional Numbed Effect for you	魔法和稀有怪物被擊敗時，#% 機率對玩家施加麻痺，持續 # 秒；玩家額外 #% 受到的麻痺效果
+danger	3500302	When Magic and Rare monsters are defeated, there is a #% chance to inflict Frosted on you. Lasts for #s	魔法和稀有怪物被擊敗時，#% 機率對玩家施加凍僵，持續 # 秒
+danger	3500303	When Rare monsters take damage, there is a #% chance to inflict Maim on you. Lasts for #s. Interval: #s	稀有怪物受到傷害時，#% 機率對玩家施加致殘，持續 # 秒，間隔 # 秒
+danger	3500304	When Magic and Rare monsters are defeated, there is a #% chance to inflict Rot on you. Lasts for #s	魔法和稀有怪物被擊敗時，#% 機率對玩家施加腐爛，持續 # 秒
+danger	5422014	Rare monsters gain #% Damage Avoidance Chance every after taking # hits. (Stacks up to # times.)	稀有怪物每被擊中 # 次，獲得 #% 避免傷害機率（最多疊加 # 次）
+danger	5521021,5634006	Upon receiving damage, Rare monsters have a #% chance to gain #% Attack, Cast, and Movement Speed. Interval: #s.	稀有怪物受到傷害時，有 #% 機率獲得 #% 的攻擊、施法、移動速度;該效果有#秒間隔時間
+danger	5634001,5521035	Rare monsters will be forced to Blink near you when they are within #m of you; #% chance for Magic and Rare monsters to inflict Blind and Paralysis for # s on hit	稀有怪物距離玩家#米時強制閃現到玩家附近;魔法和稀有怪物 #% 機率在擊中時造成 # 秒致盲和癱瘓
+danger	5634004	Rare monsters inflict a stack of Slow effect on targets within # m of them for # s every # s. Stacks up to # times.	稀有怪物每 # 秒對 # 米範圍內的目標施加一層 # 秒減速效果，最多 # 層
+danger	5634005	Rare monsters take #% additional damage from attacks dealt from more than # m away	稀有怪物受到 # 米外的傷害額外 #%
+danger	5634007,5634008	The stage has # more sets of Cooldown Speed-up Test Subject II	關卡內新增 # 組冷卻加速的中級實驗體
+danger	5634009	The stage has # more sets of Attack Speed-up Aember Shooters	關卡內新增 # 組攻擊加速的災燼觸槍
+danger	5634002,ocr-en-10	Rare monsters have a #% chance to gain a #-meter radius protective dome (Enemies outside the dome cannot deal Damage to those inside)	稀有怪物有 #% 機率獲得半徑#米的護罩（護罩外敵人無法對護罩內造成傷害）
+danger	ocr-en-9	Upon receiving Projectile Damage, Rare monsters gain a protective dome with a radius of #m. (Enemies outside the protective dome cannot deal damage to targets in the dome.)	
+warn	5111003	#% Max Elemental Resistance for you	#% 玩家的元素抗性上限
+warn	5111004	#% Max Fire Resistance for you	
+warn	5111006	#% Max Cold Resistance for you	
+warn	5111007	#% Max Erosion Resistance for you	#% 玩家的腐蝕抗性上限
+warn	5121008	#% Attack, Cast, and Movement Speed for monsters	
+warn	5212001	At Full Life, you deal #% additional damage every # s. Stacks up to # times.	玩家滿血時，每 # 秒造成的傷害額外 #% ，最高疊加 # 次
+warn	5212003	Upon leaving the Full Life status, you deal #% additional damage for # s. This effect persists even when you enter the Full Life status again.	玩家離開滿血狀態後， # 秒內造成的傷害額外 #% ；回到滿血狀態也不復原
+warn	5212006	At Low Mana, you deal #% additional damage every # s. Stacks up to # times.	玩家低魔時，每 # 秒造成的傷害額外 #% ，最高疊加 # 次
+warn	5212007	Deal #% additional damage for each Curse effect you have received	玩家每受到一個詛咒效果，造成的傷害額外 #%
+warn	5212008		玩家受詛咒效果時，每 # 秒造成的傷害額外 #% ，最高疊加 # 次
+warn	5212009	Upon receiving Paralysis, you deal #% additional damage	玩家受到癱瘓效果時，造成的傷害額外 #%
+warn	5212010	Upon being Blinded, you gain #% additional Attack and Cast Speed	玩家受到致盲效果時，攻擊和施法速度額外 #%
+warn	5212011	Gets Weakened for # s if you have moved more than # m recently	玩家在最近移動超過 # 米時，獲得 # 秒虛弱
+warn	5212016	Every # stack(s) of Agility Blessing or Focus Blessing removes # stack(s) of this blessing.	玩家每獲得 # 層靈動祝福或聚能祝福，失去 # 層該祝福
+warn	5212019	You lose # stacks of Blessing every # s	玩家每 # 秒失去 # 層祝福
+warn	5311001	Upon leaving the Full Life status, you take #% additional damage for # s. This effect persists even when you enter the Full Life status again.	玩家離開滿血狀態後， # 秒內額外 #% 受到的傷害；回到滿血狀態也不復原
+warn	5311002	Upon entering the Low Life status, you receive #% additional damage for # s	玩家進入低血狀態後 # 秒內受到傷害額外 #%
+warn	5311005	#% Life Regeneration Speed for you	
+warn	5311006	#% additional Mana Regeneration Speed for you	玩家魔力自然恢復速度額外 #%
+warn	5311010	#% additional Life Regain and Energy Shield Regain Interval for you	
+warn	5311016	Every # stack(s) of Tenacity Blessing removes # stack(s) of Tenacity Blessing.	玩家每獲得 # 層 堅韌祝福，失去 # 層 堅韌祝福
+warn	5311018	You lose # stacks of Tenacity Blessing every # s	玩家每 # 秒失去 # 層 堅韌祝福
+warn	5422013,ocr-zh-3	Rare monsters gain  #% Damage Avoidance Chance (up to # time(s)) every # s with - #% Damage Avoidance Chance when hit	稀有怪物每 # 秒獲得  #% 避免傷害機率（最多疊加 # 次），每次受擊時 - #% 避免傷害機率
+warn	5422025	Upon entering the Low Life status for the first time, Rare monsters restore #% Max Life within # s	稀有怪物首次進入低血狀態時，在 # 秒內恢復 #% 最大生命
+warn	5422033	Upon taking Damage Over Time for the first time, Rare monsters gain Life Restoration per Second equal to #% Max Life for # s	稀有怪物首次受到持續傷害時，在 # 秒內 #% 最大生命的每秒生命恢復
+warn	5521001	#% additional Attack, Cast, and Movement Speed for Magic and Rare monsters	魔法和稀有怪物額外 #% 攻擊、施法、移動速度
+warn	5521002	#% additional Attack, Cast, and Movement Speed for Magic and Rare monsters. Removes the effect upon dealing damage.	魔法和稀有怪物額外 #% 攻擊、施法、移動速度，在造成傷害後移除該效果
+warn	5521003	Rare monsters gain #% Attack, Cast, and Movement Speed for # s every time on hit	稀有怪物每次擊中時，獲得持續 # 秒的 #% 攻擊、施法、移動速度
+warn	5521009	Rare monsters' next attack cannot be evaded every after # s	每過 # 秒，稀有怪物的下一次攻擊無法被閃避
+warn	5521014	The player #% additional damage taken when at Full Mana	玩家滿魔時額外受到 #% 傷害
+warn	5521015	The player takes #% additional damage when at Low Life	玩家低血時額外受到 #% 傷害
+warn	5521016	The player #% additional damage taken when at Full Life	
+warn	5521032	When Rare monsters hit a target, they additionally increase the target's Life Regain by #% for # s, up to # stacks	
+warn	5521034		魔法和稀有怪物造成傷害時，使目標在 # 秒內護盾和生命返還間隔額外 #%
+warn	5521039	Magic and Rare monsters reduce the target's Focus Blessing, Agility Blessing, and Tenacity Blessing by # stack(s) on hit.	魔法和稀有怪物擊中時，減少目標 # 層聚能祝福、靈動祝福和堅韌祝福
+warn	5521040	Rare monsters reduce the target's Focus Blessing, Agility Blessing, and Tenacity Blessing by # stack(s) for # s on hit	稀有怪物擊中時，在 # 秒內減少目標 # 層聚能祝福、靈動祝福和堅韌祝福。
+warn	5521041	Magic and Rare monsters capture # stack(s) of Focus Blessing, Agility Blessing, and Tenacity Blessing from the target on hit.	
+warn	ocr-en-4	#% Life Regain and Energy Shield Regain for you	
+warn	5212012	You will be Blinded for # s when you have lost #% of Life or taken damage greater than #% of the sum of Life and Energy Shield recently	玩家在最近消耗 #% 生命，或受到高於 #% 生命和護盾總值的傷害時，獲得 # 秒致盲。
+warn	ocr-zh-4		稀有怪物擊中時 , 使目標#秒內生命返還#% , 最多疊加#層
+none	5112003	#% additional Fire Damage for you	玩家額外 #% 火焰傷害
+none	5112006		玩家額外 #% 物理傷害
+none	5112008	#% additional Attack and Cast Speed for you	玩家額外 #% 攻擊和施法速度
+none	5112010	#% additional Area Damage for you	玩家額外 #% 範圍傷害
+none	5121003	#% additional Fire Damage for monsters	怪物額外 #% 火焰傷害
+none	5121005	#% additional Cold Damage for monsters	
+none	5121006	#% additional Physical Damage for monsters	怪物額外 #% 物理傷害
+none	5122002	#% Monster Elemental Resistance	
+none	5122004	#% Monster Lightning Resistance	#% 怪物閃電抗性
+none	5122006	#% Monster Erosion Resistance	#% 怪物腐蝕抗性
+none	5122007	#% additional monster Life	額外 #% 怪物生命
+none	5122008,5422036	#% additional Curse Effect against monsters	怪物額外 #% 受到的詛咒效果
+none	5212013	When having at least # Fervor Rating, you lose # Fervor Rating every second	玩家至少擁有 # 點戰意值時，每秒失去 # 點戰意值
+none	5212017	#% Blessing Duration for you	玩家 #% 祝福持續時間
+none	5311003	Upon entering the Low Energy Shield status for the first time, the player #% additional Max Energy Shield	玩家首次進入低護盾狀態時，最大護盾額外 #%
+none	5311007	#% Energy Shield Charge Interval for you	玩家護盾充能間隔 #%
+none	5311013	#% additional Armor within #s when you receive damage.	玩家受到傷害時， # 秒內額外 #% 護甲值
+none	5311015	#% Block Ratio for you for # s when you block	玩家格擋時， # 秒內 #% 格擋比例
+none	5311020	#% Evasion for you for # s every # time(s) you evade	玩家每閃避 # 次， # 秒內 #% 閃避值
+none	5311024	#% Barrier Absorption Rate for you	玩家 #% 屏障吸收比例
+none	5311025	#% Barrier Shield for you	玩家 #% 屏障吸收量
+none	5311026	The player #% additional Aura Effect	玩家額外 #% 光環效果
+none	5422001	#% additional Monster Armor	怪物額外 #% 護甲值
+none	5422005	Adds Energy Shield equal to #% of Life to Magic and Rare monsters	魔法和稀有怪物附加 #% 生命的護盾值
+none	5422007	Adds Energy Shield equal to #% of Max Life to Rare monsters	稀有怪物附加 #% 最大生命的護盾值
+none	5422010	#% Injury Buffer for Rare monsters	稀有怪物 #% 受傷緩衝
+none	5422011	Rare monsters take #% additional damage for every #% Energy Shield and Life lost. Takes effect up to # time(s)	稀有怪物每損失 #% 護盾和生命值總和，額外 #% 受到的傷害（最多生效 # 次）
+none	5422016	#% Duration for Damage Over Time effects received by Rare monsters	稀有怪物受到的持續傷害效果時間 #%
+none	5422017	Rare monsters lose # Affliction for every #% Life lost	
+none	5422020,5422021,5422028	#% additional damage taken for Rare monsters affected by control effects	稀有怪物受到控制類效果時，額外 #% 受到傷害
+none	5422029	#% additional damage taken for Cursed Rare monsters	稀有怪物受到詛咒效果時，額外 #% 受到傷害
+none	5521019	When Rare monsters hit a target, they reduce the target's Armor by #% for # s	稀有怪物擊中時，使目標在 # 秒內 #% 護甲值
+none	5521023	Rare monsters deal #% additional damage to Energy Shield for # s when they take Spell Damage	稀有怪物受到法術傷害時，在 # 秒內對護盾造成的傷害額外 #%
+none	5521029	When Magic monsters deal damage to a target, the target additionally #% Energy Shield Charge Speed for # s	魔法怪物造成傷害時，使目標 # 秒內護盾充能速度額外 #%
+none	5521031	When Rare monsters hit a target, they additionally increase the target's Energy Shield Charge Speed by #% for # s	稀有怪物擊中時，使目標 # 秒內護盾充能速度額外 #%
+none	5521037	When Rare monsters hit a target, they reduce the target's Fervor Rating by #	稀有怪物擊中時，減少玩家戰意值 # 點
+none	ocr-en-1	#% Block Chance for you for # s when you block	
+none	ocr-en-2	#% additional Physical Damage for you	
+none	5121002	#% additional Elemental Damage for monsters	怪物額外 #% 元素傷害
+none	ocr-en-6	#% additional player Armor	
+none	ocr-en-7	#% Erosion Resistance Penetration for Rare monsters	
+none	5311017,ocr-zh-1	#% Tenacity Blessing Duration for you	玩家 #% 堅韌祝福持續時間
+none	5111001,ocr-zh-5	#% additional player Evasion	額外 #% 玩家的閃避值
+game	5112007	#% additional Erosion Damage for you	
+game	5311021	#% Blur effect for you	玩家 #% 迷踪效果
+game	5422018	Rare monsters take #% additional Damage Over Time within # s after their Affliction reaches #	稀有怪物加劇值達到#時， # 秒內受到的持續傷害額外 #%
+game	5121004	#% additional Lightning Damage for monsters	
+game	5521026	Rare monsters inflict # Affliction inflicted per second	
+game	5112004	#% additional Lightning Damage for you	玩家額外 #% 閃電傷害
+game	5422002	#% additional Monster Elemental Resistance	怪物額外 #% 元素抗性
+game	5122003	#% Monster Fire Resistance	#% 怪物火焰抗性
+game	5212005	At Low Life, you deal #% additional damage every # s. Stacks up to # times.	玩家低血時，每 # 秒造成的傷害額外 #% ，最高疊加 # 次
+game	5521027	Magic monsters inflict Lv. # Timid and Corruption Curse on hit	魔法怪物擊中時施加 # 級膽怯和邪惡侵蝕詛咒
+game	5634003	Magic monsters Reap # s of Damage Over Time on hit. The effect has a # s Recovery Time against the same target	魔法怪物擊中時收割 # 秒持續傷害，該效果對同一目標有 # 秒恢復時間
+game	5112005	#% additional Cold Damage for you	玩家額外 #% 冰冷傷害
+game	5422035	#% additional damage taken for all Non-Elite enemies within # m of a Rare monster.	稀有怪物 # 米範圍內的非勁敵額外 #% 受到傷害
+game	5212015	Unable to gain Fervor for # s after losing it	失去戰意後 # 秒內無法獲得戰意
+game	5311011	#% Elemental Resistance within # s when you receive damage	玩家受到傷害時， # 秒內 #% 元素抗性
+game	5121009	Monsters deal #% additional damage to Life	怪物對生命造成額外 #% 傷害
+game	5212014	#% Fervor effect	#% 戰意效果
+game	5521017	#% Elemental Resistance Penetration for Rare monsters	稀有怪物 #% 元素抗性穿透
+game	5521018		稀有怪物 #% 腐蝕抗性穿透
+game	5311008		玩家護盾充能速度額外 #%
+game	5422024		稀有怪物 # 秒內受到超過 #% 最大生命的傷害時，在 # 秒內額外恢復 #% 最大生命（僅觸發一次）
+game	5422023		稀有怪物首次被擊中時，在 # 秒內額外恢復 #% 最大生命
+game	5112001		玩家額外 #% 傷害
+game	5311019		玩家被擊中時， # 秒內額外 #% 閃避值
+game	5311012		玩家受到傷害時， # 秒內 #% 腐蝕抗性，最多疊加 # 層
+game	5422032		稀有怪物受到範圍擊中傷害時，在 # 秒內獲得 #% 避免傷害機率，冷卻 # 秒
+game	5422031		稀有怪物受到投射物傷害時，獲得半徑#米的護罩（護罩外敵人無法對護罩內造成傷害）
+game	5311022		玩家每秒失去 # 迷踪值
+game	5112009		玩家額外 #% 投射物傷害
+game	5111002		額外 #% 玩家的護甲值
+game	5521033		魔法和稀有怪物造成傷害時，使目標在 # 秒內護盾和生命返還 #% ，最多疊加 # 層
+game	5521030	When Magic monsters deal damage to a target, the target additionally #% Life Regeneration Speed for # s	魔法怪物造成傷害時，使目標 # 秒內生命自然恢復速度額外 #%
+game	5422012		普通和魔法怪物獲得 #% 避免傷害機率，且額外 #% 受到的持續傷害
+game	5111005		#% 玩家的閃電抗性上限
+game	5122001		額外 #% 怪物護甲值
+game	5311004	Upon receiving damage beyond #% Max Energy Shield recently, you have #% additional Max Energy Shield. (Can be triggered up to # times.)	玩家最近受到最大護盾 #% 以上的傷害時，最大護盾額外 #% （最多觸發 # 次）
+game	5521028		稀有怪物對 # 米範圍內的目標施加 # 級膽怯和邪惡侵蝕詛咒
+game	5521022		稀有怪物受到攻擊傷害時，在 # 秒內對生命造成的傷害額外 #%
+game	5521013		玩家低魔時額外受到 #% 傷害
+game	5422019	Upon being hit for the first time, Rare monsters additionally restore #% Max Life within # s	
+game	5122005		#% 怪物冰冷抗性
+game	5311014		玩家格擋時， # 秒內 #% 格擋率
+game	5121007		怪物額外 #% 腐蝕傷害
+game	5121010		怪物對護盾造成額外 #% 傷害
+game	5311009		玩家生命返還與護盾返還 #%

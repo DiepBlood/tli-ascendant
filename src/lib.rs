@@ -2,6 +2,8 @@
 //! from an earlier JS version: js/engine.js, js/solver.js and js/analyze.js),
 //! the screen reader and the app.
 
+// Map affix reading: the affix frames on the map page and the affix page (public since 1.2.0).
+pub mod affix;
 pub mod app;
 pub mod audit;
 pub mod board;

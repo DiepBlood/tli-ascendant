@@ -6,6 +6,8 @@
 //! output stays exactly what `format!` gave.
 
 mod zh_tw;
+// The affix page's and the affix frames' Chinese, kept in a file of its own.
+mod zh_tw_affix;
 
 /// Vorax advice notes in Traditional Chinese (src/vorax/mod.rs translates `Advice::note` with it).
 pub use zh_tw::vorax_note;
@@ -75,7 +77,7 @@ pub fn tr_in(lang: Lang, en: &'static str) -> &'static str {
         Lang::En => en,
         Lang::ZhTw => {
             static TABLE: OnceLock<HashMap<&'static str, &'static str>> = OnceLock::new();
-            TABLE.get_or_init(|| zh_tw::TEXT.iter().copied().collect()).get(en).copied().unwrap_or(en)
+            TABLE.get_or_init(|| table().copied().collect()).get(en).copied().unwrap_or(en)
         }
     }
 }
@@ -87,7 +89,12 @@ pub fn tr_dyn(en: &str) -> Option<&'static str> {
     if !zh() {
         return None;
     }
-    zh_tw::TEXT.iter().find(|(key, _)| *key == en).map(|(_, zh)| *zh)
+    table().find(|(key, _)| *key == en).map(|(_, zh)| *zh)
+}
+
+/// The Chinese table: zh_tw.rs's and the affix page's (zh_tw_affix.rs, a file of its own).
+fn table() -> impl Iterator<Item = &'static (&'static str, &'static str)> {
+    zh_tw::TEXT.iter().chain(zh_tw_affix::TEXT)
 }
 
 /// `template` with each `{}` replaced by the next of `args` and each `{N}`
@@ -152,7 +159,7 @@ mod tests {
     #[test]
     fn table_keys_are_unique() {
         let mut seen = std::collections::HashSet::new();
-        for (en, _) in zh_tw::TEXT {
+        for (en, _) in table() {
             assert!(seen.insert(en), "{en:?} is in the table twice");
         }
     }

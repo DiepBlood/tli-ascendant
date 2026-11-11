@@ -107,6 +107,8 @@ enum Tab {
     Run,
     /// Accumulated progress (Vorax, Tartarus); see [`AscendantApp::progress_section`].
     Progress,
+    /// The map affixes' switch, frame style and grades (`affix_page.rs`).
+    Affix,
     Settings,
 }
 
@@ -196,6 +198,8 @@ pub struct AscendantApp {
     /// Clicks on the window's empty parts pass to the one under it. Saved (`Settings::click_through`) and restored at
     /// start: the rail's "Thru" light, which always takes clicks, turns it off.
     click_through: bool,
+    /// The page's scroll area the mouse stays in under click-through, so the wheel scrolls it ([`wheel_area`]).
+    wheel_area: Option<Rect>,
     /// The thread that lets those clicks through, while `click_through` is on.
     through: Option<ClickThrough>,
     /// The window's opacity as last set, see [`see_through`].
@@ -341,6 +345,16 @@ pub struct AscendantApp {
     /// Live advice for Vorax surgery: while the mode is on, frames and game log hints go to it and the Tartarus
     /// Session is paused.
     vorax: VoraxView,
+    /// Private builds only: map page frames saved as samples for the affix reader, with observe mode on (see
+    /// `affix_samples.rs`); made on the first map page event, dropped when observe mode or the run logs are off.
+    #[cfg(feature = "dev-samples")]
+    affix_samples: Option<super::affix_samples::AffixSamples>,
+    /// The affix frames on the game while a map page shows (see `affix_live.rs`).
+    affix_live: super::affix_live::AffixLive,
+    /// The affix page's own state (search text, default table).
+    affix_page: super::affix_page::AffixPage,
+    /// The affixes learned from the game log (`affix-learned.tsv`, see `affix::learned`).
+    affix_learned: crate::affix::learned::Store,
     /// The hotkey being recorded on the settings page, after its "Change" was pressed: the next key pressed becomes it
     /// (see [`AscendantApp::record_key`]). Both hotkeys are released meanwhile, so the key pressed reaches this window
     /// and does nothing else.
@@ -463,6 +477,7 @@ impl AscendantApp {
                 Key { text: settings.auto_hotkey.clone(), ..Key::default() },
             ],
             click_through: false,
+            wheel_area: None,
             through: None,
             see_through: None,
             settings,
@@ -529,6 +544,14 @@ impl AscendantApp {
             move_seen: None,
             clicks: mark::Clicks::default(),
             vorax,
+            #[cfg(feature = "dev-samples")]
+            affix_samples: None,
+            affix_live: {
+                let ctx = cc.egui_ctx.clone();
+                super::affix_live::AffixLive::new(move || ctx.request_repaint())
+            },
+            affix_page: Default::default(),
+            affix_learned: crate::affix::learned::Store::open(learned_path()),
             recording: None,
             esc_busy: false,
             review: RunReview::default(),
@@ -598,6 +621,8 @@ impl AscendantApp {
         // The test entry point goes last: without auto read, watch() forces Vorax mode off, so the Vorax
         // preview has to come after it.
         app.preview_entry();
+        app.configure_affixes();
+        app.look_back_affixes();
         app
     }
 
@@ -944,6 +969,7 @@ impl AscendantApp {
         // Every settings change is saved: the Vorax settings (log, rollouts and so on) are updated along with
         // it.
         self.vorax.configure(Config::from_settings(&self.settings));
+        super::runlog::set_settings(self.settings.log_summary());
         if let Err(e) = self.settings.save() {
             self.error = Some(trf!("Settings not saved: {}", e));
         }
@@ -1537,6 +1563,172 @@ impl AscendantApp {
     fn start_vorax_settle(&mut self, dir: PathBuf, written: Option<Receiver<()>>, at: Option<i64>) {
         let rx = spawn_settle(&self.ctx, dir.clone(), Game::Vorax, written);
         self.review.start_vorax(dir, rx, at);
+    }
+
+    /// A map page event ([`Event::MapLog`], [`Event::MapShot`]): the affix frames take it, a level entered teaches its
+    /// affixes, and private builds hand it on to the affix samples ([`AscendantApp::sample_map_event`]).
+    fn map_event(&mut self, event: Event) {
+        // the live frames first, whatever observe mode says
+        match &event {
+            Event::MapLog(signal, ..) => self.affix_live.note(*signal),
+            Event::MapShot { frame, after, at, .. } => self.affix_live.frame(frame, after, *at),
+            _ => {}
+        }
+        // a level entered: the affixes its block named are learned (new ones, or another language's text)
+        if matches!(event, Event::MapLog(gamelog::Signal::MapAffixes(_), ..)) {
+            self.learn_affixes();
+        }
+        self.sample_map_event(event);
+    }
+
+    /// Private builds only: a map page event into the affix samples while observe mode and the run logs are on.
+    #[cfg(feature = "dev-samples")]
+    fn sample_map_event(&mut self, event: Event) {
+        if !(self.settings.observe && self.settings.run_log) {
+            self.affix_samples = None;
+            return;
+        }
+        if self.affix_samples.is_none() {
+            self.affix_samples = super::affix_samples::AffixSamples::new();
+        }
+        let Some(samples) = &mut self.affix_samples else { return };
+        match event {
+            Event::MapLog(signal, stamp, read) => {
+                // the display scaling the visit is taken at, for its first row
+                if matches!(signal, gamelog::Signal::MapPage { state: gamelog::PageState::Shown, .. }) {
+                    samples.set_dpi(super::capture::game_dpi(&self.settings.window_title));
+                }
+                samples.note(signal, stamp, read)
+            }
+            // the once-a-second frames (twice a second with frames up), and the frames the live frames ask for to read a
+            // panel again, are for the live frames only: as samples they would fill a visit's 40 with tooltips coming
+            // and going and crowd out the frames after the clicks
+            Event::MapShot { frame, at, after, delay_ms, taken_ms } if after != "refresh" && after != "watch" && after != "retry" => {
+                samples.shot(frame, at, after, delay_ms, taken_ms);
+            }
+            // the frames the live frames asked for: their text area only, for replays at the real times
+            Event::MapShot { frame, at, after: "retry", .. } => samples.quick(&frame, at, "retry"),
+            _ => {}
+        }
+    }
+
+    #[cfg(not(feature = "dev-samples"))]
+    fn sample_map_event(&mut self, _event: Event) {}
+
+    /// Whether the affix samples are being taken: private builds with observe mode and the run logs on.
+    fn sampling_affixes(&self) -> bool {
+        cfg!(feature = "dev-samples") && self.settings.observe && self.settings.run_log
+    }
+
+    /// The affix frames follow the reads done and the game's place, and go when it is not in front (as the mark,
+    /// ui.rs `mark_spot`). Looks at the game's window only while a map page shows or frames are up.
+    fn poll_affix_live(&mut self) {
+        // affix texts the look back found (a lock on an empty queue when there are none)
+        self.learn_affixes();
+        // the map page is captured only for those who want it: the affix frames when their switch is on, private
+        // builds' samples when they are taken (observe mode and run logs on); neither, no map page frame (the user,
+        // 2026-11-09)
+        if let Some(w) = &self.watcher {
+            w.map_frames(self.settings.affix_frames, self.sampling_affixes());
+            // frames up: the page is looked at twice a second, so a scroll or a popup takes them down sooner
+            w.map_watch(self.affix_live.frames_up());
+        }
+        // what the live frames did, into the visit's samples log while the sampler runs (private builds): a live test
+        // then shows where the time went. Taken before the poll (the events' clicks, and nothing more when no page
+        // shows) and after it (the reads it took), so no note waits a tick, when a closed page would drop it or a page
+        // shown next would get it.
+        self.forward_affix_notes();
+        if !self.affix_live.active() {
+            return;
+        }
+        let title = &self.settings.window_title;
+        let game = if game_in_front(title) { game_rect(title).ok() } else { None };
+        self.affix_live.poll(game);
+        self.forward_affix_notes();
+        // a frame asked of the capture: a quick frame while the panel comes in or settles after a click, or a panel to
+        // read again though it did not change
+        if let Some(after) = self.affix_live.wants_shot_in()
+            && let Some(w) = &self.watcher
+        {
+            w.map_shot_in(after);
+        }
+        // come back soon: the game may move or lose the front with nothing else waking the window
+        self.ctx.request_repaint_after(std::time::Duration::from_millis(200));
+    }
+
+    /// The live frames' notes, taken on every tick so none pile up: into the visit's samples log in private builds,
+    /// dropped otherwise.
+    fn forward_affix_notes(&mut self) {
+        let notes = self.affix_live.take_notes();
+        #[cfg(feature = "dev-samples")]
+        if let Some(samples) = &mut self.affix_samples {
+            for note in &notes {
+                samples.live(note);
+            }
+        }
+        drop(notes);
+    }
+
+    /// The affix page; a change is saved and passed on to the live frames.
+    fn affix_tab(&mut self, ui: &mut egui::Ui) {
+        let s = &mut self.settings;
+        let seen = self.affix_live.seen().to_vec();
+        let hints = self.affix_live.hints();
+        if super::affix_page::draw(ui, &mut self.affix_page, &mut s.affix_frames, &mut s.affix_frame_style, &mut s.affix_grades, &seen, hints) {
+            self.save();
+            self.configure_affixes();
+        }
+    }
+
+    /// The affix settings and the learned affixes passed on to the live frames and the page.
+    fn configure_affixes(&mut self) {
+        // Once, on the first start since 1.2.0: the grades the user saw keep, though every affix not graded is framed
+        // by the game's colour from now on (the table's own grades were the defaults before). Only a user who had
+        // affix grades (a private build's) had those defaults to keep.
+        if self.settings.affix_defaults < super::settings::AFFIX_DEFAULTS_GAME_COLOUR {
+            if !self.settings.affix_grades.is_empty() {
+                let table = crate::affix::Dict::builtin().with_learned(&self.affix_learned.list);
+                crate::affix::dict::keep_grades_before(&table, &mut self.settings.affix_grades);
+            }
+            self.settings.affix_defaults = super::settings::AFFIX_DEFAULTS_GAME_COLOUR;
+            self.save();
+        }
+        self.affix_live.configure(self.settings.affix_frames, self.settings.affix_frame_style, &self.settings.affix_grades, &self.affix_learned.list);
+        self.affix_page.set_learned(&self.affix_learned.list);
+    }
+
+    /// The affixes the game's logs named before this start are learned too ([`gamelog::look_back_affixes`]: the log
+    /// and the game's backups of earlier ones), read on a thread of its own below normal priority; their texts wait in
+    /// the same queue as a level's, taken on every tick ([`AscendantApp::poll_affix_live`]). Not in previews: they show
+    /// set affixes and must not read the game's logs.
+    fn look_back_affixes(&self) {
+        if std::env::vars_os().any(|(k, _)| k.to_string_lossy().starts_with("ASCENDANT_PREVIEW")) {
+            return;
+        }
+        let manual = self.settings.game_log.clone();
+        let ctx = self.ctx.clone();
+        std::thread::spawn(move || {
+            // Windows' THREAD_PRIORITY_BELOW_NORMAL, as the settlement's threads
+            crate::solver::solve::set_priority(-1);
+            if let Ok((log, _)) = gamelog::locate(manual.as_deref(), None) {
+                gamelog::look_back_affixes(&log, &std::sync::atomic::AtomicBool::new(false));
+                ctx.request_repaint();
+            }
+        });
+    }
+
+    /// The affixes the game log named on entering a level, or the look back found ([`gamelog::take_affix_texts`]),
+    /// join the learned list; a change is saved (`affix-learned.tsv` in the app's folder) and passed on.
+    fn learn_affixes(&mut self) {
+        let mut changed = false;
+        for (id, text) in gamelog::take_affix_texts() {
+            changed |= crate::affix::learned::add(&mut self.affix_learned.list, id, &text);
+        }
+        if changed {
+            // a file that did not read at start is left alone (see `affix::learned::Store`)
+            let _ = self.affix_learned.save();
+            self.configure_affixes();
+        }
     }
 
     /// A Vorax game ended with a log folder (a new `ended_at` in [`VoraxView::last_game`]): settle it in the
@@ -2151,7 +2343,7 @@ fn esc_closes(pressed: bool, busy: bool) -> bool {
 /// cover, so they are as trusted as the program and a fresh install sees the whole history. A new version adds its
 /// file here.
 const RELEASE_NOTES: &[(&str, &str)] =
-    &[("1.1.0", include_str!("../../data/release-notes/1.1.0.txt")), ("1.0.4", include_str!("../../data/release-notes/1.0.4.txt")),("1.0.3", include_str!("../../data/release-notes/1.0.3.txt")), ("1.0.2", include_str!("../../data/release-notes/1.0.2.txt")), ("1.0.1", include_str!("../../data/release-notes/1.0.1.txt")), ("1.0.0", include_str!("../../data/release-notes/1.0.0.txt"))];
+    &[("1.2.0", include_str!("../../data/release-notes/1.2.0.txt")), ("1.1.0", include_str!("../../data/release-notes/1.1.0.txt")),("1.0.4", include_str!("../../data/release-notes/1.0.4.txt")),("1.0.3", include_str!("../../data/release-notes/1.0.3.txt")), ("1.0.2", include_str!("../../data/release-notes/1.0.2.txt")), ("1.0.1", include_str!("../../data/release-notes/1.0.1.txt")), ("1.0.0", include_str!("../../data/release-notes/1.0.0.txt"))];
 
 /// Which of the versions "What's new" lists (in its order, each with whether it is a release not installed yet) starts
 /// unfolded: the release not installed yet when there is one, else the `running` version, else the newest.
@@ -2515,11 +2707,21 @@ fn widget_rects(ctx: &egui::Context) -> Vec<[i32; 4]> {
     });
     rects
         .into_iter()
-        .map(|(layer, rect)| {
-            let rect = ctx.layer_transform_to_global(layer).map_or(rect, |t| t * rect);
-            [(rect.min.x * scale).floor() as i32, (rect.min.y * scale).floor() as i32, (rect.max.x * scale).ceil() as i32, (rect.max.y * scale).ceil() as i32]
-        })
+        .map(|(layer, rect)| client_pixels(scale, ctx.layer_transform_to_global(layer).map_or(rect, |t| t * rect)))
         .collect()
+}
+
+/// A rect in points as client pixels (left, top, right, bottom), rounded outward.
+fn client_pixels(scale: f32, rect: Rect) -> [i32; 4] {
+    [(rect.min.x * scale).floor() as i32, (rect.min.y * scale).floor() as i32, (rect.max.x * scale).ceil() as i32, (rect.max.y * scale).ceil() as i32]
+}
+
+/// The page's scroll area that keeps the mouse under click-through, so the wheel scrolls it: the visible part of a
+/// page taller than the window, on every tab but the board (where clicks on the empty parts are meant for the game
+/// under it). egui's scroll areas take drags only on touch screens, so with click-through on the wheel reached the
+/// page only over a widget and went to the game everywhere else (the user's report of 2026-11-09).
+fn wheel_area(tab: Tab, content_h: f32, view: Rect) -> Option<Rect> {
+    (tab != Tab::Board && content_h > view.height() + 0.5).then_some(view)
 }
 
 impl eframe::App for AscendantApp {
@@ -2553,7 +2755,9 @@ impl eframe::App for AscendantApp {
             }
         }
         if let Some(through) = &self.through {
-            through.set_rects(widget_rects(ctx));
+            let mut rects = widget_rects(ctx);
+            rects.extend(self.wheel_area.map(|r| client_pixels(ctx.pixels_per_point(), r)));
+            through.set_rects(rects);
         }
         while let Some(event) = self.watcher.as_ref().and_then(Watcher::event) {
             // The captured window is updated whether or not Vorax mode is on (in Vorax mode route intercepts
@@ -2597,9 +2801,17 @@ impl eframe::App for AscendantApp {
                     }
                 }
                 Event::RiotBoss(boss) => self.session.log_riot_boss(boss),
+                // How the riot went: into the run log of the run just ended, and its settlement on the Run tab.
+                Event::RiotEnd(end) => {
+                    if let Some(dir) = self.session.log_riot_end(end) {
+                        self.review.riot_done(&dir, end);
+                    }
+                }
+                Event::MapLog(..) | Event::MapShot { .. } => self.map_event(event),
             }
         }
         self.poll_vorax_settle();
+        self.poll_affix_live();
         // For previews (ASCENDANT_PREVIEW_SWITCH): the page switched once its time comes.
         if let Some((at, tab)) = self.preview_switch {
             let now = Instant::now();
@@ -2742,12 +2954,21 @@ impl eframe::App for AscendantApp {
             if let Some(y) = self.preview_scroll_y {
                 area = area.vertical_scroll_offset(y);
             }
+            let tab = self.tab;
             let scrolled = area.show(ui, |ui| {
                 match self.tab {
-                    Tab::Board if self.vorax.showing() => self.vorax.panel(ui, compact),
+                    Tab::Board if self.vorax.showing() => {
+                        // the give-up hint's switch lives on the Vorax panel (the player's choice, 2026-11-09)
+                        let mut give_up = self.settings.vorax_give_up_hint;
+                        if self.vorax.panel(ui, compact, &mut give_up) {
+                            self.settings.vorax_give_up_hint = give_up;
+                            self.save();
+                        }
+                    }
                     Tab::Board => self.board_tab(ui, compact, page_h),
                     Tab::Run => self.review_section(ui),
                     Tab::Progress => self.progress_section(ui),
+                    Tab::Affix => self.affix_tab(ui),
                     Tab::Settings => self.settings_section(ui),
                 }
                 // For testing (ASCENDANT_PREVIEW_SCROLL=bottom): scroll to the bottom.
@@ -2755,6 +2976,7 @@ impl eframe::App for AscendantApp {
                     ui.scroll_to_cursor(Some(Align::BOTTOM));
                 }
             });
+            self.wheel_area = wheel_area(tab, scrolled.content_size.y, scrolled.inner_rect);
             // For testing (ASCENDANT_PREVIEW_MEASURE=<file>): write the content height and visible height, to
             // prove the content fits and there is no scrollbar.
             if let Some(path) = &self.preview_measure {
@@ -2810,6 +3032,9 @@ impl AscendantApp {
             }
             if progress.clicked() {
                 self.set_tab(Tab::Progress);
+            }
+            if rail_button(ui, size, Icon::Affix, self.tab == Tab::Affix, 0).on_hover_text(tr("Affixes")).clicked() {
+                self.set_tab(Tab::Affix);
             }
             // A newer release the hourly check found: only a red dot drawn over the button, which takes no room.
             let dot = self.update_dot();
@@ -2932,18 +3157,20 @@ impl AscendantApp {
             let (big, small, notes) = match &run_over {
                 Some(text) => {
                     // The settlement of this run is on the Run tab; mention it first on the end screen.
-                    // The full layout writes the whole sentence "Mostly luck this run: see the Run tab"; the
-                    // compact card has only a short space on the right, so it writes "Mostly luck ›" (the whole
+                    // The full layout writes the whole sentence "Within the expected range: see the Run tab"; the
+                    // compact card has only a short space on the right, so it writes "As expected ›" (the whole
                     // card is clickable and the tooltip says "Click to open the Run tab"), so it does not wrap
                     // and leave a single word.
-                    let luck = (tr("Mostly luck this run: see the Run tab"), tr("Mostly luck \u{203a}"));
+                    let within = (tr("Within the expected range: see the Run tab"), tr("As expected \u{203a}"));
                     let note = match (&self.review.settling, &self.review.settled) {
-                        _ if self.preview_run_over => Some(luck),
+                        _ if self.preview_run_over => Some(within),
                         _ if !self.over_reviewed => None,
                         (Some(_), _) => Some((tr("Reviewing the run: see the Run tab"), tr("Reviewing \u{203a}"))),
                         (None, Some((_, Outcome::Settled(r)))) => match r.cause {
-                            Some(Cause::Luck) => Some(luck),
-                            Some(Cause::Decisions) => Some((tr("Mostly decisions this run: see the Run tab"), tr("Mostly decisions \u{203a}"))),
+                            Some(Cause::Within) => Some(within),
+                            Some(Cause::Luck { high: true }) => Some((tr("Luck ran high this run: see the Run tab"), tr("Luck high \u{203a}"))),
+                            Some(Cause::Luck { high: false }) => Some((tr("Luck ran low this run: see the Run tab"), tr("Luck low \u{203a}"))),
+                            Some(Cause::Decisions) => Some((tr("Decisions lost points this run: see the Run tab"), tr("Decisions lost \u{203a}"))),
                             None => None,
                         },
                         _ => None,
@@ -3033,7 +3260,7 @@ impl AscendantApp {
         }
         // Whether there is advice (the test replacement counts too): with no advice no reason is written.
         let shown = if self.preview_not_first && s.ranking.len() >= 2 { Some(option) } else { advice.as_ref().map(|_| option) };
-        let reason = advice_reason(&s.ranking, shown, s.solving, s.rounds);
+        let reason = advice_reason(&s.ranking, shown, s.solving, s.rounds, s.races());
         // A move with no value (not played out) writes a dash, so the line keeps its parts.
         let expected = option.filter(|&k| k < s.ranking.len()).map(|k| trf!("Expected loot {}", loot_text(s, Some(k)).unwrap_or_else(|| "\u{2014}".to_string())));
         // Small text: when the advice is not the 1st ranked, write the reason first, then the objective
@@ -3516,7 +3743,10 @@ impl AscendantApp {
                     ui.label(RichText::new(tr("Shown after the run ends")).color(MUTED));
                     small(ui, tr("Each move of the run is re-solved to split luck from decisions."));
                 }
-                Some((_, Outcome::Settled(s))) => verdict_lines(ui, s),
+                Some((_, Outcome::Settled(s))) => {
+                    verdict_lines(ui, s);
+                    riot_row(ui, s);
+                }
                 Some((_, Outcome::Unfinished)) => {
                     ui.label(RichText::new(tr("The last run was not finished")).color(theme::WARN));
                     small(ui, tr("Its log has no run end, so it is not reviewed."));
@@ -4314,6 +4544,7 @@ impl AscendantApp {
             Ok("board") => self.tab = Tab::Board,
             Ok("run") => self.tab = Tab::Run,
             Ok("progress") => self.tab = Tab::Progress,
+            Ok("affixes") => self.tab = Tab::Affix,
             Ok("settings") => self.tab = Tab::Settings,
             _ => {}
         }
@@ -4620,6 +4851,8 @@ impl AscendantApp {
         self.watch();
         self.set_text_scale(ctx, self.settings.font_scale);
         self.save();
+        // the affix frames' switch and style are back to their defaults: the live frames and the affix page follow now
+        self.configure_affixes();
     }
 }
 
@@ -4630,7 +4863,9 @@ impl AscendantApp {
 ///   `tools_days`, `theme` (the instruments and theme held in this run are game progress, not preferences, and
 ///   restoring them would make this run's advice wrong); `run_log` (whether to save run logs is a privacy and
 ///   disk choice, and restoring does not silently turn it on); `keep_all_logs` (restoring must never start
-///   deleting the player's run logs).
+///   deleting the player's run logs); `affix_grades` (the grade the user gave each map affix, one
+///   by one: a list of their own rather than a preference, with its own two-click reset on the affix page).
+/// - Back to default: `affix_frames` (on) and `affix_frame_style` (A frame).
 /// - Back to default: `read_hotkey`, `auto_hotkey`, `click_through` (off), `opacity`,
 ///   `window_title`, `rollouts`, `auto_read`, `auto_place`, `window_pos` and `window_size` (back to 296×520 on
 ///   the next launch and placed by the game panel again), `float_pos` (the small windows open over the main window
@@ -4659,6 +4894,8 @@ fn restored(old: &Settings) -> Settings {
         run_log: old.run_log,
         // Keeping every run log: restoring must never start deleting the player's logs.
         keep_all_logs: old.keep_all_logs,
+        // The user's own grade of each map affix: kept (the affix page has its own reset).
+        affix_grades: old.affix_grades.clone(),
         ..Settings::default()
     }
 }
@@ -5291,9 +5528,9 @@ const SHOW_MIN_SHOWN: usize = 500;
 
 /// The reason written in the small text of the advice card when the advice is not ranked 1st. By `shown_advice`
 /// in session.rs, the advice on screen has only two sources (read on 2026-11-05):
-/// - Settled (simulation finished, or past SHOW_MIN playouts with the same first rank twice in a row and clear
-///   of the others beyond the error): `advice()` is the simulation's first rank, then adjusted by keep_shown
-///   (keep the earlier one), prefer_bite, keep_to_chain and prefer_change; these adjustments only swap in rows
+/// - Settled (simulation finished, or in a Cage Fight run past SHOW_MIN playouts with the same first rank twice in
+///   a row and clear of the others beyond the error): `advice()` is the simulation's first rank, then adjusted
+///   by keep_shown (keep the earlier one on show), prefer_bite, keep_to_chain and prefer_change; these adjustments only swap in rows
 ///   within the error of it (also_good), except for the Tartarus cage fight's chain plan (which has its own
 ///   tolerance).
 /// - Not yet settled (simulating): the advice settled earlier that still holds on this screen (held), or the
@@ -5307,13 +5544,14 @@ const SHOW_MIN_SHOWN: usize = 500;
 /// "Within error of #1" (a numeric fact, whichever rule chose it); while still simulating with a gap beyond the
 /// error it can only be the advice settled earlier; in every other case (simulation finished yet the gap is
 /// beyond the error, for example the cage fight's chain plan) the reason cannot be told and nothing is written.
-fn advice_reason(ranking: &[SolveOption], shown: Option<Option<usize>>, solving: bool, rounds: usize) -> Option<&'static str> {
+fn advice_reason(ranking: &[SolveOption], shown: Option<Option<usize>>, solving: bool, rounds: usize, early: bool) -> Option<&'static str> {
     let option = shown?;
     if ranking.len() < 2 || option == Some(0) {
         return None;
     }
     let kept = tr("Simulating \u{b7} the settled advice is kept");
-    if solving && rounds < SHOW_MIN_SHOWN {
+    // Without early showing (`Session::races`), any advice on show while simulating is the one settled earlier.
+    if solving && (rounds < SHOW_MIN_SHOWN || !early) {
         return Some(kept);
     }
     match option {
@@ -5475,12 +5713,14 @@ fn stat_card(ui: &mut egui::Ui, width: f32, title: &str, big: &str, small: &str)
     .inner
 }
 
-/// Content of the settlement card: large text "Mostly luck / decisions this run", and below it the decision
+/// Content of the settlement card: large text "Within the expected range", "Luck ran high / low this run" or "Decisions lost points this run", and below it the decision
 /// loss and luck, and how many standard deviations off.
 fn verdict_lines(ui: &mut egui::Ui, s: &Settled) {
     let head = match s.cause {
-        Some(Cause::Luck) => tr("Mostly luck this run"),
-        Some(Cause::Decisions) => tr("Mostly decisions this run"),
+        Some(Cause::Within) => tr("Within the expected range"),
+        Some(Cause::Luck { high: true }) => tr("Luck ran high this run"),
+        Some(Cause::Luck { high: false }) => tr("Luck ran low this run"),
+        Some(Cause::Decisions) => tr("Decisions lost points this run"),
         None => tr("Luck and decisions can't be split"),
     };
     let colour = if s.cause == Some(Cause::Decisions) { theme::WARN } else { Color32::WHITE };
@@ -5490,6 +5730,14 @@ fn verdict_lines(ui: &mut egui::Ui, s: &Settled) {
     ui.add(egui::Label::new(RichText::new(trf!("Decision loss {} \u{b7} luck {}", with_unit(kind, amount(kind, s.loss)), luck)).small().color(theme::TEXT)).wrap());
     if let Some(z) = s.z {
         ui.add(egui::Label::new(RichText::new(trf!("{} standard deviations from expected", format!("{z:+.2}"))).small().color(MUTED)).wrap());
+    }
+    // Tartarus: the expectation plus the advice's usual gain over the playouts, what the verdict is judged on.
+    if let (Some(e), Some(z)) = (s.expected_net, s.z_net) {
+        ui.add(egui::Label::new(RichText::new(trf!("Expected with the usual gain {}: {} standard deviations", with_unit(kind, amount(kind, e)), format!("{z:+.2}"))).small().color(MUTED)).wrap());
+    }
+    // The loss is the move made against the re-solved best: the advice of the moment's own gaps count too.
+    if s.cause == Some(Cause::Decisions) {
+        ui.add(egui::Label::new(RichText::new(tr("Includes gaps between the advice then and the re-solve: not always a mistake")).small().color(MUTED)).wrap());
     }
     // Vorax: reaching 840k, its chance at the start and whether the game reached it.
     if let Some(reach) = s.reach {
@@ -5516,7 +5764,137 @@ fn verdict_lines(ui: &mut egui::Ui, s: &Settled) {
     if n > 0 {
         hover.push_str(&trf!("\nWithin the noise: {} in {} moves", amount(kind, noise), n));
     }
+    hover.push_str(tr("\nThe decision loss compares the move made with the re-solved best, so it also counts where Ascendant's advice at the time differed from the re-solve (such as advice that came late under heavy load): it is not always the player's mistake."));
     r.on_hover_text(hover);
+}
+
+/// The icons of the riot row ([`riot_row`]).
+#[derive(Clone, Copy)]
+enum RiotIcon {
+    /// The riot battle was fought: two crossed swords.
+    Fought,
+    /// The riot was abandoned: a ring with a slash.
+    Abandoned,
+    /// The special boss (the Tartarus warden): a helmet with a barred visor and an eye slit (2026-11-10, the player's
+    /// pick of five; a horned head before looked like a goblin); green when killed, the warning colour when it got
+    /// away, dim when none came.
+    Boss { came: bool, killed: bool },
+    /// A chest: red, colour (three stripes) or medium (wood).
+    Chest(ChestKind),
+}
+
+#[derive(Clone, Copy)]
+enum ChestKind {
+    Red,
+    Color,
+    Medium,
+}
+
+/// Draws one riot icon in a 16 x 14 box, with its tooltip.
+fn riot_icon(ui: &mut egui::Ui, icon: RiotIcon, tip: &str) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(16.0, 14.0), Sense::hover());
+    let p = ui.painter();
+    let c = rect.center();
+    match icon {
+        RiotIcon::Fought => {
+            let stroke = Stroke::new(1.6, theme::TEXT);
+            for (from, to) in [(Vec2::new(-5.5, 5.5), Vec2::new(5.0, -5.0)), (Vec2::new(5.5, 5.5), Vec2::new(-5.0, -5.0))] {
+                p.line_segment([c + from, c + to], stroke);
+                // The guard, across the blade near the hilt.
+                let along = (to - from).normalized();
+                let guard = c + from + along * 3.0;
+                let across = Vec2::new(-along.y, along.x) * 2.5;
+                p.line_segment([guard - across, guard + across], stroke);
+            }
+        }
+        RiotIcon::Abandoned => {
+            let stroke = Stroke::new(1.5, MUTED);
+            p.circle_stroke(c, 5.5, stroke);
+            p.line_segment([c + Vec2::new(-3.9, 3.9), c + Vec2::new(3.9, -3.9)], stroke);
+        }
+        RiotIcon::Boss { came, killed } => {
+            let colour = match (came, killed) {
+                (false, _) => Color32::from_gray(80),
+                (true, true) => theme::GOOD,
+                (true, false) => theme::WARN,
+            };
+            // A dome over the face plate; on the plate a dark eye slit, three short visor bars under it, and the brow.
+            let hole = theme::BG;
+            let (top, r) = (c + Vec2::new(0.0, -0.5), 6.0);
+            let dome: Vec<Pos2> = (0..=12).map(|i| top + r * Vec2::angled(std::f32::consts::PI * (1.0 + i as f32 / 12.0))).collect();
+            p.add(Shape::convex_polygon(dome, colour, Stroke::NONE));
+            p.rect_filled(Rect::from_min_max(Pos2::new(top.x - r, top.y), Pos2::new(top.x + r, top.y + 7.0)), 1.5, colour);
+            p.line_segment([Pos2::new(top.x - r + 1.2, top.y + 2.4), Pos2::new(top.x + r - 1.2, top.y + 2.4)], Stroke::new(2.0, hole));
+            for dx in [-0.5 * r, 0.0, 0.5 * r] {
+                p.line_segment([Pos2::new(top.x + dx, top.y + 4.0), Pos2::new(top.x + dx, top.y + 6.0)], Stroke::new(1.2, hole));
+            }
+            p.line_segment([Pos2::new(top.x - r, top.y), Pos2::new(top.x + r, top.y)], Stroke::new(1.0, hole));
+        }
+        RiotIcon::Chest(kind) => {
+            let body = Rect::from_center_size(c + Vec2::new(0.0, 1.5), Vec2::new(14.0, 9.0));
+            let lid = Rect::from_min_max(body.min - Vec2::new(0.0, 3.0), Pos2::new(body.max.x, body.min.y + 1.0));
+            let wood = Color32::from_rgb(170, 125, 70);
+            match kind {
+                ChestKind::Red => {
+                    p.rect_filled(lid, 2.0, tier_colour(4));
+                    p.rect_filled(body, 1.0, tier_colour(4).gamma_multiply(0.8));
+                }
+                ChestKind::Color => {
+                    p.rect_filled(lid, 2.0, tier_colour(5));
+                    let w = body.width() / 3.0;
+                    for (k, colour) in [tier_colour(5), tier_colour(1), tier_colour(3)].into_iter().enumerate() {
+                        let x = body.min.x + k as f32 * w;
+                        p.rect_filled(Rect::from_min_max(Pos2::new(x, body.min.y), Pos2::new(x + w, body.max.y)), 0.0, colour);
+                    }
+                }
+                ChestKind::Medium => {
+                    p.rect_filled(lid, 2.0, wood);
+                    p.rect_filled(body, 1.0, wood.gamma_multiply(0.8));
+                }
+            }
+            p.rect_stroke(lid.union(body), 1.5, Stroke::new(1.0, Color32::from_gray(30)), StrokeKind::Inside);
+            p.rect_filled(Rect::from_center_size(Pos2::new(c.x, body.min.y + 1.0), Vec2::new(3.0, 3.5)), 0.5, Color32::from_rgb(235, 205, 90));
+        }
+    }
+    response.on_hover_text(tip)
+}
+
+/// The riot battle after a Tartarus run (the log's riot row, see [`settle::riot_of`]) as one row of icons: fought or
+/// abandoned, the special boss, and each kind of chest with its count (counted by the battle's drop lines, see
+/// `gamelog::chest_kind`), every icon with its name on hover. Nothing until the battle is over (it ends about a
+/// minute after the run, the row then appears), and nothing for a run logged before the row existed. It wraps in a
+/// narrow window.
+fn riot_row(ui: &mut egui::Ui, s: &Settled) {
+    let Some(r) = s.riot.filter(|_| s.kind == RunKind::Tartarus) else { return };
+    ui.add_space(3.0);
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing.x = 3.0;
+        ui.label(RichText::new(tr("Riot")).small().color(MUTED))
+            .on_hover_text(tr("The riot battle after the run, from the game's log: the chests of the inmates, counted by the drop lines at the battle's end. The board's task chest and the special boss's chest are not counted."));
+        if !r.fought {
+            riot_icon(ui, RiotIcon::Abandoned, tr("Riot: abandoned"));
+            ui.label(RichText::new(tr("abandoned")).small().color(MUTED));
+            return;
+        }
+        riot_icon(ui, RiotIcon::Fought, tr("Riot: fought"));
+        let boss = match (r.boss, r.boss_killed) {
+            (false, _) => tr("No special boss"),
+            (true, true) => tr("Special boss: came and was killed (its boss chest is not counted as a colour chest)"),
+            (true, false) => tr("Special boss: came, not killed"),
+        };
+        riot_icon(ui, RiotIcon::Boss { came: r.boss, killed: r.boss_killed }, boss);
+        ui.add_space(4.0);
+        let chests = [
+            (ChestKind::Color, r.color, trf!("Colour chests: {} (the task's chest and the boss chest not counted)", r.color)),
+            (ChestKind::Red, r.red, trf!("Red chests: {} (the task's chest not counted)", r.red)),
+            (ChestKind::Medium, r.medium, trf!("Medium chests: {} (the warden's hoards below red)", r.medium)),
+        ];
+        for (kind, n, tip) in chests {
+            riot_icon(ui, RiotIcon::Chest(kind), &tip);
+            ui.label(RichText::new(n.to_string()).small().color(theme::TEXT)).on_hover_text(&tip);
+            ui.add_space(3.0);
+        }
+    });
 }
 
 /// The "Largest step": which day and screen, what was actually picked, the re-solved best, the advice at the
@@ -5676,6 +6054,11 @@ fn action_cell(action: &Action, warden: i64) -> Option<usize> {
     }
 }
 
+/// The file of the affixes learned from the game log, in the app's folder.
+fn learned_path() -> Option<PathBuf> {
+    settings::app_dir().map(|d| d.join("affix-learned.tsv"))
+}
+
 /// Small icons on the navigation rail tab buttons.
 #[derive(Clone, Copy)]
 enum Icon {
@@ -5683,8 +6066,10 @@ enum Icon {
     Board,
     /// Run: a flag.
     Run,
-    /// Settings: three sliders with the knobs at different positions.
+    /// Settings: a gear (until 2026-11-10 three sliders, which looked too much like the Affixes' list right above).
     Settings,
+    /// Affixes: a map folded in three (until 2026-11-10 a two-line list, too close to the Settings' sliders).
+    Affix,
 }
 
 /// A tab button of the navigation rail: primary-colour background and white icon when selected; a slightly
@@ -5727,12 +6112,38 @@ fn rail_button(ui: &mut egui::Ui, size: Vec2, icon: Icon, selected: bool, badge:
             p.add(Shape::convex_polygon(flag, colour, Stroke::NONE));
         }
         Icon::Settings => {
-            let (left, right) = (rect.left() + 6.0, rect.right() - 6.0);
-            for (dy, knob) in [(-5.0, 0.3), (0.0, 0.7), (5.0, 0.45)] {
-                let y = c.y + dy;
-                p.line_segment([Pos2::new(left, y), Pos2::new(right, y)], Stroke::new(1.2, colour));
-                p.circle_filled(Pos2::new(left + (right - left) * knob, y), 2.2, colour);
+            // Eight teeth: the outline goes root, tip, tip, root around each tooth; a round hole in the middle.
+            let teeth = 8;
+            let (tip, root) = (7.2, 5.2);
+            let step = std::f32::consts::TAU / teeth as f32;
+            let half = step / 4.0;
+            let mut outline = Vec::with_capacity(teeth * 4);
+            for k in 0..teeth {
+                let a = k as f32 * step;
+                for (da, r) in [(-half * 1.1, root), (-half * 0.55, tip), (half * 0.55, tip), (half * 1.1, root)] {
+                    outline.push(c + r * Vec2::angled(a + da));
+                }
             }
+            p.add(Shape::closed_line(outline, stroke));
+            p.circle_stroke(c, 2.2, stroke);
+        }
+        Icon::Affix => {
+            // A map folded in three: zigzag top and bottom edges and the two folds.
+            let (x1, x2) = (c.x - 2.7, c.x + 2.7);
+            let outline = vec![
+                Pos2::new(c.x - 8.0, c.y - 5.0),
+                Pos2::new(x1, c.y - 7.0),
+                Pos2::new(x2, c.y - 5.0),
+                Pos2::new(c.x + 8.0, c.y - 7.0),
+                Pos2::new(c.x + 8.0, c.y + 5.0),
+                Pos2::new(x2, c.y + 7.0),
+                Pos2::new(x1, c.y + 5.0),
+                Pos2::new(c.x - 8.0, c.y + 7.0),
+            ];
+            p.add(Shape::closed_line(outline, stroke));
+            let fold = Stroke::new(1.0, colour);
+            p.line_segment([Pos2::new(x1, c.y - 7.0), Pos2::new(x1, c.y + 5.0)], fold);
+            p.line_segment([Pos2::new(x2, c.y - 5.0), Pos2::new(x2, c.y + 7.0)], fold);
         }
     }
     if badge > 0 {
@@ -6064,6 +6475,18 @@ mod tests {
         SolveOption { label: String::new(), action: Action::Swap, mean, se: 0.01, gap_se, n: 100, best: 0.0, policy: false }
     }
 
+    /// Under click-through the wheel scrolls a page taller than the window: its scroll area keeps the mouse, on every
+    /// tab but the board; a page that fits keeps passing clicks on its empty parts to the game.
+    #[test]
+    fn the_wheel_scrolls_long_pages_under_click_through() {
+        let view = Rect::from_min_size(egui::pos2(60.0, 40.0), egui::vec2(400.0, 300.0));
+        assert_eq!(wheel_area(Tab::Settings, 900.0, view), Some(view));
+        assert_eq!(wheel_area(Tab::Run, 900.0, view), Some(view));
+        assert_eq!(wheel_area(Tab::Settings, 300.0, view), None, "fits: nothing to scroll");
+        assert_eq!(wheel_area(Tab::Board, 900.0, view), None, "the board leaves its empty parts to the game");
+        assert_eq!(client_pixels(1.5, view), [90, 60, 690, 510]);
+    }
+
     #[test]
     fn verdict_uses_twice_the_paired_error() {
         // First rank against second uses the second's gap_se: gap 0.10, twice the standard error 0.06, so
@@ -6100,24 +6523,28 @@ mod tests {
         let ranking = [option(5.0, 0.0), option(4.95, 0.05), option(4.0, 0.05)];
         let kept = Some(tr("Simulating \u{b7} the settled advice is kept"));
         // No advice (Solving...): no reason is written, however many ranking rows there are.
-        assert_eq!(advice_reason(&ranking, None, true, 100), None);
-        assert_eq!(advice_reason(&ranking, None, false, 900), None);
+        assert_eq!(advice_reason(&ranking, None, true, 100, true), None);
+        assert_eq!(advice_reason(&ranking, None, false, 900, true), None);
         // The advice is the 1st rank, or there are fewer than two ranking rows: nothing is written.
-        assert_eq!(advice_reason(&ranking, Some(Some(0)), false, 900), None);
-        assert_eq!(advice_reason(&ranking[..1], Some(Some(0)), false, 900), None);
+        assert_eq!(advice_reason(&ranking, Some(Some(0)), false, 900, true), None);
+        assert_eq!(advice_reason(&ranking[..1], Some(Some(0)), false, 900, true), None);
         // Simulating with advice before SHOW_MIN playouts: it can only be one settled earlier (held / the first
         // bite of the manage screen).
-        assert_eq!(advice_reason(&ranking, Some(Some(1)), true, 100), kept);
-        assert_eq!(advice_reason(&ranking, Some(None), true, 100), kept);
+        assert_eq!(advice_reason(&ranking, Some(Some(1)), true, 100, true), kept);
+        assert_eq!(advice_reason(&ranking, Some(None), true, 100, true), kept);
         // Gap within the error: write within the error (the same whether simulating past SHOW_MIN or finished).
-        assert_eq!(advice_reason(&ranking, Some(Some(1)), false, 900), Some(tr("Within error of #1")));
-        assert_eq!(advice_reason(&ranking, Some(Some(1)), true, 600), Some(tr("Within error of #1")));
+        assert_eq!(advice_reason(&ranking, Some(Some(1)), false, 900, true), Some(tr("Within error of #1")));
+        assert_eq!(advice_reason(&ranking, Some(Some(1)), true, 600, true), Some(tr("Within error of #1")));
         // Simulating past SHOW_MIN with the gap beyond the error: the one settled earlier.
-        assert_eq!(advice_reason(&ranking, Some(Some(2)), true, 600), kept);
+        assert_eq!(advice_reason(&ranking, Some(Some(2)), true, 600, true), kept);
         // Simulation finished with the gap beyond the error (for example the cage fight's chain plan): the
         // reason cannot be told, nothing is written.
-        assert_eq!(advice_reason(&ranking, Some(Some(2)), false, 900), None);
-        assert_eq!(advice_reason(&ranking, Some(None), false, 900), None);
+        assert_eq!(advice_reason(&ranking, Some(Some(2)), false, 900, true), None);
+        assert_eq!(advice_reason(&ranking, Some(None), false, 900, true), None);
+        // Without early showing (not a Cage Fight run), an advice on show while simulating is the settled one,
+        // however many playouts ran.
+        assert_eq!(advice_reason(&ranking, Some(Some(1)), true, 600, false), kept);
+        assert_eq!(advice_reason(&ranking, Some(Some(1)), false, 900, false), Some(tr("Within error of #1")));
     }
 
     #[test]
@@ -6281,10 +6708,18 @@ mod tests {
             "auto_place":false,"window_pos":[10,20],"window_size":[300.0,600.0],"float_pos":{"tools":[5,6]},"run_log":false,"keep_all_logs":true,"observe":true,
             "check_updates":false,"updated_seen":"1.0.1","offer_install":false,"share_logs":true,"shared_from":"2026-11-01_00-00-00",
             "install_id":"abc","desktop_shortcut":true,"highlight":true,"show_value":false,"language":"zh-TW","vorax_enabled":false,
-            "vorax_rollouts":1024,"vorax_learn":false,"vorax_strips":true,"font_scale":1.3,"layout":"compact",
+            "vorax_rollouts":1024,"vorax_learn":false,"vorax_strips":true,"vorax_give_up_hint":true,"font_scale":1.3,"layout":"compact",
             "game_log":"D:/Logs/UE_game.log"}"#,
         )
         .unwrap();
+        // the affix page's settings, off their defaults
+        let custom = {
+            let mut c = custom;
+            c.affix_frames = false;
+            c.affix_frame_style = crate::affix::FrameStyle::Bar;
+            c.affix_grades.insert("3500300".into(), crate::affix::Grade::None);
+            c
+        };
         let json = |s: &Settings| serde_json::to_value(s).unwrap();
         let (custom_v, default_v, restored_v) = (json(&custom), json(&Settings::default()), json(&restored(&custom)));
         let fields = default_v.as_object().unwrap();
@@ -6292,7 +6727,9 @@ mod tests {
             // Every field of the test data differs from the default, so the comparison is meaningful (a new
             // field must be added to the JSON above).
             assert_ne!(&custom_v[key], default, "{key} 和預設相同");
-            let want = if KEPT.contains(&key.as_str()) { &custom_v[key] } else { default };
+            // the user's affix grades are kept too
+            let kept = KEPT.contains(&key.as_str()) || key == "affix_grades";
+            let want = if kept { &custom_v[key] } else { default };
             assert_eq!(&restored_v[key], want, "{key}");
         }
     }

@@ -473,6 +473,9 @@ pub struct View {
     pub held: Vec<(String, bool)>,
     /// What the left panel of the endgame battle showed when last read (only in [`Mode::Battle`]).
     pub battle: Option<read::Battle>,
+    /// The endgame battle's Give Up button to box, with the line that giving up settles at once: every reward tier
+    /// taken on [`GIVE_UP_READS`] reads in a row, with the setting on ([`Config::give_up_hint`]); frame pixels.
+    pub give_up: Option<MarkBox>,
     /// Frame size of the last read.
     pub frame_size: Option<(usize, usize)>,
     /// Why Vorax is open but did not enter the mode (the game client is not Traditional Chinese): one line is
@@ -504,6 +507,8 @@ pub struct Config {
     /// The general observe mode (settings `observe`): with it, or with `learn`, a board read as `Kind::Other` saves
     /// its whole frame ([`Learn::full_frame`]).
     pub observe: bool,
+    /// The endgame battle's give-up hint (settings `vorax_give_up_hint`, off by default).
+    pub give_up_hint: bool,
 }
 
 impl Config {
@@ -517,6 +522,7 @@ impl Config {
             inline: false,
             min_free_bytes: super::vorax_learn::MIN_FREE,
             observe: s.observe,
+            give_up_hint: s.vorax_give_up_hint,
         }
     }
 }
@@ -564,6 +570,32 @@ const POTION_REROLLS: i32 = 3;
 const WHY_SHOWN: usize = 4;
 /// JPEG quality of the frame saved for a new steady board (one 2560x1440 frame is about 0.3 to 0.6 MB).
 const FRAME_QUALITY: u8 = 92;
+
+/// The lossless PNGs a game saves with the general observe mode on (the user, 2026-11-09), each with the read it goes
+/// with in a `vorax_lossless` row (`screen`, `file`, and the read's time, signature and reading or panel): the JPEG
+/// frames lose the fine strokes a misread turns on (2026-11-09: no older reader read the logged values back off them),
+/// so only these can check whether a read was right. Reports leave them out (only `.jpg` goes in), and the folder goes
+/// with its game when run logs are pruned.
+/// - Every selection screen (pick, reroll, protocol): the parts its reads use ([`read::evidence`], about 330 KB) of the
+///   read the advice was solved on (`role` "advised"), and of the last steady read before the hand ended (`role`
+///   "confirmed", the one likeliest clear of effects), the second only when it read otherwise (`evidence-NNNN.png`,
+///   see [`VoraxSession::save_evidence`]). Reads with a problem (incomplete, mid animation) are not saved for these;
+///   a steady one is saved once a round as `role` "unreadable", the misread to look into.
+/// - Once a game each ([`LOSSLESS`], `lossless-<screen>-NNNN.png`): the whole frame of the first steady pick and of
+///   the steady result screen (about 1.8 MB each; their `vorax_read` rows name it as `png`), and the battle panel read
+///   the same twice in a row.
+const LOSSLESS: [&str; 3] = ["pick", "result", "battle"];
+
+/// A frame kept for its evidence image: the read's signature, time and round, the frame, and the interface scale it
+/// was read at.
+#[derive(Clone)]
+struct Shot {
+    sig: String,
+    at: i64,
+    round: Option<i32>,
+    frame: Rgba,
+    ui: Option<f64>,
+}
 /// Windows THREAD_PRIORITY_BELOW_NORMAL: the solver thread runs below normal priority so the game keeps its frame rate.
 const BELOW_NORMAL: i32 = -1;
 /// The note at the top of the window when the game client is one the reader does not read (neither Traditional Chinese nor, with the feature `en-vorax`, English; both languages are written).
@@ -1028,6 +1060,16 @@ struct Game {
     last_dealt: Option<i64>,
     /// Signature of the last saved frame.
     saved_sig: Option<String>,
+    /// The kinds of screen ([`LOSSLESS`]) whose lossless frame this game has saved.
+    lossless: Vec<&'static str>,
+    /// Observe mode: this hand's last steady, complete selection screen read, kept for its evidence image
+    /// ([`VoraxSession::save_evidence`]).
+    steady_shot: Option<Shot>,
+    /// The signature of the read whose evidence was saved for this hand's advice (`advised`).
+    evidence_sig: Option<String>,
+    /// The round whose evidence of a steady selection screen read with a problem was saved (`unreadable`, once a
+    /// round).
+    unreadable_round: Option<Option<i32>>,
     /// Signatures of this hand that were already solved early ([`VoraxSession::solve_ahead`]; cleared on confirm or reroll).
     tried: BTreeSet<String>,
     /// Number of instruments revealed at the start ([`VoraxSession::mark_openings`]; None until the round 1 instrument selection screen has been seen).
@@ -1039,6 +1081,12 @@ struct Game {
     monsters: Vec<Option<String>>,
     /// The raised card last read in this hand (the card has often dropped before confirm, so the last read does not see it).
     raised_seen: Option<Seen>,
+    /// The card raised before `raised_seen` when another card was raised after it: two cards raised in one hand,
+    /// the last one under the tooltip, make the pick unknown ([`hover_pass`]). A card picked drops as soon as the
+    /// mouse moves on, and the card the mouse passes over on its way to Confirm rises the same height
+    /// (2026-11-08_18-44-54 round 2: `益生黴溶液` picked, `細肢藥粉-骨衛兵` read raised on the last three reads,
+    /// and the row named it).
+    raised_other: Option<Seen>,
     /// The card the left tooltip last pointed at. Text read with no tooltip shown (`0 / 2`) leaves it as it is
     /// (2026-11-06_13-46-25 round 1: `孵化囊` matched, then three reads of `0 / 2` wiped it and the pick was lost); a
     /// shown tooltip naming no card or a read of another hand drops it ([`hovered_kept`]), and the confirm or
@@ -1106,6 +1154,32 @@ fn seen_in(s: &Option<Seen>, r: &Reading) -> Option<usize> {
     s.as_ref().filter(|h| (h.0.is_none() || r.round.is_none() || h.0 == r.round) && same_cards(&h.2, &hand(r))).map(|h| h.1)
 }
 
+/// A raised card read (`s`): it becomes the last raised (`last`), and the one raised before it, when another card,
+/// is kept in `other` ([`Game::raised_other`]). A card raised again does not clear `other`: picked, passed over,
+/// then the first one raised again is still two cards.
+fn note_raised(last: &mut Option<Seen>, other: &mut Option<Seen>, s: Seen) {
+    if let Some(prev) = last.replace(s)
+        && last.as_ref().is_some_and(|now| now.1 != prev.1)
+    {
+        *other = Some(prev);
+    }
+}
+
+/// Whether more than one card of the hand was seen raised: the card raised on the last read, the last one raised in
+/// the hand and another raised before it ([`Game::raised_other`]), each None when not of this hand.
+fn mixed_raise(last_read: Option<usize>, last: Option<usize>, other: Option<usize>) -> bool {
+    let mut cards: Vec<usize> = [last_read, last, other].into_iter().flatten().collect();
+    cards.sort_unstable();
+    cards.dedup();
+    cards.len() > 1
+}
+
+/// Whether the card raised on the last read (`last_read`) is only hovered on the way to Confirm: the last read's
+/// tooltip names it (`last_tip`) and another card was raised in this hand ([`mixed_raise`]).
+fn hover_pass(last_read: Option<usize>, last_tip: Option<usize>, last: Option<usize>, other: Option<usize>) -> bool {
+    last_read.is_some() && last_tip == last_read && mixed_raise(last_read, last, other)
+}
+
 /// Whether two reads of a hand are the same hand: as many cards (at least one), every card read in both is the same,
 /// and at most one position is unread in either. The tooltip often covers the name of the card next to the one
 /// pointed at (2026-11-06 04:43 game, round 2: the tooltip named the third card while the second was unread, and
@@ -1121,11 +1195,13 @@ fn unread_cards(r: &Reading) -> usize {
 }
 
 /// Which card the left tooltip on the selection screen (when the mouse rests on a card) is about: the tooltip's card name contains that card's
-/// Traditional Chinese name (after normalization), and matches exactly one card.
+/// printed name (after normalization; the English one on the English client, see vorax_learn::card_printed), and matches exactly one card.
+/// With the Traditional Chinese name only, no English tooltip ever matched, so a neighbour the mouse passed over after the pick won
+/// over the shown icon (2026-11-08_08-45-58 round 2).
 fn hovered_card(r: &Reading) -> Option<usize> {
     let tip = read::norm(&r.tooltip);
     // A hyphen read as `一` still matches (see vorax_learn::tooltip_has).
-    let hits: Vec<usize> = r.cards.iter().enumerate().filter(|(_, c)| c.zh.as_deref().is_some_and(|z| super::vorax_learn::tooltip_has(&tip, z))).map(|(k, _)| k).collect();
+    let hits: Vec<usize> = r.cards.iter().enumerate().filter(|(_, c)| super::vorax_learn::card_printed(c).is_some_and(|z| super::vorax_learn::tooltip_has(&tip, z))).map(|(k, _)| k).collect();
     match hits[..] {
         [k] => Some(k),
         _ => None,
@@ -1265,6 +1341,72 @@ fn pick_fit(en: Option<&str>, cues: &[String], tanks: &[Option<u8>], before: Opt
     Some(true)
 }
 
+/// Seeds each card is played under by [`board_fits`].
+const BOARD_SEEDS: u32 = 64;
+
+/// Which cards of a potion hand can give the board read after the pick: each card of the solver state `x` (the
+/// hand's selection screen, as solved) is played under [`BOARD_SEEDS`] seeds on the clicked tanks (every set of one
+/// or two tanks when a click's tank is unknown), the round ended as the game ends it, and the card fits when on some
+/// seed its six tanks (archetype, rarity, activity, count) are exactly the board `after`. None when it cannot be
+/// told: no six tanks after, a card or instrument the solver does not know.
+///
+/// A card that fits is not proof (cards with no effect on this board give the same board), and the true card often
+/// does not (an effect drawn from more outcomes than the seeds, or a state the screen does not show: of 536 saved
+/// potion picks with a card, 210 had no card that fits), so only one card that fits while every other card of the
+/// hand never does names the card ([`settle_pick`]). Of the 23 saved picks where one other card than the logged one
+/// fitted that way, those checked against the user's account, the tooltip or the clicks were all the logged card
+/// wrong: 2026-11-08_18-44-54 round 2 (`Probiotic Enzyme Solution`, the advised card the user picked, logged as the
+/// `Slender-Limb Powder - Bone Sentry` hovered on the way to Confirm), 2026-11-06_21-42-03 rounds 6 and 8 (the
+/// tooltip's card), 2026-11-06_04-43-15 round 6 (a one-target potion logged with no tank clicked).
+fn board_fits(x: &ScreenState, clicks: &[Option<u8>], after: Option<&str>) -> Option<Vec<bool>> {
+    use vorax::game::dispatch_with;
+    use vorax::types::{Action, TANK_COUNT};
+    let after = sig_tanks(after)?;
+    let mut unknown = Vec::new();
+    let base = vorax::advisor::to_state(x, &mut unknown);
+    if !unknown.is_empty() || base.hand.len() != x.hand.len() {
+        return None;
+    }
+    let target_sets: Vec<Vec<u8>> = if clicks.is_empty() {
+        vec![Vec::new()]
+    } else if clicks.iter().all(Option::is_some) {
+        let mut t: Vec<u8> = clicks.iter().flatten().copied().collect();
+        t.sort_unstable();
+        t.dedup();
+        vec![t]
+    } else {
+        let mut all = vec![Vec::new()];
+        for a in 0..TANK_COUNT as u8 {
+            all.push(vec![a]);
+            all.extend((a + 1..TANK_COUNT as u8).map(|b| vec![a, b]));
+        }
+        all
+    };
+    let board = |s: &vorax::types::GameState| -> Vec<String> {
+        s.tanks
+            .iter()
+            .map(|t| t.map_or_else(|| "_".to_string(), |m| format!("Some({:?}),Some({:?}),Some({}),Some({})", m.archetype, m.rarity, m.activity, m.quantity)))
+            .collect()
+    };
+    let fits = (0..base.hand.len())
+        .map(|k| {
+            (0..BOARD_SEEDS).any(|seed| {
+                target_sets.iter().any(|targets| {
+                    let mut s = base;
+                    s.rng_state = seed.wrapping_mul(2_654_435_761).wrapping_add(12_345);
+                    s = dispatch_with(&s, Action::SelectCard { index: k as i64 }, false);
+                    for &t in targets {
+                        s = dispatch_with(&s, Action::ToggleTarget { tank: i64::from(t) }, false);
+                    }
+                    s = dispatch_with(&s, Action::Confirm, false);
+                    board(&s) == after
+                })
+            })
+        })
+        .collect();
+    Some(fits)
+}
+
 /// The pick's `vorax_round` row, not written yet, of the instrument screen of round `shown` (the screen's round; a
 /// pending pick's round is the solver's acquisition round, see [`PendingPick`]): its card is the hand's card read
 /// as instrument `icon` (`how` "icon"), or null with `missing` saying so when none of the hand is.
@@ -1286,25 +1428,70 @@ fn name_from_icon(row: &mut Value, icon: u8, shown: i32) {
 /// Settle the card of a potion pick in its `vorax_round` row once the board after it is known (`after`, None when
 /// none was read): the candidates kept at the confirm (`_pick`: the card raised on the last read, the one raised
 /// earlier, then the tooltip's) are tried in that order, and the first that fits
-/// ([`pick_fit`]) is the card; when none fits the card is null and `missing` says so. Better no card than a
-/// wrong one. The card raised on the last read also stays when it cannot be told ([`pick_fit`] None: more tanks
+/// ([`pick_fit`]) is the card; when none fits, the one card of the hand the rules allow (`how` "fit"), else the card
+/// is null and `missing` says so. Better no card than a wrong one. The card raised on the last read also stays when it cannot be told ([`pick_fit`] None: more tanks
 /// clicked than it takes and no board after it), as it did before it was checked: a changed mind is likelier
 /// then than another card that happens to fit.
 fn settle_pick(row: &mut Value, after: Option<&str>) {
+    // The hand's solver state, kept at the confirm for the board check ([`board_fits`]).
+    let state = row.as_object_mut().and_then(|o| o.remove("_state")).and_then(|v| serde_json::from_value::<ScreenState>(v).ok());
     let Some(pick) = row.as_object_mut().and_then(|o| o.remove("_pick")) else { return };
     let cues: Vec<String> = row["cues"].as_array().map(|a| a.iter().filter_map(|c| c.as_str().map(str::to_string)).collect()).unwrap_or_default();
     let tanks: Vec<Option<u8>> = row.pointer("/chosen/tanks").and_then(Value::as_array).map(|a| a.iter().map(|t| t.as_u64().and_then(|t| u8::try_from(t).ok())).collect()).unwrap_or_default();
     let before = row["before"].as_str().map(str::to_string);
     let hand = row.pointer("/chosen/hand").cloned().unwrap_or(Value::Null);
+    // What the card was settled from, kept in the row (`chosen.basis`, the user's ask of 2026-11-09): each candidate
+    // seen at the confirm with whether the rules allow it (true, false, or null when it cannot be told), then the
+    // cards of the hand the rules allow when none of them stood.
+    let mut basis: Vec<Value> = Vec::new();
     let found = pick.as_array().into_iter().flatten().find_map(|c| {
         let (k, how) = (c.get(0)?.as_u64()? as usize, c.get(1)?.as_str()?);
         let en = hand.get(k).and_then(Value::as_str);
         let fit = pick_fit(en, &cues, &tanks, before.as_deref(), after);
+        basis.push(json!([k, how, fit]));
         (fit == Some(true) || (fit.is_none() && how == "raised")).then(|| (k, how.to_string()))
     });
+    // No card seen picked, or none that fits: the one card of the hand the rules allow (its targeting known and
+    // fitting the clicks, the tanks and whether a potion was used; 2026-11-08_18-41-59 round 1, a kit opened with
+    // no potion used and the only kit in the hand), as `fit`. Two that fit (or a card's targeting unknown) leave it
+    // unknown.
+    let found = found.or_else(|| {
+        let names: Vec<Option<&str>> = hand.as_array().map(|h| h.iter().map(Value::as_str).collect()).unwrap_or_default();
+        let fits: Vec<usize> = (0..names.len())
+            .filter(|&k| names[k].is_some_and(|en| potion_targeting(en).is_some()) && pick_fit(names[k], &cues, &tanks, before.as_deref(), after) == Some(true))
+            .collect();
+        let known = names.iter().all(|n| n.is_some_and(|en| potion_targeting(en).is_some()));
+        basis.push(json!({ "fits": fits, "allKnown": known }));
+        // a card clicked after the last tank click may be another card taken instead (2026-11-06_16-22-21 round 9:
+        // the tank click ruled the advised `Brain Fog Tincture` out, and `Digestive Enzyme Solution` was left)
+        let last_tank = cues.iter().rposition(|c| c == "TankClick");
+        let changed_card = last_tank.is_some_and(|t| cues[t..].iter().any(|c| c == "CardClick"));
+        match fits[..] {
+            [k] if known && !changed_card && cues.iter().any(|c| c == "Confirm") => Some((k, "fit".to_string())),
+            _ => None,
+        }
+    });
+    // The board after it ([`board_fits`]): one card of the hand that gives it while every other card never does names
+    // the card when none was settled (`how` "board"; 2026-11-08_18-44-54 round 2, the raised card only hovered on the
+    // way to Confirm; the rules of [`pick_fit`] must allow it too), and takes the settled card down to none when that
+    // card is not it: better no card than a wrong one, and the board alone does not replace a card seen picked.
+    let only = state.as_ref().filter(|x| x.hand.len() == hand.as_array().map_or(0, Vec::len)).and_then(|x| board_fits(x, &tanks, after)).and_then(|fits| {
+        basis.push(json!({ "board": fits }));
+        let mut yes = fits.iter().enumerate().filter(|(_, f)| **f).map(|(k, _)| k);
+        match (yes.next(), yes.next()) {
+            (Some(k), None) => Some(k),
+            _ => None,
+        }
+    });
+    let found = match (found, only) {
+        (None, Some(k)) if pick_fit(hand.get(k).and_then(Value::as_str), &cues, &tanks, before.as_deref(), after) == Some(true) => Some((k, "board".to_string())),
+        (Some((k, _)), Some(j)) if j != k => None,
+        (found, _) => found,
+    };
     let (card, how) = found.map_or((Value::Null, Value::Null), |(k, h)| (json!(k), json!(h)));
     row["chosen"]["card"] = card.clone();
     row["chosen"]["how"] = how;
+    row["chosen"]["basis"] = json!(basis);
     if card.is_null() {
         row["missing"] = json!(["card"]);
     }
@@ -1392,6 +1579,14 @@ fn read_panel(frame: &Rgba, ui: Option<f64>) -> (read::Battle, Rgba) {
 
 /// How fast the endgame battle panel is read (milliseconds): the panel's numbers change several times a second, and the log does not need to be that dense.
 const BATTLE_EVERY_MS: i64 = 1000;
+/// How fast it is read close to the cap with the give-up hint on ([`VoraxSession::battle_every`]): the hint waits
+/// for [`GIVE_UP_READS`] reads in a row at the cap, a second apart they put it up 1-2 s after the cap (the
+/// 2026-11-09 evening games). One read takes 25-35 ms (median over the 99 saved battle panels, under 60 ms at
+/// p99) and about 0.1 s of CPU, so they do not pile up (a read still running holds the next, `BattleRun::scan`).
+const BATTLE_NEAR_EVERY_MS: i64 = 300;
+/// Activity plus bonus at this share of the last reward tier ([`read::BATTLE_LAST`]) count as close to the cap: the
+/// 2026-11-09 evening games gained 20-80K a second at the end, so the faster reads start a few seconds before it.
+const BATTLE_NEAR_SHARE: f64 = 0.85;
 /// Even when the numbers changed, a `vorax_battle` row is written at most this often (written immediately when a later wave is read).
 const BATTLE_ROW_MS: i64 = 5000;
 /// If the agreed battle read time has passed by this much and still no frame has arrived (auto read is off, or the `read_in` frame did not come):
@@ -1441,7 +1636,23 @@ struct BattleRun {
     recent: Vec<read::Battle>,
     /// How many reads had their bonus dropped as a misread ([`BONUS_DROP`]), written in `vorax_battle_end`.
     dropped: u32,
+    /// Readable reads in a row with every reward tier taken ([`read::Battle::all_taken`]); a read of another next
+    /// tier starts over, one with the next tier unread changes nothing.
+    capped: u32,
+    /// The frame size and interface scale of the last frame read: where the Give Up button is.
+    frame: Option<((usize, usize), Option<f64>)>,
+    /// The give-up hint was logged (`vorax_give_up_hint`, once a battle).
+    give_up_logged: bool,
+    /// Frame time of the first of the reads in a row at the cap ([`Self::capped`]): the hint's row gives the time from
+    /// it (`sinceCapMs`).
+    cap_at: Option<i64>,
+    /// The last readable read was close to the cap and the hint not up yet: the panel is read faster
+    /// ([`VoraxSession::battle_every`]).
+    near_cap: bool,
 }
+
+/// Reads in a row with every reward tier taken before the give-up hint shows: one read alone may be a misread.
+const GIVE_UP_READS: u32 = 2;
 
 /// How many of the last battle reads the ending (`vorax_battle_end`) is settled from, taking the median of each
 /// number: one read alone was wrong at the 2026-11-06 12:23 game's end (482.1K read as 48.2K). Reads are a second
@@ -2288,6 +2499,11 @@ impl VoraxSession {
     /// Confirm or reroll: the board is about to change. Hide the boxes, drop the read and solve, wait for the new hand; keep the previous selection's
     /// `vorax_round` row (written once the board after the selection is read).
     fn synced(&mut self, at: i64) {
+        // the hand's last steady read, when it read otherwise than the advised one (see LOSSLESS)
+        let (shot, advised) = (self.game.steady_shot.take(), self.game.evidence_sig.take());
+        if let Some(shot) = shot.filter(|shot| advised.as_deref() != Some(shot.sig.as_str())) {
+            self.save_evidence(&shot, "confirmed");
+        }
         let cues = std::mem::take(&mut self.game.cues);
         self.finish_round(None, at);
         self.game.kit = false;
@@ -2300,6 +2516,7 @@ impl VoraxSession {
         // after it (see `Game::choice`).
         let choice = self.game.choice.take();
         let (raised_seen, hovered_seen) = (self.game.raised_seen.take(), self.game.hovered.take());
+        let raised_other = self.game.raised_other.take();
         // The card under the mouse at the last card click: the last one the tooltip named on a frame taken at or
         // before it (frame and cue times share the UTC clock).
         let click_at = self.game.click_at.take();
@@ -2325,8 +2542,16 @@ impl VoraxSession {
             let clicked = seen_in(&clicked_seen, r);
             // A reroll picks no card: the card raised or pointed at before it is not the move (2026-11-06_13-46-25
             // round 3, the reroll row had the card hovered before it).
+            // Two cards raised in this hand and the last read's raised card under the tooltip: the mouse rests on it,
+            // on its way to Confirm after picking another (a picked card drops as the mouse moves on, and a hovered one
+            // rises the same height), so no card rather than a wrong one. A card picked last reads raised with the
+            // tooltip gone or on another card (2026-11-08_18-44-54 round 4, 18-51-19 round 10, 2026-11-06_13-46-25
+            // round 7: the advised card, picked and kept). An instrument's icon still names it ([`name_from_icon`]).
+            let last_tip = self.last_reading.as_ref().filter(|l| l.kind.is_choice() && l.cards.len() == r.cards.len()).and_then(hovered_card);
+            let mixed = hover_pass(raised, last_tip, earlier, seen_in(&raised_other, r));
+            let raised = raised.filter(|_| !mixed);
             let (card, how) = match (raised, earlier, hovered, clicked) {
-                _ if rerolled => (None, None),
+                _ if rerolled || mixed => (None, None),
                 (Some(k), ..) => (Some(k), Some("raised")),
                 (None, Some(k), ..) => (Some(k), Some("raisedEarlier")),
                 (None, None, Some(k), _) => (Some(k), Some("tooltip")),
@@ -2349,9 +2574,18 @@ impl VoraxSession {
             // the rules (2026-11-06_04-43-15 round 6, log line 271: `Leptomeningeal Solution`, one target, raised
             // in a fanned hand of five, yet no tank was clicked).
             if r.kind == Kind::Potion && !rerolled {
-                let candidates: Vec<Value> = [(raised, "raised"), (earlier, "raisedEarlier"), (hovered, "tooltip"), (clicked, "clicked")].into_iter().filter_map(|(k, how)| k.map(|k| json!([k, how]))).collect();
-                if !candidates.is_empty() {
-                    row["_pick"] = json!(candidates);
+                // no candidate when the raised card was only hovered: [`settle_pick`] may still find the one card that fits
+                let candidates: Vec<Value> = if mixed {
+                    Vec::new()
+                } else {
+                    [(raised, "raised"), (earlier, "raisedEarlier"), (hovered, "tooltip"), (clicked, "clicked")].into_iter().filter_map(|(k, how)| k.map(|k| json!([k, how]))).collect()
+                };
+                row["_pick"] = json!(candidates);
+                // the hand's solver state for the board check at settlement ([`board_fits`])
+                if let Ok((x, _)) = self.screen_state(r)
+                    && let Ok(v) = serde_json::to_value(&x)
+                {
+                    row["_state"] = v;
                 }
             }
             self.game.round_row = Some(row);
@@ -2369,7 +2603,7 @@ impl VoraxSession {
                 // The raised card's id only from a name read on the card: one taken from the tooltip would make the
                 // tooltip (`hovered`) its own second witness.
                 let id = picked.filter(|c| c.how != Some(read::How::Tooltip)).and_then(named_id);
-                let hovered = hovered.or(clicked).and_then(|k| r.cards.get(k)).and_then(named_id);
+                let hovered = hovered.or(clicked).filter(|_| !mixed).and_then(|k| r.cards.get(k)).and_then(named_id);
                 self.game.pending_pick = Some(PendingPick { before, round: shown + i32::from(before > 0), card, id, hovered });
             }
         } else {
@@ -2618,6 +2852,7 @@ impl VoraxSession {
         let result = self.last_reading.as_ref().filter(|r| r.kind == Kind::Result).and_then(|r| r.ultimate);
         self.battle = BattleRun { on: true, fight_at: at, board_end: self.game.has_play(), board: result.or(self.game.last_ultimate), ..BattleRun::default() };
         self.view.battle = None;
+        self.view.give_up = None;
         self.read_next = true;
     }
 
@@ -2638,31 +2873,42 @@ impl VoraxSession {
         self.log_end(ultimate, self.battle.fight_at);
     }
 
-    /// Schedule the next panel read ([`BATTLE_EVERY_MS`] after the last one) and ask the UI for a frame at that time.
+    /// How long after one panel read the next one is due: [`BATTLE_NEAR_EVERY_MS`] with the give-up hint on, the last
+    /// read close to the cap ([`BattleRun::near_cap`]) and the hint not up yet, else [`BATTLE_EVERY_MS`].
+    fn battle_every(&self) -> i64 {
+        if self.config.give_up_hint && self.battle.near_cap && self.view.give_up.is_none() {
+            BATTLE_NEAR_EVERY_MS
+        } else {
+            BATTLE_EVERY_MS
+        }
+    }
+
+    /// Schedule the next panel read ([`VoraxSession::battle_every`] after the last one) and ask the UI for a frame at that time.
     fn schedule_battle_read(&mut self) {
         if !self.battle.on {
             return;
         }
-        let due = self.battle.last_read + BATTLE_EVERY_MS;
+        let due = self.battle.last_read + self.battle_every();
         if self.battle.due != Some(due) {
             self.battle.due = Some(due);
             self.read_in = Some(Duration::from_millis((due - self.clock).max(0) as u64));
         }
     }
 
-    /// One frame during the endgame battle: the left panel is read in the background once every [`BATTLE_EVERY_MS`]. The others are not read,
+    /// One frame during the endgame battle: the left panel is read in the background once every [`VoraxSession::battle_every`]. The others are not read,
     /// and the next one is not requested (before, every frame requested the next one, and capture ran at full speed): the next read is scheduled once a read finishes or when the time has not come.
     fn battle_frame(&mut self, frame: Rgba, at: i64) {
         if !self.battle.on || self.battle.scan.is_some() {
             return;
         }
-        if at - self.battle.last_read < BATTLE_EVERY_MS {
+        if at - self.battle.last_read < self.battle_every() {
             self.schedule_battle_read();
             return;
         }
         self.battle.last_read = at;
         self.battle.due = None;
         let ui = self.ui();
+        self.battle.frame = Some(((frame.w, frame.h), ui));
         if self.config.inline {
             let (panel, crop) = read_panel(&frame, ui);
             self.battle_read(panel, crop, at);
@@ -2688,14 +2934,29 @@ impl VoraxSession {
         if self.mode != Mode::Battle || !self.battle.on {
             return;
         }
-        self.schedule_battle_read();
         if !panel.readable() {
+            self.schedule_battle_read();
             return;
         }
         self.battle.reads += 1;
+        // This game's lossless battle frame: the panel read the same twice in a row (see LOSSLESS).
+        let same = |a: &read::Battle, b: &read::Battle| (a.wave, a.activity, a.bonus, a.next) == (b.wave, b.activity, b.bonus, b.next);
+        if self.battle.last.as_ref().is_some_and(|last| same(last, &panel))
+            && self.wants_lossless(LOSSLESS[2])
+            && self.learn.jpegs_allowed()
+            && let Some(log) = &mut self.log
+        {
+            let name = format!("lossless-{}-{:04}.png", LOSSLESS[2], log.number());
+            log.png_as(&name, crop.clone());
+            self.game.lossless.push(LOSSLESS[2]);
+            self.log_event("vorax_lossless", at, json!({ "screen": LOSSLESS[2], "file": name, "battle": battle_fields(&panel, self.battle.board) }));
+        }
         let line = battle_line(&panel);
         self.set_status(Status::Battle, vec![line]);
         self.view.battle = Some(panel.clone());
+        self.give_up(&panel, &crop, at);
+        // after the hint: how close to the cap this read was sets when the next one is due
+        self.schedule_battle_read();
         let wave = panel.wave.map_or(0, |w| w.0);
         let row_due = match &self.battle.logged {
             None => true,
@@ -2725,6 +2986,53 @@ impl VoraxSession {
         self.bump();
     }
 
+    /// The give-up hint after a readable battle read `panel` of the panel crop `crop` ([`View::give_up`]): with the
+    /// setting on, every reward tier taken on [`GIVE_UP_READS`] reads in a row and the button on show
+    /// ([`read::give_up_shown`]), the Give Up button's box ([`read::BATTLE_GIVE_UP`], scaled as
+    /// the panel is at the frame's interface scale); a read of another next tier takes it down, one with the next
+    /// tier unread leaves it as it is. Logged once a battle (`vorax_give_up_hint`), with the box (`box`), the time from
+    /// the first read at the cap (`sinceCapMs`) and from the frame to the read done (`readMs`). Also whether the panel
+    /// is close to the cap ([`BattleRun::near_cap`]): at the cap and not yet read [`GIVE_UP_READS`] times, or activity
+    /// plus bonus at [`BATTLE_NEAR_SHARE`] of the last tier with another next tier (or the next tier unread).
+    fn give_up(&mut self, panel: &read::Battle, crop: &Rgba, at: i64) {
+        if panel.all_taken() {
+            if self.battle.capped == 0 {
+                self.battle.cap_at = Some(at);
+            }
+            self.battle.capped += 1;
+        } else if panel.next.is_some() {
+            self.battle.capped = 0;
+            self.battle.cap_at = None;
+        }
+        let total = panel.activity.unwrap_or(0.0) + panel.bonus.unwrap_or(0.0);
+        self.battle.near_cap = if self.battle.capped > 0 {
+            self.battle.capped < GIVE_UP_READS
+        } else {
+            total >= BATTLE_NEAR_SHARE * read::BATTLE_LAST
+        };
+        // the button goes once the battle is won: no box on the empty place
+        let button = self.battle.frame.is_some_and(|(_, ui)| read::give_up_shown(crop, ui));
+        let shown = self.config.give_up_hint && self.battle.capped >= GIVE_UP_READS && button;
+        self.view.give_up = shown.then_some(self.battle.frame).flatten().map(|((w, h), ui)| MarkBox {
+            what: "give up".into(),
+            at: read::to_frame(w, h, crate::vorax::ui_scale::ui_box(read::BATTLE_GIVE_UP, ui)),
+            style: BoxStyle::Plain,
+        });
+        if self.view.give_up.is_some() && !self.battle.give_up_logged {
+            self.battle.give_up_logged = true;
+            // "box", not "at": the row's "at" is its time
+            let fields = json!({
+                "activity": panel.activity,
+                "bonus": panel.bonus,
+                "wave": panel.wave.map(|w| w.0),
+                "box": self.view.give_up.as_ref().map(|b| b.at),
+                "sinceCapMs": self.battle.cap_at.map(|c| at - c),
+                "readMs": (self.clock - at).max(0),
+            });
+            self.log_event("vorax_give_up_hint", at, fields);
+        }
+    }
+
     /// Leave the endgame battle: write the last panel read as one `vorax_battle_end` row, and save its crop. Written only once:
     /// when leaving is blocked (Vorax turned off, not Traditional Chinese) the mode stays at Battle, and a later leave does not rewrite it.
     fn end_battle(&mut self, at: i64) {
@@ -2735,6 +3043,7 @@ impl VoraxSession {
         self.read_in = None;
         let run = std::mem::take(&mut self.battle);
         self.view.battle = None;
+        self.view.give_up = None;
         // The last read with its numbers settled over the last few reads (one read alone can lose a digit).
         let last = run.last.as_ref().map(|l| settled_battle(&run.recent, l));
         if run.end_deferred {
@@ -2850,7 +3159,7 @@ impl VoraxSession {
         self.view.kind = Some(r.kind);
         if r.kind.is_choice() {
             if let Some(s) = seen_card(&r, false) {
-                self.game.raised_seen = Some(s);
+                note_raised(&mut self.game.raised_seen, &mut self.game.raised_other, s);
             }
             self.game.hovered = hovered_kept(self.game.hovered.take(), &r);
             if read::norm(&r.tooltip).chars().count() >= 2
@@ -2909,6 +3218,32 @@ impl VoraxSession {
             }
             self.view.learn_note = self.learn.note().map(str::to_string);
         }
+        // Observe mode: this hand's last steady, complete selection screen, for its evidence image (see LOSSLESS).
+        if steady && r.kind.is_choice() && r.problems.is_empty() && self.config.observe && self.log.is_some() {
+            self.game.steady_shot = Some(Shot { sig: sig.clone(), at: d.at, round: r.round, frame: d.frame.clone(), ui: d.s });
+        }
+        // A steady selection screen read with a problem gets no advice and so no evidence above: its own, once a round
+        // (role "unreadable"), so the misread can be checked on a lossless frame (2026-11-09: the English game's tank
+        // values unread from round 5 on left only JPEG frames).
+        if steady && r.kind.is_choice() && !r.problems.is_empty() && self.config.observe && self.game.unreadable_round != Some(r.round) {
+            self.game.unreadable_round = Some(r.round);
+            let shot = Shot { sig: sig.clone(), at: d.at, round: r.round, frame: d.frame.clone(), ui: d.s };
+            self.save_evidence(&shot, "unreadable");
+        }
+        // This game's first steady pick and result screen as lossless PNGs (observe mode, see LOSSLESS).
+        let lossless_kind = if r.kind.is_choice() { Some(LOSSLESS[0]) } else { (r.kind == Kind::Result).then_some(LOSSLESS[1]) };
+        let mut png = None;
+        if steady
+            && let Some(kind) = lossless_kind
+            && self.wants_lossless(kind)
+            && self.learn.jpegs_allowed()
+            && let Some(log) = &mut self.log
+        {
+            let name = format!("lossless-{kind}-{:04}.png", log.number());
+            log.png_as(&name, d.frame.clone());
+            self.game.lossless.push(kind);
+            png = Some(name);
+        }
         // A new steady board saves one frame (selection and result screens); observe mode does not save when it finds there is not enough space.
         let mut frame = None;
         if steady && (r.kind.is_choice() || r.kind == Kind::Result) && self.game.saved_sig.as_deref() != Some(sig.as_str()) {
@@ -2923,8 +3258,11 @@ impl VoraxSession {
         self.log_event(
             "vorax_read",
             d.at,
-            json!({ "trigger": d.trigger, "readMs": d.read_ms, "frame": frame, "size": [size.0, size.1], "reading": &r, "signature": sig, "steady": steady, "gate": self.gate.is_some(), "raised": raised, "client": d.client, "point": self.point.lock().map(|p| p.clone()).unwrap_or(Value::Null) }),
+            json!({ "trigger": d.trigger, "readMs": d.read_ms, "frame": frame, "png": png, "size": [size.0, size.1], "reading": &r, "signature": sig, "steady": steady, "gate": self.gate.is_some(), "raised": raised, "client": d.client, "point": self.point.lock().map(|p| p.clone()).unwrap_or(Value::Null) }),
         );
+        if let (Some(file), Some(kind)) = (&png, lossless_kind) {
+            self.log_event("vorax_lossless", d.at, json!({ "screen": kind, "file": file, "signature": sig, "reading": &r }));
+        }
         // An early solve (or solving while it ticks) is for another board: if this read's signature differs it is dropped, and one in progress is also told to give up
         // (when a half-dealt hand is read mid deal animation, the new one need not queue behind it).
         // But when it is solving a board that is already steady it is not dropped: one differing read caused by the mouse tooltip should not make the steady board's result
@@ -3473,6 +3811,13 @@ impl VoraxSession {
             json!({ "readAt": timestamp(at_time(s.read_at)), "state": &s.x, "advice": &s.advice, "rollouts": s.rollouts, "solveMs": s.ms, "roundsKnown": s.rounds_known, "early": s.early }),
         );
         let rerolls = st.reading.rerolls;
+        // the evidence of the read this advice was solved on, once a hand
+        if self.game.evidence_sig.is_none()
+            && let Some(shot) = self.game.steady_shot.clone().filter(|shot| shot.sig == s.sig)
+        {
+            self.save_evidence(&shot, "advised");
+            self.game.evidence_sig = Some(s.sig.clone());
+        }
         self.advised = Some(Advised { sig: s.sig, round, hand, rerolls, moves: self.hand_moves(), x: s.x, advice: s.advice });
         self.show_advice();
         self.bump();
@@ -3516,6 +3861,29 @@ impl VoraxSession {
         if let Some(log) = &self.log {
             log.event(kind, at_time(at), fields);
         }
+    }
+
+    /// Saves the evidence image ([`read::evidence`]) of `shot` as a lossless PNG and its `vorax_lossless` row with
+    /// `role` (see [`LOSSLESS`]); nothing with observe mode off, no log, or too little free space.
+    fn save_evidence(&mut self, shot: &Shot, role: &str) {
+        if !self.config.observe || !self.learn.jpegs_allowed() {
+            return;
+        }
+        let Some(log) = &mut self.log else { return };
+        let reference = read::to_reference(&shot.frame);
+        let original = match shot.ui.filter(|&s| !crate::vorax::ui_scale::is_original(s)) {
+            Some(s) => crate::vorax::ui_scale::unscale(&reference, s, None),
+            None => reference,
+        };
+        let name = format!("evidence-{:04}.png", log.number());
+        log.png_as(&name, read::evidence(&original));
+        self.log_event("vorax_lossless", self.clock, json!({ "screen": "hand", "role": role, "file": name, "readAt": timestamp(at_time(shot.at)), "signature": shot.sig, "round": shot.round }));
+    }
+
+    /// Whether this game still wants its lossless frame of `kind` ([`LOSSLESS`]): the general observe mode on, a log
+    /// to write it in, and none of the kind saved yet.
+    fn wants_lossless(&self, kind: &str) -> bool {
+        self.config.observe && self.log.is_some() && !self.game.lossless.contains(&kind)
     }
 
     /// The game's interface scale relative to the original setting the reader was measured at
@@ -3722,7 +4090,7 @@ mod tests {
     }
 
     fn session() -> VoraxSession {
-        let mut s = VoraxSession::new(Config { enabled: true, rollouts: 64, learn: false, strips: false, log_root: None, inline: true, min_free_bytes: 0, observe: false });
+        let mut s = VoraxSession::new(Config { enabled: true, rollouts: 64, learn: false, strips: false, log_root: None, inline: true, min_free_bytes: 0, observe: false, give_up_hint: false });
         s.require_zh = false;
         s
     }
@@ -3996,6 +4364,18 @@ mod tests {
         (s, root)
     }
 
+    /// [`logged`] on the Traditional Chinese client whatever this PC's OCR language: tests whose tooltips are the
+    /// Traditional Chinese names (the hovered card matches the client's printed names, `vorax_learn::card_printed`).
+    fn logged_zh(tag: &str) -> (VoraxSession, PathBuf) {
+        let root = std::env::temp_dir().join(format!("ascendant-vorax-early-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let mut s = session();
+        s.test_zh = Some(true);
+        s.configure(Config { log_root: Some(root.clone()), ..s.config.clone() });
+        s.note_cue(Cue::Page(Page::Main, PageState::Run), Some(1_000));
+        (s, root)
+    }
+
     fn rows_of(s: VoraxSession, root: &std::path::Path) -> Vec<Value> {
         s.log().unwrap().wait();
         let text = std::fs::read_to_string(s.log().unwrap().dir().join("log.jsonl")).unwrap();
@@ -4041,6 +4421,139 @@ mod tests {
         let r = || Reading { round: Some(round), held: held.clone(), ..potion_board(false, Some(600), 12) };
         feed(s, r(), at);
         feed(s, r(), at + 60);
+    }
+
+    /// The endgame battle's give-up hint: with the setting on, every reward tier taken (next tier 999.9M) on two reads
+    /// in a row boxes the Give Up button, at the frame's size and interface scale; a read of another next tier takes it
+    /// down, one with the next tier unread leaves it; with the setting off, or leaving the battle, there is none.
+    #[test]
+    fn the_give_up_button_is_boxed_once_every_tier_is_taken() {
+        let (mut s, _root) = logged("give-up");
+        s.config.give_up_hint = true;
+        s.note_cue(page(Page::Main, PageState::Hide), Some(2_000));
+        s.note_cue(Cue::Fight, Some(3_000));
+        assert_eq!(s.mode(), Mode::Battle);
+        let panel = |next: Option<f64>| read::Battle { wave: Some((3, 3)), activity: Some(1_100_000.0), bonus: Some(496_800.0), next, percent: Some(15), raw: String::new() };
+        // a panel crop with its Give Up button lit (big enough at the scales below), and one with the button gone
+        let crop = || Rgba { w: 600, h: 520, data: vec![110; 600 * 520 * 4] };
+        let won = || Rgba { w: 600, h: 520, data: vec![35; 600 * 520 * 4] };
+        let all = Some(999_900_000.0);
+        s.battle.frame = Some(((2560, 1440), None));
+        s.battle_read(panel(Some(854_000.0)), crop(), 4_000);
+        assert!(s.view.give_up.is_none());
+        s.battle_read(panel(all), crop(), 5_000);
+        assert!(s.view.give_up.is_none(), "one read at the cap is not enough");
+        s.battle_read(panel(all), crop(), 6_000);
+        assert_eq!(s.view.give_up.as_ref().map(|b| b.at), Some(read::BATTLE_GIVE_UP), "at 1440p and the original scale");
+        s.battle_read(panel(None), crop(), 7_000);
+        assert!(s.view.give_up.is_some(), "the next tier unread changes nothing");
+        // 1080p, and the interface at 1.5 (the button scales about the left edge's middle, as the panel)
+        s.battle.frame = Some(((1920, 1080), None));
+        s.battle_read(panel(all), crop(), 8_000);
+        let (x, y, hw, hh) = s.view.give_up.as_ref().unwrap().at;
+        assert!((x - 193.5 * 0.75).abs() < 0.01 && (y - 831.0 * 0.75).abs() < 0.01 && (hw - 77.0 * 0.75).abs() < 0.01 && (hh - 22.0 * 0.75).abs() < 0.01);
+        s.battle.frame = Some(((2560, 1440), Some(1.5)));
+        s.battle_read(panel(all), crop(), 9_000);
+        let (x, y, hw, _) = s.view.give_up.as_ref().unwrap().at;
+        assert!((x - 193.5 * 1.5).abs() < 0.01 && (y - (720.0 + 111.0 * 1.5)).abs() < 0.01 && (hw - 77.0 * 1.5).abs() < 0.01, "{x} {y} {hw}");
+        s.battle_read(panel(all), won(), 9_500);
+        assert!(s.view.give_up.is_none(), "the button gone (the battle won): no box on the empty place");
+        s.battle_read(panel(all), crop(), 9_800);
+        assert!(s.view.give_up.is_some(), "the cap still counted");
+        s.battle_read(panel(Some(1_120_000.0)), crop(), 10_000);
+        assert!(s.view.give_up.is_none(), "another next tier read: down");
+        s.battle_read(panel(all), crop(), 11_000);
+        s.battle_read(panel(all), crop(), 12_000);
+        assert!(s.view.give_up.is_some());
+        // the setting off: none
+        s.config.give_up_hint = false;
+        s.battle_read(panel(all), crop(), 13_000);
+        assert!(s.view.give_up.is_none());
+        s.config.give_up_hint = true;
+        s.battle_read(panel(all), crop(), 14_000);
+        assert!(s.view.give_up.is_some());
+        // leaving the battle map
+        s.note_cue(Cue::LevelLeft, Some(15_000));
+        assert!(s.view.give_up.is_none());
+    }
+
+    /// With the give-up hint on, the panel is read faster close to the cap: activity plus bonus at 85% of the last
+    /// tier, or at the cap and read fewer than GIVE_UP_READS times; far from it, once the hint is up, or with the
+    /// setting off, a second apart as before.
+    #[test]
+    fn the_panel_is_read_faster_close_to_the_cap() {
+        let (mut s, _root) = logged("give-up-near");
+        s.config.give_up_hint = true;
+        s.note_cue(page(Page::Main, PageState::Hide), Some(2_000));
+        s.note_cue(Cue::Fight, Some(3_000));
+        assert_eq!(s.mode(), Mode::Battle);
+        s.battle.frame = Some(((2560, 1440), None));
+        let panel = |activity: f64, bonus: f64, next: Option<f64>| read::Battle { wave: Some((3, 3)), activity: Some(activity), bonus: Some(bonus), next, percent: Some(15), raw: String::new() };
+        let crop = || Rgba { w: 600, h: 520, data: vec![110; 600 * 520 * 4] };
+        let all = Some(read::BATTLE_ALL);
+        // a read started at `at` (battle_frame sets last_read) and done: the next one is due this long after it
+        let after = |s: &mut VoraxSession, b: read::Battle, at: i64| {
+            s.battle.last_read = at;
+            s.battle.due = None;
+            s.battle_read(b, crop(), at);
+            s.battle.due.map(|d| d - at)
+        };
+        // far from the cap: a second
+        assert_eq!(after(&mut s, panel(500_000.0, 200_000.0, Some(721_000.0)), 4_000), Some(BATTLE_EVERY_MS));
+        // 84% of 1.12M: still a second; 85%: faster
+        assert_eq!(after(&mut s, panel(700_000.0, 240_000.0, Some(1_120_000.0)), 5_000), Some(BATTLE_EVERY_MS));
+        assert_eq!(after(&mut s, panel(700_000.0, 252_000.0, Some(1_120_000.0)), 6_000), Some(BATTLE_NEAR_EVERY_MS));
+        // the next tier unread close to the cap: still faster
+        assert_eq!(after(&mut s, panel(720_000.0, 260_000.0, None), 6_300), Some(BATTLE_NEAR_EVERY_MS));
+        assert_eq!(s.battle_every(), BATTLE_NEAR_EVERY_MS);
+        // the cap read once: faster until the second
+        assert_eq!(after(&mut s, panel(800_000.0, 330_000.0, all), 6_600), Some(BATTLE_NEAR_EVERY_MS));
+        assert!(s.view.give_up.is_none());
+        // the second: the hint up, back to a second
+        assert_eq!(after(&mut s, panel(810_000.0, 335_000.0, all), 6_900), Some(BATTLE_EVERY_MS));
+        assert!(s.view.give_up.is_some());
+        assert_eq!(after(&mut s, panel(820_000.0, 340_000.0, all), 7_900), Some(BATTLE_EVERY_MS));
+        // the setting off: a second even close to the cap
+        s.config.give_up_hint = false;
+        assert_eq!(after(&mut s, panel(800_000.0, 330_000.0, Some(1_120_000.0)), 8_900), Some(BATTLE_EVERY_MS));
+        assert_eq!(after(&mut s, panel(800_000.0, 330_000.0, all), 9_900), Some(BATTLE_EVERY_MS));
+        // a read that cannot be read keeps the pace of the last readable one
+        s.config.give_up_hint = true;
+        assert_eq!(after(&mut s, panel(700_000.0, 260_000.0, Some(1_120_000.0)), 10_900), Some(BATTLE_NEAR_EVERY_MS));
+        let unreadable = read::Battle { activity: None, ..panel(0.0, 0.0, None) };
+        assert_eq!(after(&mut s, unreadable, 11_200), Some(BATTLE_NEAR_EVERY_MS));
+    }
+
+    /// The give-up hint's row keeps its time in "at", the box in "box", and gives the time from the first read at the
+    /// cap (`sinceCapMs`) and from the frame to the read done (`readMs`); a read of another tier starts the count over.
+    #[test]
+    fn the_give_up_row_has_its_time_and_the_delay() {
+        let (mut s, root) = logged("give-up-row");
+        s.config.give_up_hint = true;
+        s.note_cue(page(Page::Main, PageState::Hide), Some(2_000));
+        s.note_cue(Cue::Fight, Some(3_000));
+        s.battle.frame = Some(((2560, 1440), None));
+        let panel = |next: Option<f64>| read::Battle { wave: Some((3, 3)), activity: Some(900_000.0), bonus: Some(300_000.0), next, percent: Some(15), raw: String::new() };
+        let crop = || Rgba { w: 600, h: 520, data: vec![110; 600 * 520 * 4] };
+        let all = Some(read::BATTLE_ALL);
+        s.battle_read(panel(all), crop(), 4_000);
+        // a misread of the next tier: the count starts over
+        s.battle_read(panel(Some(1_120_000.0)), crop(), 4_300);
+        s.battle_read(panel(all), crop(), 4_600);
+        // the read of the frame at 4,900 done at 5,020
+        s.clock = 5_020;
+        s.battle_read(panel(all), crop(), 4_900);
+        assert!(s.view.give_up.is_some());
+        let rows = rows_of(s, &root);
+        let hint = kinds(&rows, "vorax_give_up_hint");
+        assert_eq!(hint.len(), 1);
+        assert_eq!(hint[0]["at"].as_str(), Some(timestamp(at_time(4_900)).as_str()), "the row's time");
+        let b = &hint[0]["box"];
+        assert_eq!(b.as_array().map(|a| a.len()), Some(4), "{b}");
+        assert_eq!(b[0].as_f64().map(|x| x as f32), Some(read::BATTLE_GIVE_UP.0));
+        assert_eq!(hint[0]["sinceCapMs"], 300, "from the read at 4,600, not 4,000");
+        assert_eq!(hint[0]["readMs"], 120);
+        assert_eq!((hint[0]["activity"].as_f64(), hint[0]["bonus"].as_f64(), hint[0]["wave"].as_u64()), (Some(900_000.0), Some(300_000.0), Some(3)));
     }
 
     /// Endgame battle: each panel read updates the status line, reading a later wave writes a row at once, other changes are written 5 seconds apart, one crop is
@@ -5601,7 +6114,8 @@ mod tests {
     /// board after it) is written as usual, but it leaves no result card.
     #[test]
     fn a_game_given_up_early_has_no_card() {
-        let (mut s, root) = logged("give-up");
+        // its own folder: the give-up hint's test is logged("give-up") too, and tests run at once
+        let (mut s, root) = logged("given-up-early");
         steady_round(&mut s, 1, 2_000);
         s.note_cue(Cue::Synced, Some(2_500));
         s.note_cue(page(Page::Main, PageState::Destory), Some(3_000));
@@ -5696,7 +6210,7 @@ mod tests {
     /// named, and it gets the next round's board as `after` once the page is back.
     #[test]
     fn a_resolving_read_before_the_confirm_is_not_the_board_of_the_pick() {
-        let (mut s, root) = logged("pick-resolving");
+        let (mut s, root) = logged_zh("pick-resolving");
         s.note_cue(Cue::Gone, Some(1_500));
         s.note_cue(Cue::Changed, Some(1_510));
         let board = named_board(8, "2 / 2");
@@ -5737,7 +6251,7 @@ mod tests {
     /// and a steady read of the same hand with a card unread does not replace the full hand as the pick's board.
     #[test]
     fn a_tooltip_seen_with_a_card_unread_still_names_the_pick() {
-        let (mut s, root) = logged("pick-tooltip");
+        let (mut s, root) = logged_zh("pick-tooltip");
         let full = named_board(2, "");
         let covered = |tooltip: &str| {
             let mut r = named_board(2, tooltip);
@@ -5949,7 +6463,7 @@ mod tests {
     /// row, written on that same read, names the hovered card: the icon is checked before the row is written.
     #[test]
     fn an_icon_agreeing_with_the_hover_names_the_instrument_pick() {
-        let (mut s, root) = logged("pick-icon");
+        let (mut s, root) = logged_zh("pick-icon");
         let held = |ids: &[u8]| ids.iter().map(|&id| read::Held { id: Some(id), en: None, zh: None, opening: false, score: 1.0 }).collect::<Vec<_>>();
         let screen = |tooltip: &str, raised: Option<usize>| {
             let mut r = Reading { kind: Kind::Instrument, round: Some(4), rerolls: Some(0), tooltip: tooltip.to_string(), held: held(&[2, 14]), ..potion_board(false, Some(600), 12) };
@@ -5980,13 +6494,61 @@ mod tests {
         assert_eq!((&mismatch[0]["card"], &mismatch[0]["icon"], &mismatch[0]["kept"]), (&json!(21), &json!(17), &json!("icon")));
     }
 
+    /// The English client's hover agrees with the icon too (2026-11-08_08-45-58 round 2): `Vermicular Spinal Cord` (12)
+    /// picked and its icon shown, the mouse then over `Pig Iron Bone Saw` (15), read raised while the tooltip still named
+    /// the pick. The tooltip was matched on the Traditional Chinese names only, so `hovered` was null, the raised card won
+    /// and the wrong instrument was held for the rest of the run.
+    #[cfg(feature = "en-vorax")]
+    #[test]
+    fn an_english_tooltip_names_the_hovered_instrument_too() {
+        let (mut s, root) = logged("pick-icon-en");
+        s.test_zh = Some(false);
+        crate::vorax::read::set_english_here(Some(true));
+        let names = crate::vorax::names::names();
+        let index = |en: &str| names.cards.iter().position(|n| n.printed_en() == en).unwrap_or_else(|| panic!("{en}"));
+        let held = |ids: &[u8]| ids.iter().map(|&id| read::Held { id: Some(id), en: None, zh: None, opening: false, score: 1.0 }).collect::<Vec<_>>();
+        let screen = |tooltip: &str, raised: Option<usize>| {
+            let mut r = Reading { kind: Kind::Instrument, round: Some(2), rerolls: Some(0), tooltip: tooltip.to_string(), held: held(&[7]), ..potion_board(false, Some(300), 12) };
+            for (k, (c, (en, id))) in r.cards.iter_mut().zip([("Vermicular Spinal Cord", 12), ("Pig Iron Bone Saw", 15)]).enumerate() {
+                let i = index(en);
+                (c.en, c.zh, c.id, c.index, c.how, c.category) = (Some(en.into()), names.cards[i].zh.clone(), Some(id), Some(i), Some(read::How::Name), crate::vorax::names::Category::Instrument);
+                c.raised = raised == Some(k);
+            }
+            r.cards.truncate(2);
+            r
+        };
+        assert_eq!(hovered_card(&screen("Vermicular Spinal Cord", None)), Some(0));
+        s.game.held = vec![(7, 1)];
+        feed(&mut s, screen("", None), 2_000);
+        feed(&mut s, screen("", None), 2_100);
+        feed(&mut s, screen("Vermicular Spinal Cord", Some(0)), 2_600);
+        feed(&mut s, screen("Vermicular Spinal Cord", Some(0)), 2_700);
+        for (cue, at) in [(Cue::CardClick, 2_750), (Cue::Confirm, 2_800), (Cue::Picked, 2_810)] {
+            s.note_cue(cue, Some(at));
+        }
+        feed(&mut s, screen("Vermicular Spinal Cord", Some(1)), 2_900);
+        s.note_cue(Cue::Synced, Some(2_920));
+        let next = Reading { round: Some(3), held: held(&[7, 12]), ..potion_board(false, Some(400), 12) };
+        feed(&mut s, next.clone(), 3_300);
+        feed(&mut s, next, 3_400);
+        crate::vorax::read::set_english_here(None);
+        assert_eq!(s.game.held, vec![(7, 1), (12, 3)]);
+        let rows = rows_of(s, &root);
+        let picks = kinds(&rows, "vorax_round");
+        assert_eq!(picks.len(), 1);
+        assert_eq!(&picks[0]["chosen"]["card"], &json!(0), "{:?}", picks[0]);
+        for m in kinds(&rows, "vorax_pick_mismatch") {
+            assert_eq!(&m["kept"], &json!("icon"), "{m:?}");
+        }
+    }
+
     /// The card the tooltip named at the card click names the pick when the mouse then goes to a tank and a monster's
     /// tooltip drops the hover (2026-11-06_20-03-09 round 10, log lines 415 to 432: `孿生激素-蠱蟲` hovered and
     /// clicked, then `暴食巨蠕蟲`, and the row's card was null). It is looked up at the confirm: a frame taken before
     /// the click may come out of OCR after the click's line, and a card hovered only after the click is not it.
     #[test]
     fn the_card_hovered_at_the_click_names_the_pick() {
-        let (mut s, root) = logged("pick-clicked");
+        let (mut s, root) = logged_zh("pick-clicked");
         let full = named_board(2, "");
         let monster = || Reading { panel_covered: true, ..named_board(2, "暴 食 巨 蠕 蟲") };
         feed(&mut s, full.clone(), 2_000);
@@ -6016,7 +6578,7 @@ mod tests {
     /// (`消化酶溶液`, one target) fits and is the pick.
     #[test]
     fn a_card_raised_on_the_last_read_must_fit_the_pick() {
-        let (mut s, root) = logged("pick-raised-checked");
+        let (mut s, root) = logged_zh("pick-raised-checked");
         let full = named_board(2, "");
         feed(&mut s, full.clone(), 2_000);
         feed(&mut s, full.clone(), 2_100);
@@ -6043,7 +6605,7 @@ mod tests {
     /// `0 / 2` matched no card; the hover is kept and the pick names the card. A read of another hand drops it.
     #[test]
     fn a_tooltip_matching_no_card_keeps_the_hover() {
-        let (mut s, root) = logged("pick-hover-kept");
+        let (mut s, root) = logged_zh("pick-hover-kept");
         let full = named_board(2, "");
         feed(&mut s, full.clone(), 2_000);
         feed(&mut s, full.clone(), 2_100);
@@ -6113,6 +6675,31 @@ mod tests {
         pick_fit(en, cues, tanks, before, after) == Some(true)
     }
 
+    /// No card seen picked: the one card of the hand the rules allow is the pick (`fit`); two that fit, a card of
+    /// unknown targeting in the hand, or a card clicked after the last tank click leave it unknown.
+    #[test]
+    fn the_one_card_the_rules_allow_is_the_pick() {
+        let row = |hand: &[&str], cues: &[&str], tanks: &[Option<u8>]| {
+            let mut r = json!({ "round": 1, "phase": "potion", "cues": cues, "missing": [], "_pick": [], "chosen": { "card": null, "how": null, "hand": hand, "tanks": tanks } });
+            settle_pick(&mut r, None);
+            (r.pointer("/chosen/card").and_then(Value::as_u64), r.pointer("/chosen/how").and_then(Value::as_str).map(str::to_string))
+        };
+        // 2026-11-08_18-41-59 round 1: confirmed with no potion used, the kit the only Box card
+        let kit = ["Rare Potion Kit (Small)", "Probiotic Enzyme Solution", "Potent Xenopurge Powder"];
+        assert_eq!(row(&kit, &["CardClick", "CardClick", "Confirm"], &[]), (Some(0), Some("fit".into())));
+        // one tank clicked, one Select1 card among Auto ones (18-51-19 round 1)
+        let one = ["Slender-Limb Powder - Bone Sentry", "Gray Matter Spinal Solution", "Twin Hormone - Pest"];
+        assert_eq!(row(&one, &["CardClick", "TankClick", "Confirm", "PotionUsed"], &[Some(1)]), (Some(2), Some("fit".into())));
+        // a card clicked after the tank: maybe another card taken (2026-11-06_16-22-21 round 9)
+        let changed = ["Spinal Solution - Agito", "Digestive Enzyme Solution", "Brain Fog Tincture"];
+        assert_eq!(row(&changed, &["CardClick", "TankClick", "CardClick", "Confirm", "PotionUsed"], &[Some(0)]), (None, None));
+        // two Auto cards with no tank clicked: either
+        let two = ["Probiotic Enzyme Solution", "Spinal Solution - Aemberon", "Slender-Limb Powder - Pest"];
+        assert_eq!(row(&two, &["CardClick", "Confirm", "PotionUsed"], &[]), (None, None));
+        // a card not in the potion table: its targeting unknown, nothing told
+        assert_eq!(row(&["Rare Potion Kit (Small)", "Not A Potion", "Probiotic Enzyme Solution"], &["CardClick", "Confirm"], &[]), (None, None));
+    }
+
     /// The tank clicks and the board after a potion pick against its card ([`pick_fit`], [`settle_pick`]), on the
     /// two picks that were recorded wrong.
     #[test]
@@ -6163,6 +6750,8 @@ mod tests {
         let mut r = row(0, "raisedEarlier", json!([[0, "raisedEarlier"], [2, "tooltip"]]));
         settle_pick(&mut r, Some(a3));
         assert_eq!((&r["chosen"]["card"], &r["chosen"]["how"], &r["missing"], r.get("_pick")), (&json!(2), &json!("tooltip"), &json!([]), None));
+        // what it was settled from: the earlier card the rules ruled out, then the tooltip's they allow
+        assert_eq!(r["chosen"]["basis"], json!([[0, "raisedEarlier", false], [2, "tooltip", true]]));
         let mut r = row(0, "raisedEarlier", json!([[0, "raisedEarlier"]]));
         settle_pick(&mut r, Some(a3));
         assert_eq!((&r["chosen"]["card"], &r["chosen"]["how"], &r["missing"]), (&Value::Null, &Value::Null, &json!(["card"])));
@@ -6215,11 +6804,26 @@ mod tests {
             .iter()
             .map(|c| read::Card { en: c["en"].as_str().map(str::to_string), zh: c["zh"].as_str().map(str::to_string), raised: c["raised"].as_bool().unwrap_or(false), x: c["x"].as_i64().unwrap_or(0) as i32, ..template.clone() })
             .collect();
+        // The name table's index, as the reader sets it: the English client's tooltip is matched by it (vorax_learn::card_printed).
+        for c in &mut base.cards {
+            c.index = c.en.as_deref().and_then(|en| crate::vorax::names::names().cards.iter().position(|n| n.en == en));
+        }
         Some(base)
     }
 
     /// A logged pick's card and how.
     type Pick = (Option<usize>, Option<String>);
+
+    /// The solver state of the last potion advice before the end of `rows` whose hand is `hand`, from the rows since
+    /// the `vorax_round` row before it (None when that hand was not advised, or a card is unread).
+    fn advised_state(rows: &[Value], hand: &[Option<String>]) -> Option<Value> {
+        let from = rows.iter().rposition(|v| v["kind"] == "vorax_round").map_or(0, |k| k + 1);
+        let hand: Vec<String> = hand.iter().cloned().collect::<Option<_>>()?;
+        rows[from..].iter().rev().filter(|v| v["kind"] == "vorax_advice").find_map(|v| {
+            let x: ScreenState = serde_json::from_value(v["state"].clone()).ok()?;
+            (x.hand == hand && x.phase == ScreenPhase::Potion).then(|| v["state"].clone())
+        })
+    }
 
     /// A logged potion pick (`vorax_round` at log line `line`) re-derived from the reads logged since the round row
     /// before it, as the session derives it (the card raised on the last read, the last card raised, the hover, then
@@ -6295,7 +6899,7 @@ mod tests {
     /// card is the first candidate of [`settle_pick`], like the session's, and other rows keep it. Rows from logs before
     /// `chosen.tanks` get one unknown tank per tank click.
     fn replayed(dir: &std::path::Path) -> Vec<(usize, Pick, Pick, Pick)> {
-        replayed_with(dir, false)
+        replayed_with(dir, false, true)
     }
 
     /// The selection screen reads of one stretch of logged rows (`vorax_read` rows; other screens read as None),
@@ -6334,7 +6938,9 @@ mod tests {
     }
 
     /// [`replayed`], with the names carried as the session carries them when `carry`.
-    fn replayed_with(dir: &std::path::Path, carry: bool) -> Vec<(usize, Pick, Pick, Pick)> {
+    /// [`replayed`] with `carry` the names carried ([`window_reads`]) and `board_check` the board check: a potion row's
+    /// solver state is the last `vorax_advice` state of its hand before it (the session keeps its own read's state).
+    fn replayed_with(dir: &std::path::Path, carry: bool, board_check: bool) -> Vec<(usize, Pick, Pick, Pick)> {
         let text = std::fs::read_to_string(dir.join("log.jsonl")).unwrap();
         let rows: Vec<Value> = text.lines().map(|l| serde_json::from_str(l).unwrap_or(Value::Null)).collect();
         let pick_of = |v: &Value| -> Pick { (v.pointer("/chosen/card").and_then(Value::as_u64).map(|c| c as usize), v.pointer("/chosen/how").and_then(Value::as_str).map(str::to_string)) };
@@ -6356,10 +6962,10 @@ mod tests {
             window_start = i + 1;
             let last = reads.iter().rposition(|r| r.round == round && !other_hand(&hand(r), &cards_en));
             let reads = &reads[..last.map_or(0, |k| k + 1)];
-            let (mut raised_seen, mut old_hover, mut new_hover) = (None, None, None);
+            let (mut raised_seen, mut raised_other, mut old_hover, mut new_hover) = (None, None, None, None);
             for r in reads {
                 if let Some(s) = seen_card(r, false) {
-                    raised_seen = Some(s);
+                    note_raised(&mut raised_seen, &mut raised_other, s);
                 }
                 if read::norm(&r.tooltip).chars().count() >= 2 {
                     old_hover = seen_card(r, true);
@@ -6381,18 +6987,25 @@ mod tests {
                     _ => (None, None),
                 }
             };
+            // The raised card only hovered on the way to Confirm after another was raised ([`hover_pass`], 2026-11-09):
+            // no card (an instrument's icon names it later in the session, not in this replay).
+            let last_tip = reads.last().and_then(hovered_card);
+            let mixed = hover_pass(if raised { logged.0 } else { None }, last_tip, earlier, seen_in(&raised_other, &board));
             let old = if rerolled { logged.clone() } else { pick(old_h) };
-            let mut new = if rerolled { (None, None) } else { pick(new_h) };
+            let mut new = if rerolled || mixed { (None, None) } else { pick(new_h) };
             if phase == "potion" && !rerolled {
                 let last = if raised { logged.0 } else { None };
-                let candidates: Vec<Value> = [(last, "raised"), (earlier, "raisedEarlier"), (new_h, "tooltip")].into_iter().filter_map(|(k, how)| k.map(|k| json!([k, how]))).collect();
-                if !candidates.is_empty() {
+                let candidates: Vec<Value> = if mixed { Vec::new() } else { [(last, "raised"), (earlier, "raisedEarlier"), (new_h, "tooltip")].into_iter().filter_map(|(k, how)| k.map(|k| json!([k, how]))).collect() };
+                {
                     let mut r = row.clone();
                     if r.pointer("/chosen/tanks").is_none_or(Value::is_null) {
                         let n = r["cues"].as_array().map_or(0, |a| a.iter().filter(|c| *c == "TankClick").count());
                         r["chosen"]["tanks"] = json!(vec![Value::Null; n]);
                     }
                     r["_pick"] = json!(candidates);
+                    if board_check && let Some(x) = advised_state(&rows[..i], &cards_en) {
+                        r["_state"] = x;
+                    }
                     settle_pick(&mut r, row["after"].as_str());
                     new = pick_of(&r);
                 }
@@ -6400,6 +7013,72 @@ mod tests {
             out.push((i + 1, logged, old, new));
         }
         out
+    }
+
+    /// The board check of a potion pick ([`board_fits`] in [`settle_pick`]): the 2026-11-08_18-44-54 round 2 hand on a
+    /// board of Pest groups and a Bone Sentry group, the board after it made by playing `Probiotic Enzyme Solution`.
+    /// No card seen picked (the raised one only hovered): the board names it (`board`). The hovered card kept as the
+    /// pick: none rather than it. A board that no card gives, or no state kept: the rows settle as before.
+    #[test]
+    fn the_board_after_a_potion_names_its_card_or_none() {
+        use vorax::advisor::ScreenMonster;
+        use vorax::game::dispatch_with;
+        use vorax::types::Action;
+        use vorax::{Archetype, Rarity};
+        let m = |archetype: Archetype, rarity: Rarity, activity: i64, quantity: i64| Some(ScreenMonster { archetype, rarity, activity, quantity });
+        let hand: Vec<String> = ["Probiotic Enzyme Solution", "Slender-Limb Powder - Bone Sentry", "Digestive Enzyme Solution"].map(String::from).to_vec();
+        let x = ScreenState {
+            tanks: vec![m(Archetype::Pest, Rarity::Normal, 1, 81), m(Archetype::Pest, Rarity::Normal, 1, 81), m(Archetype::Pest, Rarity::Magic, 5, 69), m(Archetype::BoneSentry, Rarity::Normal, 1, 154), None, None],
+            hand: hand.clone(),
+            instruments: vec!["Chrysalis Specimen".into(), "Incubation Sac".into()],
+            instrument_rounds: Some(vec![1, 1]),
+            phase: ScreenPhase::Potion,
+            round: Some(2),
+            potion_refreshes: Some(2),
+            instrument_refreshes: Some(2),
+            shelley: None,
+        };
+        // the board after playing card k under seed 0, as a board signature
+        let after = |k: i64| {
+            let mut s = vorax::advisor::to_state(&x, &mut Vec::new());
+            s.rng_state = 12_345;
+            for a in [Action::SelectCard { index: k }, Action::Confirm] {
+                s = dispatch_with(&s, a, false);
+            }
+            let tanks: Vec<String> = s.tanks.iter().map(|t| t.map_or_else(|| "_".to_string(), |m| format!("Some({:?}),Some({:?}),Some({}),Some({})", m.archetype, m.rarity, m.activity, m.quantity))).collect();
+            format!("Instrument|Some(2)|Some(2)|{};|x;|", tanks.join(";"))
+        };
+        let fits = board_fits(&x, &[], Some(&after(0))).unwrap();
+        assert_eq!(fits, [true, false, false], "only the card played gives its board");
+        let row = |pick: Value| {
+            json!({ "round": 2, "phase": "potion", "missing": [], "cues": ["CardClick", "CardClick", "Confirm", "PotionUsed"], "_pick": pick, "_state": serde_json::to_value(&x).unwrap(),
+                "chosen": { "card": null, "how": null, "hand": hand.clone(), "tankClicks": 0, "tanks": [] } })
+        };
+        let settled = |pick: Value, after: &str| {
+            let mut r = row(pick);
+            settle_pick(&mut r, Some(after));
+            assert!(r.get("_state").is_none() && r.get("_pick").is_none());
+            (r["chosen"]["card"].clone(), r["chosen"]["how"].clone(), r["missing"].clone(), r["chosen"]["basis"].clone())
+        };
+        // no card seen picked: the board names it
+        let (card, how, missing, basis) = settled(json!([]), &after(0));
+        assert_eq!((card, how, missing), (json!(0), json!("board"), json!([])));
+        assert_eq!(basis.as_array().unwrap().last(), Some(&json!({ "board": [true, false, false] })));
+        // the hovered card kept as the pick, the board another's: none
+        let (card, how, missing, _) = settled(json!([[1, "raised"]]), &after(0));
+        assert_eq!((card, how, missing), (Value::Null, Value::Null, json!(["card"])));
+        // the card raised and the board agree: kept as raised
+        assert_eq!(settled(json!([[0, "raised"]]), &after(0)).1, json!("raised"));
+        // a board no card gives: settled as before (the raised card kept, none when none was seen)
+        let nowhere = after(0).replacen("Some(Pest)", "Some(Aemberon)", 1);
+        assert_ne!(nowhere, after(0));
+        assert_eq!(settled(json!([[1, "raised"]]), &nowhere).0, json!(1));
+        assert_eq!(settled(json!([]), &nowhere).0, Value::Null);
+        // no state kept (a hand that was not read whole): as before
+        let mut r = row(json!([[1, "raised"]]));
+        r.as_object_mut().unwrap().remove("_state");
+        settle_pick(&mut r, Some(&after(0)));
+        assert_eq!(r["chosen"]["card"], json!(1));
     }
 
     /// The two games of 2026-11-06 replayed from their logs (skipped when the folders are gone): the picks recorded
@@ -6412,8 +7091,9 @@ mod tests {
             // 13-46-25: round 1 instrument (`孵化囊`, the hover kept through `0 / 2`), round 3 reroll (no card), round 3
             // (`Xeno-Hormone`, not `Pure Leech Solution`).
             ("2026-11-06_13-46-25", vec![(27, some(0, "tooltip")), (85, (None, None)), (107, some(2, "tooltip"))]),
-            // 12-23-50: round 6 (`Spinal Solution - Aemberon` takes no target, tank 1 was clicked: null).
-            ("2026-11-06_12-23-50", vec![(237, (None, None))]),
+            // 12-23-50: round 6 (`Spinal Solution - Aemberon` takes no target, tank 1 was clicked: null); round 7, no card
+            // seen picked, `Bewitching Tincture` (the advised card) the one card whose play gives the board after it.
+            ("2026-11-06_12-23-50", vec![(237, (None, None)), (258, some(0, "board"))]),
         ] {
             let dir = home.join(game);
             if !dir.join("log.jsonl").is_file() {
@@ -6429,6 +7109,127 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Two cards raised in one hand make the pick unknown ([`mixed_raise`]): the card raised on the last read, the
+    /// last raised and the one before it, in this hand; one card raised again and again is one card.
+    #[test]
+    fn two_cards_raised_in_a_hand_give_no_card() {
+        let hand = vec![Some("A".to_string()), Some("B".to_string()), Some("C".to_string())];
+        let (mut last, mut other) = (None, None);
+        note_raised(&mut last, &mut other, (Some(2), 0, hand.clone()));
+        note_raised(&mut last, &mut other, (Some(2), 0, hand.clone()));
+        assert!(other.is_none(), "the same card raised twice");
+        note_raised(&mut last, &mut other, (Some(2), 1, hand.clone()));
+        assert_eq!((last.as_ref().map(|s| s.1), other.as_ref().map(|s| s.1)), (Some(1), Some(0)));
+        // raised again: still two cards
+        note_raised(&mut last, &mut other, (Some(2), 0, hand.clone()));
+        assert_eq!((last.as_ref().map(|s| s.1), other.as_ref().map(|s| s.1)), (Some(0), Some(1)));
+        assert!(mixed_raise(Some(1), Some(1), Some(0)));
+        assert!(mixed_raise(Some(1), Some(0), None), "the last read against the last raised");
+        assert!(!mixed_raise(Some(1), Some(1), None));
+        assert!(!mixed_raise(None, Some(1), None));
+        assert!(!mixed_raise(None, None, None));
+        // only hovered: two cards raised and the tooltip on the last read names the raised one
+        assert!(hover_pass(Some(1), Some(1), Some(1), Some(0)));
+        assert!(!hover_pass(Some(1), None, Some(1), Some(0)), "the tooltip gone: picked");
+        assert!(!hover_pass(Some(1), Some(0), Some(1), Some(0)), "the tooltip on another card");
+        assert!(!hover_pass(Some(1), Some(1), Some(1), None), "one card raised");
+        assert!(!hover_pass(None, None, Some(1), Some(0)), "none raised on the last read");
+    }
+
+    /// The four games of 2026-11-08 evening replayed from their logs (skipped when the folders are gone): the potion of
+    /// 18-44-54 round 2 (log line 52), picked `Probiotic Enzyme Solution` (the advised card, the user's account) then
+    /// `Slender-Limb Powder - Bone Sentry` raised under the tooltip on the way to Confirm, is `Probiotic Enzyme
+    /// Solution` from the board after it ([`board_fits`]: every Pest group's activity up, the Bone Sentry group
+    /// unchanged); every other row logged as raised keeps its card (round 4 of the same game and 18-51-19 round 10
+    /// raised two cards too, the last one picked, the tooltip gone). Prints every row whose replayed card differs from
+    /// the logged one (`clicked` and `icon` rows: the replay has no click times or icons).
+    #[test]
+    fn the_picks_of_the_11_08_evening_games_replay_right() {
+        let home = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("home").join("vorax");
+        for (game, want) in [
+            ("2026-11-08_18-41-59", vec![]),
+            ("2026-11-08_18-44-54", vec![52usize]),
+            ("2026-11-08_18-48-43", vec![]),
+            ("2026-11-08_18-51-19", vec![]),
+        ] {
+            let dir = home.join(game);
+            if !dir.join("log.jsonl").is_file() {
+                println!("skipped: {game} is missing");
+                continue;
+            }
+            for (line, logged, _old, new) in replayed(&dir) {
+                if new != logged {
+                    println!("{game} L{line}: logged {logged:?} -> {new:?}");
+                }
+                if want.contains(&line) {
+                    assert_eq!(new, (Some(0), Some("board".into())), "{game} line {line}");
+                } else if logged.1.as_deref().is_some_and(|h| ["raised", "raisedEarlier"].contains(&h)) {
+                    assert_eq!(new, logged, "{game} line {line}");
+                }
+            }
+        }
+    }
+
+    /// Every saved game (`ASC_VORAX_HOME`, default the repo's home vorax folder) replayed: prints the rows logged as
+    /// raised that [`hover_pass`] leaves with no card, the rows whose card is the one the rules allow (`fit`), and how
+    /// many rows were looked at.
+    #[test]
+    #[ignore]
+    fn replay_hover_pass_all_games() {
+        let home = std::env::var("ASC_VORAX_HOME").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("home").join("vorax"));
+        let mut dirs: Vec<PathBuf> = std::fs::read_dir(&home).unwrap().map(|e| e.unwrap().path()).filter(|p| p.join("log.jsonl").is_file()).collect();
+        dirs.sort();
+        let (mut raised, mut dropped) = (0, 0);
+        for dir in dirs {
+            let name = dir.file_name().unwrap().to_string_lossy().to_string();
+            for (line, logged, _old, new) in replayed(&dir) {
+                if logged.1.as_deref() == Some("raised") {
+                    raised += 1;
+                    if new.0.is_none() {
+                        dropped += 1;
+                        println!("HOVER-PASS {name} L{line} logged {logged:?}");
+                    }
+                }
+                if new.1.as_deref() == Some("fit") {
+                    println!("FIT {name} L{line} logged {logged:?} -> {new:?}");
+                }
+            }
+        }
+        println!("rows logged raised {raised}, now no card {dropped}");
+    }
+
+    /// Every saved game (`ASC_VORAX_HOME`, default the repo's home vorax folder; `ASC_VORAX_FROM` the first folder
+    /// name looked at) replayed on its own client (the `point` of its reads): per game the pick rows, the ones logged
+    /// with no card and the ones still with no card now, and a `MISSING` line for each of those.
+    #[test]
+    #[ignore]
+    fn replay_missing_picks() {
+        let home = std::env::var("ASC_VORAX_HOME").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("home").join("vorax"));
+        let from = std::env::var("ASC_VORAX_FROM").unwrap_or_default();
+        let mut dirs: Vec<PathBuf> = std::fs::read_dir(&home).unwrap().map(|e| e.unwrap().path()).filter(|p| p.join("log.jsonl").is_file()).collect();
+        dirs.retain(|d| d.file_name().unwrap().to_string_lossy().as_ref() >= from.as_str());
+        dirs.sort();
+        for dir in dirs {
+            let name = dir.file_name().unwrap().to_string_lossy().to_string();
+            let text = std::fs::read_to_string(dir.join("log.jsonl")).unwrap();
+            let english = text.lines().find_map(|l| serde_json::from_str::<Value>(l).ok().and_then(|v| v.pointer("/point/english").and_then(Value::as_bool)));
+            #[cfg(feature = "en-vorax")]
+            crate::vorax::read::set_english_here(english);
+            let (mut rows, mut logged_none, mut now_none) = (0, 0, 0);
+            for (line, logged, _old, new) in replayed(&dir) {
+                rows += 1;
+                logged_none += usize::from(logged.0.is_none());
+                if new.0.is_none() {
+                    now_none += 1;
+                    println!("MISSING {name} L{line} logged {logged:?}");
+                }
+            }
+            println!("GAME {name} english {english:?} picks {rows} logged-none {logged_none} now-none {now_none}");
+        }
+        #[cfg(feature = "en-vorax")]
+        crate::vorax::read::set_english_here(None);
     }
 
     /// Every `vorax_round` row of the saved games up to 2026-11-06_13-46-25 (`ASC_VORAX_HOME`, default the repo's
@@ -6476,8 +7277,8 @@ mod tests {
         let (mut seen, mut changed) = (0, 0);
         for dir in dirs {
             let name = dir.file_name().unwrap().to_string_lossy().to_string();
-            let plain = replayed_with(&dir, false);
-            let carried = replayed_with(&dir, true);
+            let plain = replayed_with(&dir, false, false);
+            let carried = replayed_with(&dir, true, false);
             for ((line, _, _, a), (_, _, _, b)) in plain.iter().zip(&carried) {
                 seen += 1;
                 if a != b {
@@ -6804,6 +7605,120 @@ mod tests {
         assert!(kinds_now(&s, "vorax_full_frame").is_empty());
         let all = all_rows(s, &root);
         assert_eq!(all.iter().map(|rows| kinds(rows, "vorax_full_frame").len()).sum::<usize>(), 2);
+    }
+
+    /// With observe mode on, a steady selection screen read with a problem (no advice, so no "advised" evidence) saves
+    /// its evidence image once a round as "unreadable"; a read that is not steady, the same round again, or observe
+    /// mode off saves none.
+    #[test]
+    fn observe_mode_saves_an_unreadable_hand_once_a_round() {
+        let root = std::env::temp_dir().join(format!("ascendant-vorax-unreadable-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let mut s = session();
+        s.configure(Config { log_root: Some(root.clone()), observe: true, ..s.config.clone() });
+        s.note_cue(page(Page::Main, PageState::Run), Some(1_000));
+        let unreadable = |s: &VoraxSession| kinds_now(s, "vorax_lossless").into_iter().filter(|r| r["role"] == "unreadable").collect::<Vec<_>>();
+        let bad = |round: i32, ult: i64| {
+            let mut r = Reading { round: Some(round), problems: vec!["水箱 1（Hollow Cocoon）未知：數值".into()], ..potion_board(false, Some(ult), 12) };
+            (r.tanks[0].activity, r.tanks[0].quantity) = (None, None);
+            r
+        };
+        feed(&mut s, bad(5, 600), 2_000);
+        assert!(unreadable(&s).is_empty(), "one read: not steady");
+        feed(&mut s, bad(5, 600), 2_060);
+        assert_eq!(s.view().status, Status::Unreadable);
+        let saved = unreadable(&s);
+        assert_eq!(saved.len(), 1);
+        assert_eq!((saved[0]["screen"].as_str(), saved[0]["round"].as_i64()), (Some("hand"), Some(5)));
+        assert!(saved[0]["file"].as_str().is_some_and(|f| f.starts_with("evidence-") && f.ends_with(".png")));
+        // the same round read otherwise, steady again: not saved again
+        feed(&mut s, bad(5, 700), 2_500);
+        feed(&mut s, bad(5, 700), 2_560);
+        assert_eq!(unreadable(&s).len(), 1);
+        // the next round: saved
+        feed(&mut s, bad(6, 800), 3_000);
+        feed(&mut s, bad(6, 800), 3_060);
+        assert_eq!(unreadable(&s).iter().map(|r| r["round"].as_i64()).collect::<Vec<_>>(), [Some(5), Some(6)]);
+        // observe mode off: none
+        s.configure(Config { observe: false, ..s.config.clone() });
+        feed(&mut s, bad(7, 900), 4_000);
+        feed(&mut s, bad(7, 900), 4_060);
+        assert_eq!(unreadable(&s).len(), 2);
+        drop(s);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// With the general observe mode on, each hand saves the evidence image of the read its advice was solved on and,
+    /// when the hand's last steady read read otherwise, of that one too; a game saves the whole frame of its first
+    /// steady pick and of the steady result screen, and the battle panel read the same twice, each named in a
+    /// `vorax_lossless` row; observe mode off, none.
+    #[test]
+    fn observe_mode_saves_the_evidence_of_each_hand_losslessly() {
+        let root = std::env::temp_dir().join(format!("ascendant-vorax-lossless-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let mut s = session();
+        s.configure(Config { log_root: Some(root.clone()), observe: true, ..s.config.clone() });
+        s.note_cue(page(Page::Main, PageState::Run), Some(1_000));
+        let rows = |s: &VoraxSession| kinds_now(s, "vorax_lossless");
+        let role = |r: &Value| (r["screen"].as_str().unwrap_or("").to_string(), r["role"].as_str().unwrap_or("").to_string());
+        // hand 1: steady and advised: its evidence ("advised") and the game's whole pick frame
+        feed(&mut s, potion_board(false, Some(600), 12), 2_000);
+        assert!(rows(&s).is_empty(), "one read: not steady");
+        feed(&mut s, potion_board(false, Some(600), 12), 2_060);
+        assert!(s.advice().is_some());
+        let saved = rows(&s);
+        assert_eq!(saved.iter().map(role).collect::<Vec<_>>(), [("pick".into(), String::new()), ("hand".into(), "advised".into())]);
+        let advised = &saved[1];
+        assert!(advised["file"].as_str().is_some_and(|f| f.starts_with("evidence-") && f.ends_with(".png")));
+        let read_at = advised["readAt"].as_str().unwrap().to_string();
+        assert!(kinds_now(&s, "vorax_read").iter().any(|r| r["at"].as_str() == Some(read_at.as_str())), "names the read it goes with");
+        // the hand read otherwise before its end (a card raised, say): saved as "confirmed" at the hand's end
+        feed(&mut s, potion_board(false, Some(600), 20), 2_500);
+        feed(&mut s, potion_board(false, Some(600), 20), 2_560);
+        s.note_cue(Cue::Confirm, Some(2_800));
+        s.note_cue(Cue::Synced, Some(2_810));
+        assert_eq!(rows(&s).iter().map(role).next_back(), Some(("hand".into(), "confirmed".into())));
+        assert_eq!(rows(&s).len(), 3);
+        // hand 2: advised, and its last steady read the same: one image
+        s.note_cue(Cue::Dealt, Some(2_900));
+        feed(&mut s, potion_board(false, Some(720), 20), 3_000);
+        feed(&mut s, potion_board(false, Some(720), 20), 3_060);
+        s.note_cue(Cue::Confirm, Some(3_300));
+        s.note_cue(Cue::Synced, Some(3_310));
+        assert_eq!(rows(&s).iter().filter(|r| r["role"] == "advised").count(), 2);
+        assert_eq!(rows(&s).len(), 4, "the same read twice is saved once");
+        // the result screen, steady: its whole frame
+        s.note_cue(page(Page::Reward, PageState::Run), Some(8_000));
+        let result = || Reading { kind: Kind::Result, ultimate: Some(851_000), ..other_read() };
+        feed(&mut s, result(), 8_500);
+        feed(&mut s, result(), 9_000);
+        assert_eq!(rows(&s).last().map(role), Some(("result".into(), String::new())));
+        // the battle: the panel read the same twice in a row saves the panel
+        s.note_cue(Cue::Fight, Some(10_000));
+        assert_eq!(s.mode(), Mode::Battle);
+        let panel = read::Battle { wave: Some((1, 3)), activity: Some(91_100.0), bonus: Some(18_200.0), next: Some(114_000.0), percent: Some(0), raw: String::new() };
+        let crop = || Rgba { w: 4, h: 4, data: vec![0; 64] };
+        s.battle_read(panel.clone(), crop(), 11_000);
+        assert_eq!(rows(&s).len(), 5, "one read alone");
+        s.battle_read(panel.clone(), crop(), 12_000);
+        let saved = rows(&s);
+        assert_eq!(saved.len(), 6);
+        assert_eq!((saved[5]["screen"].as_str(), saved[5]["battle"]["activity"].as_f64()), (Some("battle"), Some(91_100.0)));
+        let dir = s.log().unwrap().dir().to_path_buf();
+        s.log().unwrap().wait();
+        for r in &saved {
+            let png = std::fs::read(dir.join(r["file"].as_str().unwrap())).unwrap();
+            assert!(png.starts_with(&[0x89, b'P', b'N', b'G']), "{}", r["file"]);
+        }
+        // a new game with observe mode off: none
+        s.configure(Config { observe: false, ..s.config.clone() });
+        s.note_cue(Cue::LevelLeft, Some(30_000));
+        s.note_cue(page(Page::Main, PageState::Run), Some(31_000));
+        feed(&mut s, potion_board(false, Some(600), 12), 31_500);
+        feed(&mut s, potion_board(false, Some(600), 12), 31_560);
+        s.note_cue(Cue::Synced, Some(32_000));
+        let all = all_rows(s, &root);
+        assert_eq!(all.iter().map(|rows| kinds(rows, "vorax_lossless").len()).sum::<usize>(), 6);
     }
 
     /// A `vorax_view` row carries the advice's note as the window shows it (the 12:23 game's rows had none, so a

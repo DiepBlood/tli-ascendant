@@ -33,6 +33,9 @@ const STALE: Color32 = Color32::GRAY;
 /// UI).
 pub const CREDIT: &str = "渴血求解器：vorax-solver-rs（MIT，DinoRaos、tidewarden、Moebing）";
 /// The same credit line in English, used by "About" in the English UI.
+/// The endgame battle's give-up hint ([`VoraxView::show_give_up`]).
+const GIVE_UP_LINE: &str = "Score at its cap: give up to settle at once";
+
 pub const CREDIT_EN: &str = "Vorax solver: vorax-solver-rs (MIT; DinoRaos, tidewarden, Moebing)";
 
 /// What Vorax's live advice looks like in the window and over the game. There is only one in the whole program.
@@ -65,6 +68,10 @@ pub struct VoraxView {
     latest_window: Option<String>,
     /// Test only (ASCENDANT_PREVIEW_VORAX_PANEL): the panel draws this made-up view instead of the session's.
     preview_view: Option<View>,
+    /// The endgame battle's give-up hint on the game ([`View::give_up`]): the line, a gold notice as Tartarus's at the
+    /// top of the game, and the box on the Give Up button; made when first needed.
+    give_up_notice: Option<Notice>,
+    give_up_mark: Option<Mark>,
 }
 
 /// The content written to the `vorax_view` row, matching the fields written: the boxes drawn (what and `Mark::at()`),
@@ -83,7 +90,7 @@ impl VoraxView {
     pub fn new(settings: &Settings, ctx: egui::Context) -> VoraxView {
         let mut session = VoraxSession::new(Config::from_settings(settings));
         session.on_progress(move || ctx.request_repaint());
-        let mut view = VoraxView { session, marks: Vec::new(), value: None, window: None, last_view: None, hidden: None, preview: false, preview_battle: None, preview_result: None, dismissed: None, latest_window: None, preview_view: None };
+        let mut view = VoraxView { session, marks: Vec::new(), value: None, window: None, last_view: None, hidden: None, preview: false, preview_battle: None, preview_result: None, dismissed: None, latest_window: None, preview_view: None, give_up_notice: None, give_up_mark: None };
         // ASCENDANT_PREVIEW_VORAX_PANEL=advice, none or blank: the panel draws a made-up board (see preview_view).
         if let Ok(which) = std::env::var("ASCENDANT_PREVIEW_VORAX_PANEL") {
             view.preview_panel(&which);
@@ -269,7 +276,9 @@ impl VoraxView {
             // Observe-mode frames: not given to Tartarus in Vorax mode.
             Event::Observe(..) => None,
             // The riot battle's boss goes to the Tartarus run log whatever the mode: it does not leave Vorax.
-            Event::RiotBoss(_) => Some(event),
+            Event::RiotBoss(_) | Event::RiotEnd(_) => Some(event),
+            // The map pages go to the affix samples whatever the mode (a map page is never open in Vorax mode).
+            Event::MapLog(..) | Event::MapShot { .. } => Some(event),
         }
     }
 
@@ -310,7 +319,7 @@ impl VoraxView {
     /// Called by ui.rs on every tick outside Vorax mode: if boxes are still drawn, take them all down (e.g. leftovers
     /// after leaving). Does nothing when the boxes are already hidden.
     pub fn hide_marks(&mut self) {
-        if self.marks.iter().any(Mark::shown) || self.value.as_ref().is_some_and(Notice::shown) {
+        if self.marks.iter().any(Mark::shown) || self.value.as_ref().is_some_and(Notice::shown) || self.give_up_shown() {
             self.hide_all();
         }
     }
@@ -321,6 +330,7 @@ impl VoraxView {
         if let Some(v) = &mut self.value {
             v.hide();
         }
+        self.hide_give_up();
         // This is taking the boxes down on leaving Vorax mode, not hidden by show_marks.
         self.hidden = None;
         self.log_marks(vorax_session::now_ms());
@@ -366,7 +376,55 @@ impl VoraxView {
             w.report(news, off_board);
         }
         self.show_marks(ctx, settings);
+        self.show_give_up(ctx, settings);
         self.log_marks(now);
+    }
+
+    /// The give-up hint is on the game.
+    fn give_up_shown(&self) -> bool {
+        self.give_up_notice.as_ref().is_some_and(Notice::shown) || self.give_up_mark.as_ref().is_some_and(Mark::shown)
+    }
+
+    fn hide_give_up(&mut self) {
+        if let Some(n) = &mut self.give_up_notice {
+            n.hide();
+        }
+        if let Some(m) = &mut self.give_up_mark {
+            m.hide();
+        }
+    }
+
+    /// The endgame battle's give-up hint ([`View::give_up`]) with the setting on and the game in front: the line as
+    /// Tartarus's notice, centred at the top of the game (as ui.rs `show_notice`), and the Give Up button boxed as an
+    /// advised card is ([`VoraxView::show_marks`]: frame pixels plus the client area's top-left, `unit = height /
+    /// 1080`). Everything else hides it.
+    fn show_give_up(&mut self, ctx: &egui::Context, settings: &Settings) {
+        let title = &settings.window_title;
+        let b = self.session.view().give_up.clone().filter(|_| settings.vorax_give_up_hint);
+        if b.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(200));
+        }
+        let rect = b.as_ref().filter(|_| game_in_front(title)).and_then(|_| game_rect(title).ok());
+        let (Some(b), Some(rect @ [left, top, width, height])) = (b, rect) else {
+            self.hide_give_up();
+            return;
+        };
+        let unit = height as f32 / 1080.0;
+        if self.give_up_notice.is_none() {
+            self.give_up_notice = Notice::new();
+        }
+        if let Some(n) = &mut self.give_up_notice {
+            n.show(tr(GIVE_UP_LINE), left as f32 + width as f32 / 2.0, top as f32 + height as f32 * 8.0 / 1080.0, unit, width as f32 * 0.6);
+        }
+        if self.give_up_mark.is_none() {
+            self.give_up_mark = Mark::new();
+        }
+        if let Some(m) = &mut self.give_up_mark {
+            let (x, y, half_w, half_h) = b.at;
+            if m.show([left as f32 + x, top as f32 + y, half_w, half_h, unit], mark::Style::Plain, rect) {
+                ctx.request_repaint();
+            }
+        }
     }
 
     /// Draw the boxes over the game according to `View::boxes`, with the same coordinate conversion as ui.rs's
@@ -484,7 +542,16 @@ impl VoraxView {
     /// ranking and the board text that was read are in an expandable section. When `compact`, draws the compact
     /// version (when the window is small, see `next_compact` in ui.rs). Line 1 of the compact version is drawn by
     /// ui.rs's status line (merged into it, see [`VoraxView::compact_head`]).
-    pub fn panel(&self, ui: &mut egui::Ui, compact: bool) {
+    /// At the bottom, the switch of the endgame battle's give-up hint (`give_up`, settings `vorax_give_up_hint`; the
+    /// player asked for it on this panel, 2026-11-09): true when it was switched, for ui.rs to save.
+    pub fn panel(&self, ui: &mut egui::Ui, compact: bool, give_up: &mut bool) -> bool {
+        self.panel_body(ui, compact);
+        ui.add_space(6.0);
+        let hover = tr("Vorax endgame battle: once the score reaches its cap (1.12M, every reward tier taken), a line on the game says giving up settles at once, and the Give Up button is boxed. More battle adds nothing then");
+        ui.add(theme::Switch::new(give_up, tr("Vorax: hint to give up at the score cap"))).on_hover_text(hover).changed()
+    }
+
+    fn panel_body(&self, ui: &mut egui::Ui, compact: bool) {
         if !self.active()
             && let Some(g) = self.last_game()
         {

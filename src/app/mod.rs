@@ -40,6 +40,16 @@ pub mod ui;
 pub mod update;
 #[cfg(windows)]
 pub mod vorax_view;
+// The affix frames' window, the frames live on the game, the affix page (public since 1.2.0).
+#[cfg(windows)]
+pub mod affix_overlay;
+#[cfg(windows)]
+pub mod affix_live;
+#[cfg(windows)]
+pub mod affix_page;
+// Private builds only: map page frames as samples for the affix reader (not exported to the public repository).
+#[cfg(all(windows, feature = "dev-samples"))]
+pub mod affix_samples;
 
 /// Opens the window, with `preload` read first when given.
 #[cfg(windows)]
@@ -67,6 +77,8 @@ pub fn run(preload: Option<&std::path::Path>) -> Result<(), String> {
     // Before any run log is made (the window's RunLog and the Vorax session's are made in AscendantApp::new):
     // until now every run log is kept.
     runlog::set_keep_all(settings.keep_all_logs);
+    // the settings each run log's window line names (and a `settings` row on a change, see runlog::set_settings)
+    runlog::set_settings(settings.log_summary());
     crate::lang::set(crate::lang::Lang::from_key(&settings.language));
     if let Some(current) = current.as_ref().filter(|_| installed && !settings.desktop_shortcut) {
         let _ = install::desktop_shortcut(current);

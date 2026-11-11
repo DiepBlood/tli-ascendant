@@ -8,12 +8,14 @@ body:
       value: |
         感謝回報（Thanks for reporting）。請先在程式的「本局頁」頂端選那一局，在下方「匯出這一局」按「準備匯出」，看過列出的內容後按「存檔並開啟資料夾」。zip 存在 `Ascendant.exe` 所在的資料夾（不能寫入時在 `%APPDATA%\Ascendant`），再拖進下方附件欄。
         Please pick the run at the top of the Run tab first, press "Prepare" under "Export this run", look the list over, then press "Save and open folder". The zip is saved next to `Ascendant.exe` (or in `%APPDATA%\Ascendant` when that folder cannot be written). Drag it into the attachment box below.
+        關卡詞綴的問題請附地圖頁「基礎詞綴」面板的截圖與「詞綴」頁的截圖，並寫出是哪一條詞綴、框成什麼顏色、應該是什麼（「匯出這一局」不含詞綴）。
+        For a map affix problem, attach screenshots of the map page's Base Affix panel and the Affixes page, and say which affix, how it was framed, and what it should be ("Export this run" does not cover affixes).
   - type: input
     id: version
     attributes:
       label: 版本（Version）
-      description: Ascendant 的版本號，例如 1.1.0（The Ascendant version, e.g. 1.1.0）
-      placeholder: "1.1.0"
+      description: Ascendant 的版本號，例如 1.2.0（The Ascendant version, e.g. 1.2.0）
+      placeholder: "1.2.0"
     validations:
       required: true
   - type: dropdown
@@ -23,13 +25,14 @@ body:
       options:
         - 塔羅斯（Tartarus）
         - 渴血手術（Vorax）
+        - 關卡詞綴（Map affixes）
     validations:
       required: true
   - type: dropdown
     id: client_language
     attributes:
       label: 遊戲客戶端語言（Game client language）
-      description: 繁中客戶端支援最完整，英文客戶端的渴血為 1.1.0 新增（The Traditional Chinese client is the best supported; Vorax on the English client is new in 1.1.0）
+      description: 繁中客戶端支援最完整；關卡詞綴為 1.2.0 新增，繁中、英文客戶端都支援（The Traditional Chinese client is the best supported; map affixes are new in 1.2.0, on both clients）
       options:
         - 繁體中文（Traditional Chinese）
         - English
@@ -48,7 +51,7 @@ body:
     id: description
     attributes:
       label: 問題描述（What happened）
-      description: 發生了什麼事、怎麼重現。若是英文客戶端渴血讀錯卡，請寫出讀成什麼、實際是什麼（What happened and how to reproduce it. For a Vorax misread on the English client, say what was read and what it should be）
+      description: 發生了什麼事、怎麼重現。若是英文客戶端渴血讀錯卡，請寫出讀成什麼、實際是什麼（What happened and how to reproduce it. For a Vorax misread on the English client, say what was read and what it should be）。若是詞綴框錯，請寫出詞綴文字、框的顏色、你在詞綴頁設的等級（For a wrong affix frame, give the affix text, the frame's colour and your grade on the Affixes page）
     validations:
       required: true
   - type: textarea

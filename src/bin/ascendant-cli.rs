@@ -984,9 +984,9 @@ fn run_audit(args: &[String]) -> Result<ExitCode, String> {
         let name = dir.file_name().map_or_else(|| dir.display().to_string(), |n| n.to_string_lossy().into_owned());
         games.extend(ascendant::audit::games(&name, &text));
     }
-    ascendant::audit::score(&mut games, rollouts);
+    let topped = ascendant::audit::score_topped(&mut games, rollouts);
     print!("{}", ascendant::audit::report(&games, rollouts, each));
-    out!("{:.1} s", clock.elapsed().as_secs_f64());
+    out!("{:.1} s, {topped} dropped moves re-solved to the full round count", clock.elapsed().as_secs_f64());
     Ok(ExitCode::SUCCESS)
 }
 

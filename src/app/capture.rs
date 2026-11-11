@@ -66,19 +66,60 @@ const CONSOLE_CLASSES: [&str; 2] = ["ConsoleWindowClass", "CASCADIA_HOSTING_WIND
 /// The game's executable: its window is the one captured, whatever other windows' titles hold.
 const GAME_EXE: &str = "torchlight_infinite.exe";
 
-struct Search {
+/// Programs whose windows are never taken for the game by their title: a Discord channel, a browser tab or an
+/// Explorer folder named after the game ("#繁中 | Torchlight: Infinite - Discord", 2026-11-03 to 11-08: 16 of the
+/// user's run logs began on such a window while the game was closed, and read only misses). File names, any case.
+const NOT_GAME: &[&str] = &["discord.exe", "msedge.exe", "chrome.exe", "firefox.exe", "brave.exe", "opera.exe", "explorer.exe"];
+
+/// The windows looked at for the game, in the order EnumWindows gives them (front to back); `H` is the window
+/// handle, a plain number in tests.
+struct Search<H> {
     needle: String,
     /// A window of [`GAME_EXE`] ends the search.
-    game: Option<HWND>,
+    game: Option<H>,
     /// The first window titled exactly `needle`.
-    exact: Option<HWND>,
+    exact: Option<H>,
     /// The first window whose title contains `needle`.
-    partial: Option<HWND>,
+    partial: Option<H>,
+    /// Whether a window of a [`NOT_GAME`] program had `needle` in its title (and was left out).
+    skipped: bool,
+}
+
+impl<H: Copy> Search<H> {
+    fn new(title: &str) -> Self {
+        Search { needle: title.to_lowercase(), game: None, exact: None, partial: None, skipped: false }
+    }
+
+    /// Takes in one visible, titled window: `title` as shown, `exe` its process's file name when it could be read.
+    /// True when it is the game's, which ends the search.
+    fn see(&mut self, hwnd: H, title: &str, exe: Option<&str>) -> bool {
+        if exe.is_some_and(|f| f.eq_ignore_ascii_case(GAME_EXE)) {
+            self.game = Some(hwnd);
+            return true;
+        }
+        let title = title.to_lowercase();
+        if !title.contains(&self.needle) {
+            return false;
+        }
+        if exe.is_some_and(|f| NOT_GAME.iter().any(|n| f.eq_ignore_ascii_case(n))) {
+            self.skipped = true;
+        } else if title == self.needle {
+            self.exact.get_or_insert(hwnd);
+        } else {
+            self.partial.get_or_insert(hwnd);
+        }
+        false
+    }
+
+    /// The game's window, else the first titled exactly as asked, else the first whose title contains it.
+    fn pick(&self) -> Option<H> {
+        self.game.or(self.exact).or(self.partial)
+    }
 }
 
 unsafe extern "system" fn visit(hwnd: HWND, lparam: LPARAM) -> BOOL {
     // SAFETY: lparam is the &mut Search passed to EnumWindows below, alive for the call.
-    let search = unsafe { &mut *(lparam.0 as *mut Search) };
+    let search = unsafe { &mut *(lparam.0 as *mut Search<HWND>) };
     // This process's windows are left out before their title is read, with calls that send them nothing
     // (IsWindowVisible, GetWindowThreadProcessId, GetClassNameW): GetWindowTextW on a window of this process owned by
     // another thread is a SendMessage(WM_GETTEXT) with no timeout, and with the UI thread waiting in Watcher's drop
@@ -87,21 +128,12 @@ unsafe extern "system" fn visit(hwnd: HWND, lparam: LPARAM) -> BOOL {
     if !unsafe { IsWindowVisible(hwnd) }.as_bool() || own_or_console(hwnd) {
         return BOOL(1);
     }
-    let title = window_title(hwnd).to_lowercase();
+    let title = window_title(hwnd);
     if title.is_empty() {
         return BOOL(1);
     }
-    let pid = window_pid(hwnd);
-    if process_file(pid).is_some_and(|f| f.eq_ignore_ascii_case(GAME_EXE)) {
-        search.game = Some(hwnd);
-        return BOOL(0);
-    }
-    if title == search.needle {
-        search.exact.get_or_insert(hwnd);
-    } else if title.contains(&search.needle) {
-        search.partial.get_or_insert(hwnd);
-    }
-    BOOL(1)
+    let exe = process_file(window_pid(hwnd));
+    BOOL(i32::from(!search.see(hwnd, &title, exe.as_deref())))
 }
 
 /// The id of the process that owns the window.
@@ -192,18 +224,17 @@ const LOG_CHECK: Duration = Duration::from_secs(2);
 
 /// The visible top-level window of [`GAME_EXE`], else the first titled
 /// `title` (any case), else the first whose title contains it, leaving out
-/// this process's windows and console windows.
+/// this process's windows, console windows and [`NOT_GAME`] programs' windows.
 fn find(title: &str) -> Option<HWND> {
-    let search = search(title);
-    search.game.or(search.exact).or(search.partial)
+    search(title).pick()
 }
 
 /// The windows [`find`] picks from for `title`.
-fn search(title: &str) -> Search {
-    let mut search = Search { needle: title.to_lowercase(), game: None, exact: None, partial: None };
+fn search(title: &str) -> Search<HWND> {
+    let mut search = Search::new(title);
     // SAFETY: the callback only touches `search`, which outlives the call. EnumWindows
     // reports an error when the callback stops early, which is how the game's window ends it.
-    let _ = unsafe { EnumWindows(Some(visit), LPARAM(&mut search as *mut Search as isize)) };
+    let _ = unsafe { EnumWindows(Some(visit), LPARAM(&mut search as *mut Search<HWND> as isize)) };
     search
 }
 
@@ -215,8 +246,14 @@ pub fn game_pid() -> Option<u32> {
 
 /// The window `find` picks for `title`, or why there is none.
 fn find_window(title: &str) -> Result<HWND, String> {
-    find(title).ok_or_else(|| {
-        trf!("No Torchlight: Infinite window ({}), and no window with \"{}\" in its title: is the game running?", GAME_EXE, title)
+    let search = search(title);
+    search.pick().ok_or_else(|| {
+        if search.skipped {
+            // only a Discord channel, a browser tab or a folder named after the game
+            trf!("Torchlight: Infinite is not running ({}): only other programs' windows have \"{}\" in their title.", GAME_EXE, title)
+        } else {
+            trf!("No Torchlight: Infinite window ({}), and no window with \"{}\" in its title: is the game running?", GAME_EXE, title)
+        }
     })
 }
 
@@ -263,6 +300,14 @@ pub fn game_rect(title: &str) -> Result<[i32; 4], String> {
     let hwnd = find_window(title)?;
     let r = dpi_aware(|| client_rect(hwnd))?;
     Ok([r.left, r.top, r.right - r.left, r.bottom - r.top])
+}
+
+/// The game window's DPI (96 at 100% display scaling), None when the window is not found.
+pub fn game_dpi(title: &str) -> Option<u32> {
+    let hwnd = find_window(title).ok()?;
+    // SAFETY: a plain Win32 call on a window handle just found; 0 means an invalid handle.
+    let dpi = dpi_aware(|| unsafe { GetDpiForWindow(hwnd) });
+    (dpi != 0).then_some(dpi)
 }
 
 /// Whether the game's window or one of this process's windows is in front.
@@ -1389,6 +1434,15 @@ pub enum Event {
     Game(Signal, Option<i64>, SystemTime),
     /// The riot battle after a run had its special boss ([`Signal::RiotBoss`]): for the run log only.
     RiotBoss(gamelog::RiotBoss),
+    /// How the riot battle after a run went ([`Signal::RiotEnd`]): for the run log and the run review only.
+    RiotEnd(gamelog::RiotEnd),
+    /// A map page signal of the game's log ([`Signal::MapPage`], [`Signal::AffixButton`], [`Signal::MapAffixes`]),
+    /// with its line's time and when it was read off the log: for the affix frames (and private builds' samples), never
+    /// Tartarus's or Vorax's (as a game signal it would end a Vorax mode).
+    MapLog(Signal, Option<i64>, SystemTime),
+    /// A frame taken for the map page after `after` (open, add or revert): asked for `delay_ms` after the log line was
+    /// read, taken `taken_ms` after it (later when the capture thread was resting), see [`map_shots`].
+    MapShot { frame: Rgba, at: SystemTime, after: &'static str, delay_ms: u32, taken_ms: u32 },
 }
 
 /// The watcher's state the UI thread reaches too.
@@ -1406,6 +1460,143 @@ struct Shared {
     charges: gamelog::Charges,
     /// What the log follower is doing, see [`Watcher::log_status`].
     log: gamelog::LogStatus,
+    /// When a map page last showed or had an affix button clicked (from the log), while it is shown: its buttons
+    /// mean something only then, and for at most [`MAP_IDLE`] after (a page whose closing line never came, as when
+    /// the game crashed on it, does not keep generic `AddBtn` clicks elsewhere taking frames); see [`map_shots`].
+    map_open: Option<Instant>,
+    /// Map page frames to take: when, after what, the delay that was asked for (ms), and when its log line was read.
+    map_shots: Vec<(Instant, &'static str, u32, Instant)>,
+    /// While a map page shows, when to take its next frame anyway ([`MAP_REFRESH`]): a wrong read is put right by the
+    /// next frame, not kept until the next click.
+    map_refresh: Option<Instant>,
+    /// Who wants map page frames ([`Watcher::map_frames`]): the live frames (the affix frames' switch on: every frame
+    /// it schedules), the samples (private builds sampling: the page's and the clicks' frames only). Neither: none.
+    map_live: bool,
+    map_samples: bool,
+    /// The live frames have frames up ([`Watcher::map_watch`]): the page's frames anyway come every [`MAP_WATCH`],
+    /// named `watch`, so a panel scrolled or gone takes its frames down sooner (2026-11-09).
+    map_watch: bool,
+}
+
+/// After the game's log says a map page showed, when to take its frame for the affix samples (ms): guesses, as the
+/// page's animation was not measured; the samples are to measure it.
+const MAP_OPEN_SHOTS: [u32; 2] = [600, 1500];
+/// After an Add or Revert click on a map page, when to take its frame (ms): the panel redraws with the new affix on
+/// top; guesses as above.
+const AFFIX_CLICK_SHOTS: [u32; 3] = [350, 800, 1500];
+/// A map page with nothing from the log this long counts as gone (see [`Shared::map_open`]).
+const MAP_IDLE: Duration = Duration::from_secs(600);
+/// While a map page shows, a frame at least this often (the live frames read it only when the panel changed).
+const MAP_REFRESH: Duration = Duration::from_millis(1000);
+/// While the affix frames are up, a frame at least this often instead (see [`Shared::map_watch`]): a frame standing on
+/// another entry after a scroll is seen in half a second at most, for a frame copy more a second.
+const MAP_WATCH: Duration = Duration::from_millis(500);
+
+/// How often the page's frames come anyway now ([`MAP_REFRESH`], or [`MAP_WATCH`] with frames up), and their name.
+fn refresh_every(shared: &Shared) -> (Duration, &'static str) {
+    if shared.map_watch { (MAP_WATCH, "watch") } else { (MAP_REFRESH, "refresh") }
+}
+
+/// The live frames have frames up (`on`) or not ([`Shared::map_watch`]): with frames up, a refresh due later than
+/// [`MAP_WATCH`] from `now` comes then.
+fn map_watch(shared: &Mutex<Shared>, on: bool, now: Instant) {
+    let mut shared = lock(shared);
+    shared.map_watch = on;
+    if on && let Some(at) = shared.map_refresh {
+        shared.map_refresh = Some(at.min(now + MAP_WATCH));
+    }
+}
+
+/// Schedules the map page frames of a map page signal from the log ([`MAP_OPEN_SHOTS`], [`AFFIX_CLICK_SHOTS`]) for
+/// the affix frames (and private builds' samples), as [`Watcher::map_frames`] says they are wanted; a page hidden or
+/// closed drops those still waiting.
+fn map_shots(shared: &Mutex<Shared>, signal: Signal, now: Instant) {
+    let mut shared = lock(shared);
+    let open = shared.map_open.is_some_and(|at| now.duration_since(at) < MAP_IDLE);
+    let (after, delays): (&'static str, &[u32]) = match signal {
+        Signal::MapPage { state: gamelog::PageState::Shown, .. } => ("open", &MAP_OPEN_SHOTS),
+        Signal::MapPage { .. } => {
+            shared.map_open = None;
+            shared.map_shots.clear();
+            shared.map_refresh = None;
+            return;
+        }
+        Signal::AffixButton { revert } if open => (if revert { "revert" } else { "add" }, &AFFIX_CLICK_SHOTS),
+        _ => return,
+    };
+    // the page is known to show whoever wants frames, so a switch turned on later takes the next ones
+    shared.map_open = Some(now);
+    // the once-a-second frames are the live frames' only; with nobody wanting frames, none at all
+    let every = refresh_every(&shared).0;
+    shared.map_refresh = shared.map_live.then_some(now + every);
+    if !(shared.map_live || shared.map_samples) {
+        return;
+    }
+    // a later click replaces the earlier click's frames still waiting (the panel changed again)
+    if after != "open" {
+        shared.map_shots.retain(|s| s.1 == "open");
+    }
+    shared.map_shots.extend(delays.iter().map(|&ms| (now + Duration::from_millis(u64::from(ms)), after, ms, now)));
+    shared.map_shots.sort_by_key(|s| s.0);
+}
+
+/// Who wants map page frames from now on (see [`Shared::map_live`]): the frames of those no longer wanted that still
+/// wait go (the live frames' refreshes and retries; all when nobody wants any). The live frames wanted again while a
+/// map page shows get their once-a-second frames back from `now` (else none came until the next click or page).
+fn map_frames(shared: &Mutex<Shared>, live: bool, samples: bool, now: Instant) {
+    let mut shared = lock(shared);
+    let turned_on = live && !shared.map_live;
+    (shared.map_live, shared.map_samples) = (live, samples);
+    if turned_on && shared.map_open.is_some_and(|at| now.duration_since(at) < MAP_IDLE) {
+        shared.map_refresh = Some(now + refresh_every(&shared).0);
+    }
+    if !live {
+        shared.map_refresh = None;
+        shared.map_shots.retain(|s| s.1 != "retry");
+    }
+    if !(live || samples) {
+        shared.map_shots.clear();
+    }
+}
+
+/// A "retry" map page frame `after` from `now` ([`Watcher::map_shot_in`]), while a map page shows and the live frames
+/// want frames.
+fn map_shot_in(shared: &Mutex<Shared>, after: Duration, now: Instant) {
+    let mut shared = lock(shared);
+    if shared.map_live && shared.map_open.is_some_and(|at| now.duration_since(at) < MAP_IDLE) {
+        let ms = u32::try_from(after.as_millis()).unwrap_or(u32::MAX);
+        shared.map_shots.push((now + after, "retry", ms, now));
+        shared.map_shots.sort_by_key(|s| s.0);
+    }
+}
+
+/// The map page frame due now, if any: the newest sampled frame, for the latest shot due (shots due together, as
+/// after a stall, give one frame), or a refresh ([`MAP_REFRESH`]) while the page shows and has been quiet; any frame
+/// taken puts the next refresh off.
+fn map_shot_due(shared: &Mutex<Shared>, now: Instant) -> Option<Event> {
+    let mut shared = lock(shared);
+    let (after, delay_ms, read) = match shared.map_shots.iter().rposition(|s| s.0 <= now) {
+        Some(due) => {
+            let (_, after, delay_ms, read) = shared.map_shots[due];
+            shared.map_shots.drain(..=due);
+            (after, delay_ms, read)
+        }
+        None => {
+            let due = shared.map_refresh.filter(|&at| at <= now)?;
+            let open = shared.map_open.is_some_and(|at| now.duration_since(at) < MAP_IDLE);
+            if !open {
+                shared.map_refresh = None;
+                return None;
+            }
+            let (every, name) = refresh_every(&shared);
+            (name, every.as_millis() as u32, due.checked_sub(every).unwrap_or(due))
+        }
+    };
+    let every = refresh_every(&shared).0;
+    shared.map_refresh = shared.map_refresh.map(|_| now + every);
+    let frame = shared.latest.as_ref()?.0.clone();
+    let taken_ms = u32::try_from(now.duration_since(read).as_millis()).unwrap_or(u32::MAX);
+    Some(Event::MapShot { frame, at: SystemTime::now(), after, delay_ms, taken_ms })
 }
 
 /// How often observe mode keeps a frame: about 25 a second, as the reads'
@@ -1463,6 +1654,13 @@ const BITE_READS: [Duration; 2] = [super::session::BITE_READABLE, Duration::from
 /// Vorax: when to read after the log says the new hand has been dealt or the card animation has started. The tank
 /// monsters keep moving, so the picture may stay unsteady and Watch never judges it steady (plan section 3.3).
 const VORAX_READS: [Duration; 4] = [Duration::from_millis(120), Duration::from_millis(250), Duration::from_millis(600), Duration::from_millis(1000)];
+
+/// When to read after the log tells of a treasure opening: its pick is read whatever the samples show. A treasure in
+/// a row may look like the last pick on the samples (the same template, or the closing in between missed while the
+/// machine is busy), and only a read solves it again; its advice came 0.4 to 0.8 s after the line (all 75 treasures
+/// in a row of 2026-11-06..08), so reads at 0.35, 0.6 and 1 s. A read begun before the line is not this pick's
+/// (`Session::stale_pick`).
+const TREASURE_READS: [Duration; 3] = [Duration::from_millis(350), Duration::from_millis(600), Duration::from_millis(1000)];
 /// Vorax observe mode: this long after a resolve cue (Tool, Gone, Changed) one read is scheduled to save the tank
 /// label strip (plan section 6.3).
 const VORAX_STRIP: Duration = Duration::from_millis(150);
@@ -1537,6 +1735,12 @@ impl Watcher {
             gift_gap_until: None,
             charges: gamelog::Charges::default(),
             log: gamelog::LogStatus::Searching,
+            map_open: None,
+            map_shots: Vec::new(),
+            map_refresh: None,
+            map_watch: false,
+            map_live: true,
+            map_samples: cfg!(feature = "dev-samples"),
         }));
         let log = {
             let (state, tx, notify) = (shared.clone(), tx.clone(), notify.clone());
@@ -1671,6 +1875,26 @@ impl Watcher {
         let mut shared = lock(&self.shared);
         shared.reads_at.push(Instant::now() + after);
         shared.reads_at.sort();
+    }
+
+    /// One more map page frame `after` from now ("retry"), while a map page shows and the affix frames want frames:
+    /// the live frames read a panel again that has not changed (see `affix_live`). Nothing when no page shows.
+    pub fn map_shot_in(&self, after: Duration) {
+        map_shot_in(&self.shared, after, Instant::now());
+    }
+
+    /// Who wants map page frames (the user's decision of 2026-11-09: the map page is captured with the affix frames'
+    /// switch): `live`, the affix frames on (every frame they ask for); `samples`, private builds sampling (the page's
+    /// and the clicks' frames only). Neither: no map page frame at all; the log's map signals still go on (affixes are
+    /// learned from them whatever the switch).
+    pub fn map_frames(&self, live: bool, samples: bool) {
+        map_frames(&self.shared, live, samples, Instant::now());
+    }
+
+    /// Whether the affix frames are up: the map page's frames then come every half second (`watch`), else every
+    /// second (`refresh`). See `Shared::map_watch`.
+    pub fn map_watch(&self, on: bool) {
+        map_watch(&self.shared, on, Instant::now());
     }
 
     /// Tells auto read whether the last read showed anything new, and was off the board; see [`Watch::report`].
@@ -1821,6 +2045,10 @@ fn on_signal(shared: &Mutex<Shared>, signal: Signal) {
             shared.reads_at.extend(DOOR_READS.iter().map(|&after| now + after));
             shared.reads_at.sort();
         }
+        Signal::TreasureOpen => {
+            shared.reads_at.extend(TREASURE_READS.iter().map(|&after| now + after));
+            shared.reads_at.sort();
+        }
         Signal::CardsUp(_, at) => {
             let up = now.checked_sub(gamelog::age(at)).unwrap_or(now);
             shared.reads_at.extend(CARDS_READS.iter().map(|&after| (up + after).max(now)));
@@ -1875,10 +2103,14 @@ fn on_log_signal(signal: Signal, stamp: Option<i64>, state: &Mutex<Shared>, tx: 
                 notify();
             }
         }
-        // The UI scale goes to Vorax only, as a cue: it wakes no read, and as a Tartarus signal it would end a
-        // Vorax mode (the deadlock guard) or drop a paused Vorax game.
+        // The UI scale goes to Vorax as a cue and to the affix frames (they check the scale they measure against
+        // it): it wakes no read, and as a Tartarus signal it would end a Vorax mode (the deadlock guard) or drop a
+        // paused Vorax game.
         Signal::UiScale { micro } => {
             if tx.send(Event::Game(Signal::Vorax(Cue::UiScale { micro }), stamp, SystemTime::now())).is_ok() {
+                notify();
+            }
+            if tx.send(Event::MapLog(signal, stamp, SystemTime::now())).is_ok() {
                 notify();
             }
         }
@@ -1886,6 +2118,20 @@ fn on_log_signal(signal: Signal, stamp: Option<i64>, state: &Mutex<Shared>, tx: 
         // it would end a Vorax mode (the deadlock guard) and count in the run check as a move.
         Signal::RiotBoss(boss) => {
             if tx.send(Event::RiotBoss(boss)).is_ok() {
+                notify();
+            }
+        }
+        // How the riot went: the run log and the run review only, for the same reasons.
+        Signal::RiotEnd(end) => {
+            if tx.send(Event::RiotEnd(end)).is_ok() {
+                notify();
+            }
+        }
+        // The map pages are the affix frames' (and private builds' samples'): they wake no read and go to neither
+        // Tartarus nor Vorax.
+        Signal::MapPage { .. } | Signal::AffixButton { .. } | Signal::MapAffixes(_) => {
+            map_shots(state, signal, Instant::now());
+            if tx.send(Event::MapLog(signal, stamp, SystemTime::now())).is_ok() {
                 notify();
             }
         }
@@ -1982,7 +2228,15 @@ fn watch(title: &str, generation: u64, stopped: &Receiver<()>, tx: &Sender<Event
                 if let Some(event) = read {
                     send(event);
                 }
-                (if lock(shared).watch.resting() { REST } else { SAMPLE }, None)
+                if let Some(shot) = map_shot_due(shared, Instant::now()) {
+                    send(shot);
+                }
+                // map page frames waiting keep the sampling quick
+                let rest = {
+                    let shared = lock(shared);
+                    shared.watch.resting() && shared.map_shots.is_empty()
+                };
+                (if rest { REST } else { SAMPLE }, None)
             }
             Err(e) => {
                 stream = None;
@@ -2101,6 +2355,36 @@ fn fail(what: &'static str) -> impl Fn(windows::core::Error) -> String {
 mod tests {
     use super::*;
 
+    /// The game's window is taken wherever it stands; Discord, browser and Explorer windows named after the game
+    /// never are, and leave the search with nothing; another window whose title matches is still the fallback.
+    #[test]
+    fn the_game_is_found_and_discord_is_never_taken_for_it() {
+        let discord = (1, "#繁中 | Torchlight: Infinite - Discord", Some("Discord.exe"));
+        let game = (2, "Torchlight: Infinite", Some("torchlight_infinite.exe"));
+        let pick = |windows: &[(u32, &str, Option<&str>)]| {
+            let mut s = Search::new("Torchlight");
+            for &(h, title, exe) in windows {
+                if s.see(h, title, exe) {
+                    break;
+                }
+            }
+            (s.pick(), s.skipped)
+        };
+        assert_eq!(pick(&[discord, game]).0, Some(2), "Discord in front of the game");
+        assert_eq!(pick(&[game, discord]).0, Some(2));
+        assert_eq!(pick(&[discord]), (None, true), "only Discord: the game is not running");
+        let edge = (3, "search - Torchlight: Infinite Wiki - Microsoft Edge", Some("msedge.exe"));
+        let folder = (4, "Torchlight", Some("explorer.exe"));
+        assert_eq!(pick(&[edge, folder, discord]), (None, true), "a browser tab or a folder titled exactly so neither");
+        assert_eq!(pick(&[(5, "Notes", Some("notepad.exe"))]), (None, false), "nothing named after the game");
+        // the fallback stays for a window of another program: exact before contains, whatever the order
+        let exact = (6, "TORCHLIGHT", Some("streamer.exe"));
+        let partial = (7, "Torchlight: Infinite (mirror)", Some("mirror.exe"));
+        assert_eq!(pick(&[discord, partial, exact]), (Some(6), true));
+        assert_eq!(pick(&[partial, discord]).0, Some(7));
+        assert_eq!(pick(&[(8, "Torchlight: Infinite", None)]).0, Some(8), "a process that can't be queried is not left out");
+    }
+
     /// A new session always tells of its window; a running one tells again only when the captured client size changes,
     /// once per change.
     #[test]
@@ -2127,6 +2411,27 @@ mod tests {
         assert_eq!(with_tank_from(click, Some(1), || Some(4)), Signal::Vorax(Cue::TankClick { tank: Some(4) }));
     }
 
+    /// A treasure opening schedules reads of its pick ([`TREASURE_READS`]) whatever the samples show: a treasure in a
+    /// row whose closing was missed, or that looks like the last pick, is still read and solved again.
+    #[test]
+    fn a_treasure_opening_schedules_reads() {
+        let state = shared();
+        let before = Instant::now();
+        on_signal(&state, Signal::TreasureOpen);
+        let s = lock(&state);
+        assert_eq!(s.reads_at.len(), TREASURE_READS.len());
+        for (at, after) in s.reads_at.iter().zip(TREASURE_READS) {
+            let d = at.duration_since(before);
+            assert!(d >= after && d < after + Duration::from_millis(200), "{d:?} for {after:?}");
+        }
+        drop(s);
+        // a second treasure in a row adds its own reads, in time order
+        on_signal(&state, Signal::TreasureOpen);
+        let s = lock(&state);
+        assert_eq!(s.reads_at.len(), 2 * TREASURE_READS.len());
+        assert!(s.reads_at.is_sorted());
+    }
+
     fn shared() -> Mutex<Shared> {
         Mutex::new(Shared {
             watch: Watch::default(),
@@ -2135,7 +2440,169 @@ mod tests {
             gift_gap_until: None,
             charges: gamelog::Charges::default(),
             log: gamelog::LogStatus::Searching,
+            map_open: None,
+            map_shots: Vec::new(),
+            map_refresh: None,
+            map_watch: false,
+            map_live: true,
+            map_samples: cfg!(feature = "dev-samples"),
         })
+    }
+
+    /// A map page showing and each click on it schedule frames; a click replaces the last click's
+    /// frames still waiting; a click with no page shown, or long after the page's last line, and a page hidden or
+    /// closed leave none. A frame due goes out once, for the latest shot due, with how late it was taken.
+    #[test]
+    fn map_page_frames_are_scheduled() {
+        use gamelog::{MapPage, PageState};
+        let state = shared();
+        let t0 = Instant::now();
+        let ms = |n: u64| t0 + Duration::from_millis(n);
+        let page = |state| Signal::MapPage { page: MapPage::Normal, state };
+        map_shots(&state, Signal::AffixButton { revert: false }, t0);
+        assert!(lock(&state).map_shots.is_empty());
+        map_shots(&state, page(PageState::Shown), t0);
+        map_shots(&state, Signal::AffixButton { revert: false }, t0);
+        map_shots(&state, Signal::AffixButton { revert: true }, ms(100));
+        let afters: Vec<&str> = lock(&state).map_shots.iter().map(|s| s.1).collect();
+        assert_eq!(afters, ["revert", "open", "revert", "open", "revert"]);
+        lock(&state).latest = Some((Rgba { w: 1, h: 1, data: vec![0; 4] }, Vec::new()));
+        let Some(Event::MapShot { after, delay_ms, taken_ms, .. }) = map_shot_due(&state, ms(700)) else { panic!("a frame is due") };
+        assert_eq!((after, delay_ms, taken_ms), ("open", 600, 700));
+        assert!(map_shot_due(&state, ms(700)).is_none());
+        map_shots(&state, page(PageState::Hidden), ms(800));
+        assert!(lock(&state).map_shots.is_empty());
+        map_shots(&state, Signal::AffixButton { revert: false }, ms(900));
+        assert!(lock(&state).map_shots.is_empty());
+        // shown again and quiet: a refresh frame each MAP_REFRESH, none before
+        map_shots(&state, page(PageState::Shown), ms(1000));
+        lock(&state).map_shots.clear();
+        assert!(map_shot_due(&state, ms(1900)).is_none());
+        let Some(Event::MapShot { after, .. }) = map_shot_due(&state, ms(2000)) else { panic!("a refresh is due") };
+        assert_eq!(after, "refresh");
+        assert!(map_shot_due(&state, ms(2500)).is_none());
+        assert!(map_shot_due(&state, ms(3000)).is_some());
+        // a click after MAP_IDLE with no line between: not taken, and the refreshes stop
+        map_shots(&state, Signal::AffixButton { revert: false }, ms(1000) + MAP_IDLE);
+        assert!(lock(&state).map_shots.is_empty());
+        assert!(map_shot_due(&state, ms(1000) + MAP_IDLE + Duration::from_secs(2)).is_none());
+        assert!(lock(&state).map_refresh.is_none());
+    }
+
+    /// With the affix frames up the page's frames come every half second, named `watch`; without, every second as
+    /// `refresh`; frames going up bring a refresh due later forward.
+    #[test]
+    fn frames_up_take_the_page_twice_a_second() {
+        use gamelog::{MapPage, PageState};
+        let t0 = Instant::now();
+        let ms = |n: u64| t0 + Duration::from_millis(n);
+        let state = shared();
+        lock(&state).latest = Some((Rgba { w: 1, h: 1, data: vec![0; 4] }, Vec::new()));
+        map_shots(&state, Signal::MapPage { page: MapPage::Normal, state: PageState::Shown }, t0);
+        lock(&state).map_shots.clear();
+        assert_eq!(lock(&state).map_refresh, Some(ms(1000)), "no frames up: every second");
+        map_watch(&state, true, ms(100));
+        assert_eq!(lock(&state).map_refresh, Some(ms(600)), "frames up: brought forward");
+        assert!(map_shot_due(&state, ms(590)).is_none());
+        assert!(matches!(map_shot_due(&state, ms(600)), Some(Event::MapShot { after: "watch", delay_ms: 500, .. })));
+        assert_eq!(lock(&state).map_refresh, Some(ms(1100)), "half a second on");
+        assert!(matches!(map_shot_due(&state, ms(1100)), Some(Event::MapShot { after: "watch", .. })));
+        // the frames go: back to every second from the next frame
+        map_watch(&state, false, ms(1200));
+        assert_eq!(lock(&state).map_refresh, Some(ms(1600)), "the one due stays");
+        assert!(matches!(map_shot_due(&state, ms(1600)), Some(Event::MapShot { after: "refresh", delay_ms: 1000, .. })));
+        assert_eq!(lock(&state).map_refresh, Some(ms(2600)));
+        // the page closed: none either way
+        map_watch(&state, true, ms(2700));
+        map_shots(&state, Signal::MapPage { page: MapPage::Normal, state: PageState::Closed }, ms(2800));
+        assert!(lock(&state).map_refresh.is_none() && map_shot_due(&state, ms(3500)).is_none());
+    }
+
+    /// No game window, no DPI. The game's own window is found by its process whatever the title, so with the game
+    /// running (tests run on the player's PC right after playing, 2026-11-10) there is nothing to check.
+    #[test]
+    fn no_window_no_dpi() {
+        if game_pid().is_some() {
+            eprintln!("skipped: the game is running, its window is found by its process");
+            return;
+        }
+        assert_eq!(game_dpi("no window has this title 7f3a9c"), None);
+    }
+
+    /// The map page is captured with the affix frames' switch (the user, 2026-11-09): off and no samples taken, no
+    /// frame at all, though the page is still known to show; off with samples taken, only the page's and the clicks'
+    /// frames (no once-a-second frame, no retry); turned off with frames waiting, the unwanted ones go; on again, the
+    /// next click takes frames as before.
+    #[test]
+    fn map_frames_follow_the_affix_switch() {
+        use gamelog::{MapPage, PageState};
+        let t0 = Instant::now();
+        let ms = |n: u64| t0 + Duration::from_millis(n);
+        let shown = Signal::MapPage { page: MapPage::Normal, state: PageState::Shown };
+        let frame = |state: &Mutex<Shared>| lock(state).latest = Some((Rgba { w: 1, h: 1, data: vec![0; 4] }, Vec::new()));
+        // off, no samples: nothing scheduled, nothing due, no retry
+        let state = shared();
+        frame(&state);
+        map_frames(&state, false, false, t0);
+        map_shots(&state, shown, t0);
+        map_shots(&state, Signal::AffixButton { revert: false }, ms(100));
+        map_shot_in(&state, Duration::from_millis(120), ms(200));
+        assert!(lock(&state).map_shots.is_empty() && lock(&state).map_refresh.is_none());
+        assert!((1..40).all(|i| map_shot_due(&state, ms(i * 100)).is_none()), "no map page frame at all");
+        assert!(lock(&state).map_open.is_some(), "the page is still known to show");
+        // on again with the page showing: the once-a-second frames come back with no click, and go on
+        map_frames(&state, true, false, ms(4000));
+        assert_eq!(lock(&state).map_refresh, Some(ms(5000)));
+        assert!(map_shot_due(&state, ms(4900)).is_none());
+        assert!(matches!(map_shot_due(&state, ms(5000)), Some(Event::MapShot { after: "refresh", .. })));
+        assert!(matches!(map_shot_due(&state, ms(6000)), Some(Event::MapShot { after: "refresh", .. })), "a second later");
+        map_frames(&state, true, false, ms(6100));
+        assert_eq!(lock(&state).map_refresh, Some(ms(7000)), "on staying on: the refresh as it was");
+        // and the next click takes its frames
+        map_shots(&state, Signal::AffixButton { revert: false }, ms(6100));
+        assert_eq!(lock(&state).map_shots.len(), AFFIX_CLICK_SHOTS.len());
+        // off, samples taken: the page's and the clicks' frames only
+        let state = shared();
+        frame(&state);
+        map_frames(&state, false, true, t0);
+        map_shots(&state, shown, t0);
+        map_shots(&state, Signal::AffixButton { revert: true }, ms(100));
+        map_shot_in(&state, Duration::from_millis(120), ms(200));
+        let afters: Vec<&str> = lock(&state).map_shots.iter().map(|s| s.1).collect();
+        assert!(afters.iter().all(|a| *a == "open" || *a == "revert") && !afters.is_empty(), "{afters:?}");
+        assert!(lock(&state).map_refresh.is_none(), "no once-a-second frame");
+        // on, then turned off with a retry and a refresh waiting: they go, the samples' frames stay
+        let state = shared();
+        map_shots(&state, shown, t0);
+        map_shot_in(&state, Duration::from_millis(120), ms(10));
+        map_frames(&state, false, true, ms(20));
+        {
+            let s = lock(&state);
+            assert!(s.map_refresh.is_none() && s.map_shots.iter().all(|s| s.1 == "open") && !s.map_shots.is_empty());
+        }
+        // on again with no map page known: no refresh
+        let state = shared();
+        map_frames(&state, false, false, t0);
+        map_frames(&state, true, false, ms(100));
+        assert!(lock(&state).map_refresh.is_none(), "no page: no refresh");
+    }
+
+    /// A retry frame asked by the live frames goes out after its wait while a page shows; none is taken with no page.
+    #[test]
+    fn retry_frames_while_a_page_shows() {
+        use gamelog::{MapPage, PageState};
+        let state = shared();
+        let t0 = Instant::now();
+        let ms = |n: u64| t0 + Duration::from_millis(n);
+        map_shot_in(&state, Duration::from_millis(250), t0);
+        assert!(lock(&state).map_shots.is_empty(), "no page: no frame");
+        map_shots(&state, Signal::MapPage { page: MapPage::Normal, state: PageState::Shown }, t0);
+        lock(&state).map_shots.clear();
+        lock(&state).latest = Some((Rgba { w: 1, h: 1, data: vec![0; 4] }, Vec::new()));
+        map_shot_in(&state, Duration::from_millis(250), ms(100));
+        assert!(map_shot_due(&state, ms(300)).is_none());
+        let Some(Event::MapShot { after, delay_ms, taken_ms, .. }) = map_shot_due(&state, ms(350)) else { panic!("a retry is due") };
+        assert_eq!((after, delay_ms, taken_ms), ("retry", 250, 250));
     }
 
     /// The tank filled in for a live click is the one sent on to the session (it was dropped until 2026-11-06, and
@@ -2163,7 +2630,8 @@ mod tests {
         assert!(rx.try_recv().is_err());
     }
 
-    /// The UI scale goes on as a Vorax cue only (looked back or live), and wakes no read.
+    /// The UI scale goes on as a Vorax cue (looked back or live) and to the affix frames (they check the scale they
+    /// measure against it), and wakes no read.
     #[test]
     fn the_ui_scale_goes_to_vorax() {
         let (state, (tx, rx)) = (shared(), channel());
@@ -2174,6 +2642,7 @@ mod tests {
                 Ok(Event::Game(Signal::Vorax(Cue::UiScale { micro: 842_409 }), s, _)) => assert_eq!(s, stamp),
                 _ => panic!("a Vorax cue"),
             }
+            assert!(matches!(rx.try_recv(), Ok(Event::MapLog(Signal::UiScale { micro: 842_409 }, s, _)) if s == stamp), "to the affix frames");
         }
         assert!(rx.try_recv().is_err());
         assert!(lock(&state).reads_at.is_empty());

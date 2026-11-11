@@ -159,8 +159,9 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
 }
 
 /// A hidden layered window over the game that never takes focus and lets
-/// clicks through; None when Windows refuses one.
-fn overlay_window() -> Option<HWND> {
+/// clicks through; None when Windows refuses one. The affix frames use it too
+/// (`affix_overlay.rs`).
+pub(crate) fn overlay_window() -> Option<HWND> {
     // SAFETY: plain Win32 calls; the class name is a static string.
     dpi_aware(|| unsafe {
         let instance = GetModuleHandleW(None).ok()?;
@@ -252,7 +253,7 @@ impl Mark {
 /// at (`left`, `top`); false when Windows refuses.
 /// The part of a BGRA bitmap placed at `rect` (left, top, width, height)
 /// inside `clip`, and where that part sits; None when none of it is.
-fn clipped(pixels: &[u8], [left, top, width, height]: [i32; 4], [cl, ct, cw, ch]: [i32; 4]) -> Option<(Vec<u8>, [i32; 4])> {
+pub(crate) fn clipped(pixels: &[u8], [left, top, width, height]: [i32; 4], [cl, ct, cw, ch]: [i32; 4]) -> Option<(Vec<u8>, [i32; 4])> {
     let (x0, y0) = (left.max(cl), top.max(ct));
     let (x1, y1) = ((left + width).min(cl + cw), (top + height).min(ct + ch));
     if x0 >= x1 || y0 >= y1 {
@@ -271,7 +272,7 @@ fn clipped(pixels: &[u8], [left, top, width, height]: [i32; 4], [cl, ct, cw, ch]
     Some((out, rect))
 }
 
-fn update(hwnd: HWND, pixels: &[u8], width: i32, height: i32, left: i32, top: i32) -> bool {
+pub(crate) fn update(hwnd: HWND, pixels: &[u8], width: i32, height: i32, left: i32, top: i32) -> bool {
     let info = dib_info(width, height);
     // SAFETY: the DC and bitmap are made, used and freed here; the bitmap
     // holds width * height * 4 bytes, the length of `pixels`.

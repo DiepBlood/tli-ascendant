@@ -21,7 +21,7 @@
 //!   Activity) capped at 840k, the same goal the solver plays for. Luck = actual - expected + decision loss.
 //! - Labels are built from the name table in the language passed in, so no global language is switched.
 
-use super::settle::{Cause, Outcome, Reach, RunKind, Settled, Step};
+use super::settle::{Outcome, Reach, RunKind, Settled, Step};
 use crate::audit::{Verdict, Why};
 use crate::lang::Lang;
 use crate::vorax::names::{Category, names};
@@ -401,7 +401,8 @@ fn summarize(folder: &str, ds: &[Decision], fin: Option<i64>, approx: bool, ui: 
         (Some(a), Some((e, s))) if s > 0.0 => Some((a - e) / s),
         _ => None,
     };
-    let cause = luck.map(|l| if l.abs() > loss { Cause::Luck } else { Cause::Decisions });
+    // No drift correction for Vorax: |luck| against the loss, as before.
+    let cause = super::settle::cause(loss, luck, None);
     let worst = ds
         .iter()
         .zip(&verdicts)
@@ -426,6 +427,8 @@ fn summarize(folder: &str, ds: &[Decision], fin: Option<i64>, approx: bool, ui: 
         noise,
         luck,
         z,
+        expected_net: None,
+        z_net: None,
         cause,
         worst,
         scored: ds.iter().filter(|d| d.scored.is_some()).count(),
@@ -433,6 +436,7 @@ fn summarize(folder: &str, ds: &[Decision], fin: Option<i64>, approx: bool, ui: 
         rollouts,
         kind: RunKind::Vorax,
         reach,
+        riot: None,
     }
 }
 

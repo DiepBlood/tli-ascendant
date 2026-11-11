@@ -1,6 +1,6 @@
 [package]
 name = "ascendant"
-version = "1.1.0"
+version = "1.2.0"
 edition = "2024"
 description = "Live advisor for the Tartarus prison board in Torchlight: Infinite"
 license = "GPL-3.0-only"
@@ -45,9 +45,10 @@ embed-resource = "3.0"
 
 [features]
 default = ["en-vorax"]
-# Private builds only (`cargo build --release --features dev-samples`): with the game client in English, Vorax observe
-# mode saves whole frames as samples and reads nothing (roadmap item 17). Never on in a public build; the release
-# check of scripts/export-public.ps1 refuses an exe that has it.
+# Private builds only (`cargo build --release --features dev-samples`): Vorax's and the map affixes' samples (with
+# the game client in English, Vorax observe mode saves whole frames and reads nothing, roadmap item 17; the map page's
+# panels are saved in observe mode). Never on in a public build; the release check of scripts/export-public.ps1
+# refuses an exe that has it.
 dev-samples = []
 # The English client reader (src/vorax/read_en.rs and templates_en.rs), on by default since 1.1.0: Vorax reads the
 # English game client too and advises on it. --no-default-features turns it off, leaving the Traditional Chinese

@@ -356,8 +356,27 @@ pub(super) fn family_by_effect(tries: &[Vec<Line>], effect: &str, category: Cate
     let e = norm(effect);
     let shown: Vec<&str> = ARCHETYPES.iter().copied().filter(|a| e.contains(a)).collect();
     let [one] = shown[..] else { return None };
+    // The effect text up to its first digit: the name's second line when the name wraps (`Spinal Solution -` over
+    // `Aemberon`), before the effect itself ("Add 1 group(s)", "Select 1 group(s)").
+    let opening = norm(effect.split(|c: char| c.is_ascii_digit()).next().unwrap_or(""));
     tries.iter().find_map(|t| {
-        let (_, hits) = run_hits(&no_digits(&norm(&joined(t))), candidates(category));
+        let text = joined(t);
+        let dash = text.trim_end().ends_with(" -");
+        let (_, mut hits) = run_hits(&no_digits(&norm(&text)), candidates(category));
+        // A name read with no run of a card's name: the OCR's look-alike letters folded together, and only with the
+        // archetype said before the effect or after a dash. Spinal Solution - Aemberon reads as `SpinatSöfution`,
+        // `Spinal S6fution`, `binatSöfution` (9 times in 6 English games, 2026-11-07/08), 5 to 7 letters of a run.
+        if hits.is_empty() && (dash || opening.contains(one)) {
+            hits = run_hits(&folded(&text), &folded_candidates(category)).1;
+            hits.retain(|&i| names().cards[i].printed_en().contains(" - "));
+        }
+        // A name read up to " -" has an archetype suffix after it: the family's cards without one are not it
+        // (2026-11-07_14-47-35 sample-0042, `Spinal Solution -`: Gray Matter, Hollow and Petrified Spinal Solution held
+        // the run too, and with them in the family check failed before the effect text's lone Aemberon was looked at).
+        // A space before the dash, so a hyphen inside a name read cut (`Targeted Xeno-`) does not count.
+        if dash {
+            hits.retain(|&i| names().cards[i].printed_en().contains(" - "));
+        }
         let parts: Vec<(&str, &str)> = hits.iter().map(|&i| names().cards[i].printed_en().rsplit_once(" - ")).collect::<Option<Vec<_>>>()?;
         if hits.len() < 2 || parts.iter().any(|p| p.0 != parts[0].0) {
             return None;
@@ -368,6 +387,26 @@ pub(super) fn family_by_effect(tries: &[Vec<Line>], effect: &str, category: Cate
             _ => None,
         }
     })
+}
+
+/// `s` with the letters the OCR mistakes for one another folded together: t f i j 1 | as l, ö ó ò 6 0 as o (folded
+/// before [`norm`] and [`no_digits`], so a 6 read for an o is kept). Only for [`family_by_effect`]'s last resort.
+fn folded(s: &str) -> String {
+    let f: String = s
+        .chars()
+        .flat_map(char::to_lowercase)
+        .map(|c| match c {
+            't' | 'f' | 'i' | 'j' | '1' | '|' | 'l' => 'l',
+            'ö' | 'ó' | 'ò' | '6' | '0' | 'o' => 'o',
+            c => c,
+        })
+        .collect();
+    no_digits(&norm(&f))
+}
+
+/// [`candidates`] folded ([`folded`]).
+fn folded_candidates(category: Category) -> Vec<(usize, String)> {
+    names().cards.iter().enumerate().filter(|(_, c)| c.category == category && c.printed_en().is_ascii()).map(|(i, c)| (i, folded(c.printed_en()))).filter(|(_, z)| !z.is_empty()).collect()
 }
 
 /// [`super::kit_ok`]: `Potion Kit (Large)`, `Potion Kit (Small)`, `Rare Potion Kit (Small)`. The size needs `large` or
@@ -891,6 +930,21 @@ mod tests {
         en_of(match_name(t, category, clipped, None, None))
     }
 
+    /// [`folded`]: no two printed names of a category fold to one (folding must not make two cards one), and the
+    /// reads it is for fold onto the name.
+    #[test]
+    fn folded_names_stay_apart() {
+        for category in [Category::Potion, Category::Instrument, Category::Protocol] {
+            let mut f: Vec<String> = folded_candidates(category).into_iter().map(|(_, z)| z).collect();
+            let all = f.len();
+            f.sort();
+            f.dedup();
+            assert_eq!(f.len(), all, "{category:?}");
+        }
+        assert!(folded("Spinal Solution - Aemberon").contains(&folded("SpinatSöfution")));
+        assert!(folded("Spinal Solution - Aemberon").contains(&folded("S6fution")));
+    }
+
     /// Names read whole, a letter off, or cut at either end (the reads of the hand-labelled sample frames): the run
     /// of 8 or more letters in one card name only; a run two cards of one family share gives the one whose
     /// archetype shows, or none.
@@ -1190,6 +1244,14 @@ mod tests {
         assert_eq!(by("Slender-Lirfib Powde", "Add 1 group(s) of"), None);
         assert_eq!(by("Slender-Lirfib Powde", "Pests and Bone Sentries"), None);
         assert_eq!(by("Mutagenic Powder", "Pests"), None, "no family");
+        // A name read up to " -": the Spinal Solutions without a suffix are not it (2026-11-07_14-47-35 sample-0042).
+        assert_eq!(by("Spinal Solution -", "Spinat5mutlon • Aemberon Add 1 group(s) o $ Aemberons and to their V Activit i").as_deref(), Some("Spinal Solution - Aemberon"));
+        assert_eq!(by("Spinal Solution", "Add 1 group(s) of Aemberons"), None, "no dash, no archetype before the effect: Gray Matter and the rest stay in");
+        // Look-alike letters folded, with the archetype said before the effect (the name's second line) or after a dash.
+        assert_eq!(by("SpinatSöfution -", "SpinalSöIUtlon• Aemberon Add 1 group(s) of Aemberons and to their V Activi").as_deref(), Some("Spinal Solution - Aemberon"));
+        assert_eq!(by("Spinal S6fution ron", "Aemberon Add 1 group(s) o $Aemberons and to their V Activit").as_deref(), Some("Spinal Solution - Aemberon"));
+        assert_eq!(by("binatSöfution ron", "Aemberon d 1 group(s) of emberons and +31 their *Activity m").as_deref(), Some("Spinal Solution - Aemberon"));
+        assert_eq!(by("SpinatSöfution", "Select 1 group(s) monsters and +2 their Activity. If they are not Aemberons"), None, "the archetype only inside the effect");
         drop(_en);
         assert_eq!(by("Spinal Solution -A", "Add 1 group(s) of Agitoes"), None, "the Traditional Chinese client");
     }

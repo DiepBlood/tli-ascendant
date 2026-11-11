@@ -12,7 +12,8 @@ pub mod values;
 use crate::engine::data::{Beast, CAGE_FIGHT, LOOT, ObjectiveKind, RAINBOW, Tool, data};
 use crate::engine::devour::{can_devour_now, devour_options, hunt_targets, start_options};
 use crate::engine::rng::rand;
-use crate::engine::rules::door_weights;
+use crate::engine::rules::{door_weights, fewer_dice};
+use std::sync::OnceLock;
 use crate::engine::state::{Cell, Pending, Phase, State};
 use crate::engine::{Action, ChoiceId};
 use chain::replace_odds;
@@ -21,20 +22,52 @@ use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, Hasher};
 use values::fresh_activation;
 
+/// The playouts' version, written in every advice row (`playout`) so the audit can take out the drift fitted for
+/// the playouts that solved it (`audit::Game::drift_at_start`). 1: the rows before the field (up to the 18:41 build
+/// of 2026-11-09); 2: the playouts redesigned that evening (the Blacklist potential, the Hunt walk, TOOL_RANK measured
+/// again, `w_ahead`). Add 1 whenever a change of the strategy moves the expected values, and fit the drift again.
+pub const PLAYOUT_VERSION: u32 = 2;
+
 /// Torture Instruments by Chromatics per run (TOOL_RANK), as the strategy
-/// picks and re-rolls them: measured 2026-10-31 holding each from the start,
-/// 100,000 strategy games each on seed 81 (Trap 8.68 down to Scapegoat's
-/// Guillotine 4.39). The order kept from js/solver.js ranked the Squirming
-/// Iron Box 30th (10th measured) and the Execution Axe 29th (13th); this
-/// order gained +0.24 to +0.25 +- 0.003 Chromatics a run on seeds 91 and 101
-/// (400,000 games each), and one point fewer runs at 2 or fewer.
+/// picks and re-rolls them: measured holding each from the start, 100,000
+/// strategy games each on seed 81. First measured 2026-10-31 (Trap 8.68 down
+/// to Scapegoat's Guillotine 4.39): the order kept from js/solver.js ranked
+/// the Squirming Iron Box 30th (10th measured) and the Execution Axe 29th
+/// (13th), and the measured order gained +0.24 to +0.25 +- 0.003 Chromatics a
+/// run on seeds 91 and 101 (400,000 games each). Measured again 2026-11-09
+/// with the strategy playing the Blacklist's potential (Trap 9.51 down to
+/// Scapegoat's Guillotine 4.94): the Executioner's Blacklist rose from 19th
+/// to 7th (7.90, between the Noose 7.91 and the Claws 7.53), the Tongs passed
+/// the Noose and the Keys the Iron Box; this order gained +0.20 to +0.21
+/// +- 0.005 Chromatics a run on seeds 41 and 51 (100,000 games each), +0.05
+/// holding the Blacklist and +0.01 the Crown from the start, none with the Trap.
 pub const TOOL_RANK: [Tool; 31] = [
+    Tool::Trap, Tool::Maul, Tool::Crown, Tool::Coin, Tool::Tongs, Tool::Rope, Tool::Blacklist, Tool::Claws,
+    Tool::Revenge, Tool::Keys, Tool::Ironbox, Tool::Longchain, Tool::Skewer, Tool::Axe, Tool::Saw, Tool::Collar,
+    Tool::Hook, Tool::Beastcage, Tool::Maiden, Tool::Muzzle, Tool::Shortchain, Tool::Guillotine, Tool::Fire,
+    Tool::Chains, Tool::Whip, Tool::Dogtag, Tool::Stake, Tool::Scales, Tool::Pestle, Tool::Forgedkey,
+    Tool::Scapegoat,
+];
+
+/// TOOL_RANK in a Cage Fight: the order of 2026-10-31. There the strategy holds the Blacklist without its potential
+/// (`Black::of`), and the Blacklist at 7th lost 0.039 +- 0.010 Chromatics a run against this order (6,056 Cage Fights
+/// of 200,000 strategy games, seed 61), while the other themes gained 0.10 to 0.24.
+pub const CAGE_FIGHT_TOOL_RANK: [Tool; 31] = [
     Tool::Trap, Tool::Maul, Tool::Crown, Tool::Coin, Tool::Rope, Tool::Tongs, Tool::Skewer, Tool::Claws,
     Tool::Revenge, Tool::Ironbox, Tool::Longchain, Tool::Keys, Tool::Axe, Tool::Hook, Tool::Saw, Tool::Collar,
     Tool::Maiden, Tool::Muzzle, Tool::Blacklist, Tool::Beastcage, Tool::Chains, Tool::Guillotine, Tool::Fire,
     Tool::Whip, Tool::Shortchain, Tool::Stake, Tool::Dogtag, Tool::Scales, Tool::Pestle, Tool::Forgedkey,
     Tool::Scapegoat,
 ];
+
+/// The instrument order the strategy picks by on `st`: [`TOOL_RANK`], or [`CAGE_FIGHT_TOOL_RANK`] in a Cage Fight.
+/// A theme not read yet (`st.theme` None) picks by [`TOOL_RANK`]. The app reads the theme from the lobby's scroll
+/// before the run, so the opening pick of a Cage Fight usually follows the Cage Fight order; when the scroll was missed
+/// (Ascendant opened mid-run), the theme waits for the board's charm (`app::session`, THEME_ICON_READS reads), and
+/// until then a Cage Fight's picks follow [`TOOL_RANK`].
+pub fn tool_rank(st: &State) -> &'static [Tool; 31] {
+    if st.theme == Some(CAGE_FIGHT) { &CAGE_FIGHT_TOOL_RANK } else { &TOOL_RANK }
+}
 
 /// The top tier (Rainbow) as an index.
 const TOP: usize = RAINBOW as usize;
@@ -67,6 +100,34 @@ pub struct Params {
     /// The Room's landing weight factor under Tyranny, whose extra Instigates
     /// place markers the Bestow gain does not count.
     pub room_tyranny: f64,
+    /// The Executioner's Blacklist's later firings as a potential ([`Black`]): a landing that opens doors earns the
+    /// potential's rise, a bite that reseals the meal's cell pays its fall, times `w_black_seal`. 0 prices neither.
+    pub w_black: f64,
+    /// The reseal side of [`Black`] as a factor on `w_black`. The potential prices a firing by the tiers of the
+    /// inmates on the board now, and the firings come later, on rarer inmates: held from the start, 100,000 strategy
+    /// games a seed (2026-11-09) gained +0.40 Chromatics a run with the two sides equal, +0.63 at 2, +0.75 at 4,
+    /// +0.80 at 8 and +0.81 at 12, with runs at 2 or fewer Chromatics down 1.7 points at 8; the door side alone
+    /// gained +0.08 at 1 and lost at 2.
+    pub w_black_seal: f64,
+    /// A patrol landing on a Lion that could mark prey with the Blood-Stained Trap, by what the best mark is worth
+    /// over the landing's worth as a meal-taker. Held from the start, 100,000 strategy games a seed (2026-11-09)
+    /// gained +0.29 Chromatics a run at 0.25, +0.33 at 2, +0.34 at 3 and no more above. 0 prices no Hunt on a patrol.
+    pub w_hunt_walk: f64,
+    /// A Replace in the warden's cell while the Trap is held and today's Hunt unused may bring a Lion that marks prey
+    /// today: the odds of a Lion times, by the new inmate's tier odds, the best mark's worth (`hunt_after_swap`).
+    /// Held from the start, 100,000 strategy games a seed (2026-11-09) gained +0.05 Chromatics a run at 0.5 to 4
+    /// (seed 21), +0.04 and +0.05 at 1 on seeds 41 and 51, and nothing without the Trap. 0 prices no Hunt on a Replace.
+    pub w_hunt_swap: f64,
+    /// A patrol landing earns this share of what tomorrow's destinations, the 1 to 6 cells past the landing, are
+    /// worth to land on (`scores::ahead_value`: half the best of them, half their mean): a door its fresh inmate and
+    /// the Blacklist potential's rise, a marker its incident score, a Lion its Hunt with the Trap, the Room a Bestow.
+    /// The strategy priced only the landing itself, and the advice's playouts overruled 38% of its patrols (200
+    /// games, 2026-11-09). 100,000 strategy games a seed: +0.15 Chromatics a run at 0.02, +0.18 at 0.05, +0.19 at
+    /// 0.075, +0.18 at 0.1, +0.16 at 0.15, +0.05 at 0.5 and nothing at 1 (seed 21); at 0.075, +0.18 to +0.20 on seeds
+    /// 31, 41 and 51 with runs at 2 or fewer Chromatics down 1.0 points, +0.02 to +0.03 holding the Trap from the
+    /// start, +0.05 the Blacklist, +0.07 the Crown and the Maul; every theme gained (Cage Fight +0.07). 0 prices
+    /// nothing past the landing.
+    pub w_ahead: f64,
 }
 
 impl Params {
@@ -89,6 +150,11 @@ impl Params {
             "w_incident" => &mut self.w_incident,
             "reroll_rank" => &mut self.reroll_rank,
             "room_tyranny" => &mut self.room_tyranny,
+            "w_black" => &mut self.w_black,
+            "w_black_seal" => &mut self.w_black_seal,
+            "w_hunt_walk" => &mut self.w_hunt_walk,
+            "w_hunt_swap" => &mut self.w_hunt_swap,
+            "w_ahead" => &mut self.w_ahead,
             _ => return None,
         })
     }
@@ -98,10 +164,10 @@ impl Params {
 pub static TUNED: Params = Params {
     tier_base: 2.75,
     rainbow_mult: 1.0,
-    // With TOOL_RANK as measured, doors weigh more and steps less: 1.0 and
-    // 0.25 over 0.5 and 0.75 gained +0.019 to +0.025 +- 0.002 Chromatics a run
-    // (seeds 161 and 171, 400,000 games each) and no more runs at 2 or fewer;
-    // 1.5 gained a little more with more such runs (2026-10-31).
+    // With TOOL_RANK as measured on 2026-10-31, doors weigh more and steps
+    // less: 1.0 and 0.25 over 0.5 and 0.75 gained +0.019 to +0.025 +- 0.002
+    // Chromatics a run (seeds 161 and 171, 400,000 games each) and no more
+    // runs at 2 or fewer; 1.5 gained a little more with more such runs.
     w_open: 1.0,
     w_now: 1.5,
     w_walk: 0.5,
@@ -121,11 +187,27 @@ pub static TUNED: Params = Params {
     // 0.10 to 0.12 points fewer runs at 2 or fewer; 256 gained less, 1024 and
     // 4096 no more (2026-10-31).
     w_incident: 512.0,
-    // With TOOL_RANK as measured: +0.031 to +0.035 Chromatics a run with one
-    // re-roll over 8 (seeds 91 and 101, 200,000 games each), and 0.5 to 0.7
-    // points fewer runs at 2 or fewer; 12 and up gained less.
-    reroll_rank: 11.0,
+    // With TOOL_RANK as measured on 2026-10-31: +0.031 to +0.035 Chromatics a
+    // run with one re-roll at 11 over 8 (seeds 91 and 101, 200,000 games
+    // each), and 0.5 to 0.7 points fewer runs at 2 or fewer; 12 and up gained
+    // less. Re-scanned 2026-11-09 with the order measured that day (the
+    // Blacklist and the Keys now among the first 11, the Skewer and the Iron
+    // Box no longer): +0.023 +- 0.004 Chromatics a run at 9 over 11 on seed 21,
+    // +0.017 and +0.020 on seeds 31 and 41 (100,000 games each, one re-roll); 10 gained +0.004, 8 +0.006,
+    // 12 and up lost.
+    reroll_rank: 9.0,
     room_tyranny: 4.0,
+    // The Blacklist potential and the Hunt walk (2026-11-09, lab playout-redesign): on seeds not used to choose
+    // them, 100,000 strategy games each, holding the Blacklist from the start gained +0.82 Chromatics a run (runs at
+    // 2 or fewer down 1.7 points), the Trap +0.33, nothing +0.09, the Crown, Maul, Coin and Casket +0.006 to +0.06.
+    // With the strategy playing the Blacklist this way, an instrument pick's playouts value it enough on their own:
+    // on 87 picks of 300 games, ranking without the former correction changed 31 picks for +1.58 +- 0.16 a changed
+    // pick (1 worse), against 33 for +1.40 +- 0.18 (4 worse) with the correction, played to the end the same way.
+    w_black: 1.0,
+    w_black_seal: 8.0,
+    w_hunt_walk: 3.0,
+    w_hunt_swap: 1.0,
+    w_ahead: 0.075,
 };
 
 /// mulberry32 (rng32), for the solver's own dice (never the game's).
@@ -275,6 +357,8 @@ pub struct Ctx<'a> {
     pub last_day: bool,
     /// The run's objective while it is open and `w_goal` is not 0.
     pub goal: Option<Goal>,
+    /// The Executioner's Blacklist potential while it is held and `w_black` is not 0.
+    pub black: Option<Black>,
     pub memo: Memo,
     /// What `memo`'s values depend on, see [`MemoSig`].
     memo_sig: MemoSig,
@@ -371,6 +455,16 @@ pub fn held_memos() -> (usize, usize) {
     (MEMO_HELD.load(std::sync::atomic::Ordering::Relaxed), MEMO_HELD_BYTES.load(std::sync::atomic::Ordering::Relaxed))
 }
 
+/// Lets every playout thread drop the memos it keeps ([`SPARE_MEMOS`]), and this thread too: called when a run is
+/// over, so the program does not hold them (about 150 to 300 MB, 2026-11-08) through the time in town. The next
+/// run's first solves build them again (the values are the same, only cached: a solve gives the same result). Blocks
+/// until every thread of rayon's pool has run it, so call it off the window's thread.
+pub fn release_memos() {
+    let forget = || SPARE_MEMOS.with(|spare| spare.borrow_mut().0.drain(..).for_each(|(_, memo)| note_taken(&memo)));
+    rayon::broadcast(|_| forget());
+    forget();
+}
+
 /// Drops this thread's kept memos (see [`MEMO_SLOTS`]).
 #[cfg(test)]
 pub fn forget_chain_memos() {
@@ -433,6 +527,93 @@ impl Goal {
     }
 }
 
+/// The Executioner's Blacklist as a potential. With `sealed` doors and `landings` patrol landings still to come, the
+/// table holds the expected number of firings when every landing on a door opens it: a day has a door among its
+/// destinations with odds 1 - (1 - sealed/doors)^dice, and the instrument fires once fewer than its threshold stay
+/// sealed after the opening. Reseals are not in the table: a bite seals the meal's cell again
+/// (`Params::reusable_cells`), and pays the potential's fall itself. One firing is worth `gain`, the instrument's
+/// count of inmates times the mean worth of its tiers to the open inmates now. A move's score takes the potential
+/// after it minus before, so a door opened before the threshold earns its share of the later firings, and the
+/// strategy stops eating its way back above the threshold: against the advice's playouts (200 games, 2026-11-09),
+/// the strategy holding the Blacklist fired it 2.9 times a run to the advice's 8.5, ate 16 inmates to its 14, and
+/// opened as many doors; a third of its runs never fired it. With the potential it fires 5.6 times and 97% of runs
+/// fire it, for +0.6 Chromatics a run.
+pub struct Black {
+    table: &'static [[f64; LANDINGS]; DOORS],
+    /// Chromatics-worth of one firing, in the strategy's tier values.
+    pub gain: f64,
+    pub w: f64,
+}
+
+/// Rows and columns of [`Black`]'s table: doors sealed (0 to 15) and landings to come (0 to 31).
+const DOORS: usize = 16;
+const LANDINGS: usize = 32;
+
+impl Black {
+    fn of(st: &State, p: &Params, v: &[f64; 6], r: f64) -> Option<Black> {
+        // Not in a Cage Fight: there the chains are what the run lives on, and holding back the bites for the
+        // Blacklist lost 0.28 to 0.73 Chromatics a run at a reseal weight of 2 to 8 (+0.01 at 1), against +0.5 to
+        // +1.0 in a plain run (100,000 strategy games, 2026-11-09).
+        if p.w_black == 0.0 || !st.has(Tool::Blacklist) || st.theme == Some(CAGE_FIGHT) {
+            return None;
+        }
+        let def = data().tool(Tool::Blacklist);
+        let (count, by) = (def.count.unwrap_or(0), def.tiers.unwrap_or(0));
+        let top = st.top_tier();
+        let at = |t: i32| if t as usize >= TOP { r } else { v[t as usize] };
+        let rise = |t: i32| at((t + by).clamp(0, top)) - at(t);
+        // Summed in place: this runs at every decision of every playout.
+        let (mut sum, mut n) = (0.0, 0usize);
+        for i in st.cells.iter().filter(|c| c.on_board()).filter_map(|c| c.inmate) {
+            sum += rise(i.tier);
+            n += 1;
+        }
+        let mean = if n == 0 { rise(0) } else { sum / n as f64 };
+        let dice = (st.params.destinations as i32 - fewer_dice(st)).clamp(1, 6) as usize;
+        Some(Black { table: black_table(dice), gain: count as f64 * mean, w: p.w_black })
+    }
+
+    /// The potential with `sealed` doors and `landings` landings to come.
+    pub fn potential(&self, sealed: usize, landings: usize) -> f64 {
+        self.w * self.gain * self.fires(sealed, landings)
+    }
+
+    /// The expected firings with `sealed` doors and `landings` landings to come.
+    pub fn fires(&self, sealed: usize, landings: usize) -> f64 {
+        self.table[sealed.min(DOORS - 1)][landings.min(LANDINGS - 1)]
+    }
+}
+
+/// [`Black`]'s expected firings by dice count (0 to 6), then by (sealed, landings).
+fn black_table(dice: usize) -> &'static [[f64; LANDINGS]; DOORS] {
+    static TABLES: OnceLock<Vec<[[f64; LANDINGS]; DOORS]>> = OnceLock::new();
+    let tables = TABLES.get_or_init(|| {
+        let d = data();
+        let doors = (d.cell_count - 1) as f64;
+        let threshold = d.tool(Tool::Blacklist).max_sealed.unwrap_or(0);
+        (0..=6usize)
+            .map(|k| {
+                let mut t = [[0.0; LANDINGS]; DOORS];
+                for landings in 1..LANDINGS {
+                    for s in 1..DOORS {
+                        let q = 1.0 - (1.0 - (s as f64 / doors).min(1.0)).powi(k as i32);
+                        let fire = if s - 1 < threshold { 1.0 } else { 0.0 };
+                        t[s][landings] = q * (fire + t[s - 1][landings - 1]) + (1.0 - q) * t[s][landings - 1];
+                    }
+                }
+                t
+            })
+            .collect()
+    });
+    &tables[dice.min(6)]
+}
+
+/// Patrol landings still to come in the run, today's included while it is not yet made.
+pub fn landings_left(st: &State) -> usize {
+    let left = st.max_days.saturating_sub(st.day) as usize;
+    if st.phase == Phase::Patrol { left + 1 } else { left }
+}
+
 /// The strategy's tier values `v` and vaulted Rainbow worth `r` on `st`, and
 /// whether it is the run's last day, where every tier below Chromatic is worth
 /// only its Riot loot (`LOOT`) in vaulted Chromatics.
@@ -491,6 +672,7 @@ pub fn context<'a>(st: &'a State, p: &'a Params) -> Ctx<'a> {
         side_value,
         last_day,
         goal: Goal::of(st, p),
+        black: Black::of(st, p, &v, r),
         memo: Memo::default(),
         memo_sig: MemoSig { worth: [0; 7], cage: 0, extra: [0; 8], food: [0; 12], flags: 0 },
     };
@@ -610,11 +792,12 @@ pub fn decide(st: &State, p: &Params, roll: &mut Rng32) -> Option<Action> {
             // The Hunt's target pick: the prey mark worth the most.
             Pending::Prey { options } => best_hunt(&ctx, options).map(|(n, _)| Action::Choose { id: ChoiceId::Cell(n) }),
             Pending::Tool { options, .. } => {
-                let best = TOOL_RANK.iter().position(|t| options.contains(t));
-                if st.rerolls > 0 && best.unwrap_or(TOOL_RANK.len()) as f64 >= p.reroll_rank {
+                let rank = tool_rank(st);
+                let best = rank.iter().position(|t| options.contains(t));
+                if st.rerolls > 0 && best.unwrap_or(rank.len()) as f64 >= p.reroll_rank {
                     return Some(Action::Reroll);
                 }
-                name(best.map_or(options[0], |i| TOOL_RANK[i]).key())
+                name(best.map_or(options[0], |i| rank[i]).key())
             }
         };
     }

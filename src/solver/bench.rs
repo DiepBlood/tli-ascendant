@@ -234,6 +234,70 @@ mod tests {
         }
     }
 
+    /// Memos released between runs ([`crate::solver::release_memos`]) only cost their rebuilding: a game played
+    /// with the advice after the release goes exactly as before it.
+    #[test]
+    fn released_memos_change_no_advice() {
+        let before = play(3, 1, 40);
+        crate::solver::release_memos();
+        assert_eq!(play(3, 1, 40), before);
+        crate::solver::release_memos();
+        crate::solver::release_memos();
+        assert_eq!(play(3, 1, 40), before, "released twice in a row");
+    }
+
+    /// The cost of releasing the memos between runs (ignored: a measurement). Runs played back to back: the first
+    /// decisions of a run (`FIRST` steps of each game, 1600 rounds on 19 threads as live) timed once with the memos
+    /// the run before left, once right after [`crate::solver::release_memos`]. Prints the medians and the mean.
+    #[test]
+    #[ignore]
+    fn released_memos_first_decisions_time() {
+        const FIRST: u32 = 5;
+        let threads = std::thread::available_parallelism().map_or(8, |n| n.get()).saturating_sub(1).max(1);
+        // the first FIRST decision states of game k
+        let states = |k: u32| -> Vec<State> {
+            let (mut st, mut rng) = start(1, k, &[]);
+            let mut out = Vec::new();
+            for _ in 0..FIRST {
+                let Some(action) = decide(&st, &TUNED, &mut rng) else { break };
+                out.push(st.clone());
+                if !apply(&mut st, &action).is_ok() {
+                    break;
+                }
+            }
+            out
+        };
+        let solve = |st: &State| {
+            let t = std::time::Instant::now();
+            Rollouts::new(st, 7, &TUNED).run_on(1600, threads);
+            t.elapsed().as_secs_f64() * 1000.0
+        };
+        let (mut warm, mut cold) = (Vec::new(), Vec::new());
+        for k in 0..12 {
+            // a whole run before: its decisions leave their memos
+            for st in states(100 + k).iter().chain(states(200 + k).iter()) {
+                solve(st);
+            }
+            let next = states(k);
+            let w: Vec<f64> = next.iter().map(solve).collect();
+            for st in states(100 + k).iter().chain(states(200 + k).iter()) {
+                solve(st);
+            }
+            crate::solver::release_memos();
+            let c: Vec<f64> = next.iter().map(solve).collect();
+            println!("game {k}: warm {w:.0?} ms, after release {c:.0?} ms");
+            warm.extend(w);
+            cold.extend(c);
+        }
+        let median = |v: &mut Vec<f64>| {
+            v.sort_by(f64::total_cmp);
+            v[v.len() / 2]
+        };
+        let mean = |v: &[f64]| v.iter().sum::<f64>() / v.len() as f64;
+        let (mw, mc) = (mean(&warm), mean(&cold));
+        println!("decisions {}: warm median {:.1} mean {mw:.1} ms; after release median {:.1} mean {mc:.1} ms", warm.len(), median(&mut warm), median(&mut cold));
+    }
+
     #[test]
     fn changed_weights_change_the_strategy_runs() {
         let mut p = TUNED.clone();

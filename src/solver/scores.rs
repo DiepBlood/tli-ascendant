@@ -3,9 +3,9 @@
 
 use super::chain::{best_meal, coin_of_fate, devour_delta, replace_odds};
 use super::values::{activation, execution_value, fresh_value, stair_delta, swap_value};
-use super::{Comp, Ctx, Dist, Params, Rng32, TOP, beasts, composition, dist_worth, door_dist, seen_door, tier_values, worth};
+use super::{Comp, Ctx, Dist, Params, Rng32, TOP, beasts, composition, dist_worth, door_dist, landings_left, seen_door, tier_values, worth};
 use crate::engine::data::{Beast, Card, ObjectiveKind, RAINBOW, TYRANNY, Tool, data};
-use crate::engine::devour::{Bite, eater_mask, sure_gain};
+use crate::engine::devour::{Bite, devour_options, eater_mask, eating, sure_gain};
 use crate::engine::incidents::{CHAIN_REACTION, EXECUTION_EFFICIENCY, SEWER_RATWAY};
 use crate::engine::rules::{clockwise_path, fitting_incidents, land, marker_seen, steps_between};
 use crate::engine::state::{Cell, Inmate, Pending, State};
@@ -237,7 +237,18 @@ pub fn patrol_scores(ctx: &mut Ctx, cells: &[usize]) -> Vec<(usize, f64)> {
                 score -= ctx.v[st.params.nest_tier as usize];
             }
         } else if c.inmate.is_some() {
-            score += p.w_walk * known(ctx, c);
+            let walk = p.w_walk * known(ctx, c);
+            score += walk;
+            // Blood-Stained Trap: a Lion here could mark prey today, if that is worth more than the landing is worth
+            // as a meal-taker (`Params::w_hunt_walk`).
+            if p.w_hunt_walk != 0.0
+                && st.has(Tool::Trap)
+                && st.used.hunt == 0
+                && st.day < st.max_days
+                && let Some(lion) = c.inmate.filter(|i| i.beast == Beast::Lion && st.link_of(i.id).is_none())
+            {
+                score += p.w_hunt_walk * (hunt_walk_gain(ctx, n, &lion) - walk).max(0.0);
+            }
         }
         // Iron Tongs of Lust: a Replace left for the Tusk cell's inmate.
         if swap_left && c.ivory && c.on_board() {
@@ -248,6 +259,18 @@ pub fn patrol_scores(ctx: &mut Ctx, cells: &[usize]) -> Vec<(usize, f64)> {
             let opened = (c.sealed && !st.chain)
                 .then(|| door_dist(st, Some(c), true).0);
             score += held_terms(ctx, h, n, steps, opened.as_ref(), left, left_worth);
+        }
+        // What tomorrow's destinations past this landing hold (`Params::w_ahead`).
+        if p.w_ahead != 0.0 && !st.chain && st.day < st.max_days {
+            score += p.w_ahead * ahead_value(ctx, n, &board);
+        }
+        // Executioner's Blacklist: the potential after the doors this landing opens (`Black`).
+        if let Some(b) = &ctx.black {
+            let opens = if st.chain { clockwise_path(st, n).iter().filter(|&&k| st.cells[k].sealed).count() } else { usize::from(c.sealed) };
+            if opens > 0 {
+                let (sealed, left) = (st.sealed_count(), landings_left(st).saturating_sub(1));
+                score += b.potential(sealed.saturating_sub(opens), left) - b.potential(sealed, left);
+            }
         }
         out.push((n, score));
     }
@@ -411,6 +434,67 @@ fn held_terms(ctx: &Ctx, h: &Held, n: usize, steps: usize, opened: Option<&Dist>
     gain
 }
 
+/// The best prey mark a Lion `lion` standing in open cell `n` could make today, as `link_value` prices it: both rise
+/// a tier on each of the mornings left, up to the mark's rounds.
+fn hunt_walk_gain(ctx: &Ctx, n: usize, lion: &Inmate) -> f64 {
+    let st = ctx.st;
+    devour_options(st, n)
+        .into_iter()
+        .filter(|o| !o.scratch)
+        .filter_map(|o| st.cells[o.cell].inmate.filter(|i| st.link_of(i.id).is_none()))
+        .map(|prey| climb(ctx, lion.tier) + climb(ctx, prey.tier))
+        .fold(0.0, f64::max)
+}
+
+/// What the cells 1 to 6 past a landing on `n` are worth to land on tomorrow (`Params::w_ahead`): a sealed door its
+/// fresh inmate and the Blacklist potential's rise, a marker its incident score, an open unmarked Lion its best Hunt
+/// with the Trap, the Interrogation Room a Bestow's mean rise; half the best of the six, half their mean, as three of
+/// the six are offered.
+fn ahead_value(ctx: &Ctx, n: usize, board: &Comp) -> f64 {
+    let st = ctx.st;
+    let p = ctx.p;
+    let d = data();
+    let cells = d.cell_count;
+    let (sealed, left) = (st.sealed_count(), landings_left(st).saturating_sub(1));
+    let mut values = [0.0f64; 6];
+    for (k, v) in values.iter_mut().enumerate() {
+        let m = (n + k + 1) % cells;
+        let c = &st.cells[m];
+        let mut value = 0.0;
+        if c.event.is_some() {
+            value += incident_score(ctx, c, board);
+        }
+        if m == d.room {
+            let (mut sum, mut count) = (0.0, 0usize);
+            for i in st.cells.iter().filter(|c| c.on_board()).filter_map(|c| c.inmate).filter(|i| i.tier < RAINBOW) {
+                sum += rise_worth(ctx, i.tier as usize, 1);
+                count += 1;
+            }
+            if count > 0 {
+                value += p.w_event * sum / count as f64;
+            }
+        } else if c.sealed {
+            value += p.w_open * ctx.open_value;
+            if let Some(b) = &ctx.black
+                && sealed > 0
+            {
+                value += b.potential(sealed - 1, left) - b.potential(sealed, left);
+            }
+        } else if let Some(i) = c.inmate
+            && i.beast == Beast::Lion
+            && p.w_hunt_walk != 0.0
+            && st.has(Tool::Trap)
+            && st.link_of(i.id).is_none()
+        {
+            value += p.w_hunt_walk * hunt_walk_gain(ctx, m, &i);
+        }
+        *v = value;
+    }
+    let best = values.iter().cloned().fold(0.0, f64::max);
+    let mean = values.iter().sum::<f64>() / 6.0;
+    0.5 * best + 0.5 * mean
+}
+
 /// linkValue: what a prey mark still promises; both inmates rise a tier each morning.
 pub fn link_value(ctx: &Ctx, lion: u32, prey: u32, rounds: i32) -> f64 {
     // Count only the mornings left in this run: the prey marked on the last day will not rise again (a Hunt ends the
@@ -491,11 +575,54 @@ fn tusk_gain(ctx: &Ctx) -> f64 {
     (st.params.ivory_count as usize).min(board.len()) as f64 * lift
 }
 
-/// huntGain: what a Hunt on the target in `cell` adds, the value of its prey mark.
+/// huntGain: what a Hunt on the target in `cell` adds, the value of its prey mark. A Lion already marked rises once a
+/// morning however many marks it holds (engine prey_rise), so a second mark earns only its prey's climb.
 fn hunt_gain(ctx: &Ctx, cell: usize) -> f64 {
     let st = ctx.st;
     let (lion, prey) = (st.cells[st.position].inmate.expect("lion"), st.cells[cell].inmate.expect("prey"));
-    link_value(ctx, lion.id, prey.id, st.params.prey_rounds as i32)
+    let value = link_value(ctx, lion.id, prey.id, st.params.prey_rounds as i32);
+    if st.link_of(lion.id).is_none() {
+        return value;
+    }
+    value - climb(ctx, lion.tier)
+}
+
+/// What an inmate of tier `t` gains from a prey mark: a tier on each of the mornings left, up to the mark's rounds.
+fn climb(ctx: &Ctx, t: i32) -> f64 {
+    let st = ctx.st;
+    let rounds = (st.params.prey_rounds as i32).min(st.max_days.saturating_sub(st.day) as i32);
+    worth(ctx, TOP.min((t + rounds) as usize)) - ctx.v[t as usize]
+}
+
+/// The worth of the best prey mark a Lion of tier `t` standing in cell `at` could make now, the climb of both, over
+/// the unmarked inmates of tier `t` on the board it could eat (`can_eat`); 0 when there is none or no morning is left.
+fn mark_worth(ctx: &Ctx, t: i32, at: usize) -> f64 {
+    let st = ctx.st;
+    let lion = Inmate { id: u32::MAX, beast: Beast::Lion, tier: t };
+    let eats = eating(st);
+    let any = st.cells.iter().any(|c| {
+        c.n != at && c.on_board() && c.inmate.is_some_and(|i| i.tier == t && st.link_of(i.id).is_none() && eats(&lion, Some(&i)))
+    });
+    if any { 2.0 * climb(ctx, t) } else { 0.0 }
+}
+
+/// What a Replace of `old` in the warden's cell adds for the Hunt it may open (`Params::w_hunt_swap`): the odds the
+/// new inmate is a Lion (one of the other three beasts, `Params::replace_weights`; none with the Iron Pestle), by the
+/// odds `dist` of each tier, times `mark_worth`. 0 without the Trap, with today's Hunt made, on the last day, or when
+/// the warden's inmate is a Lion already.
+fn hunt_after_swap(ctx: &Ctx, old: &Inmate, dist: &Dist) -> f64 {
+    let st = ctx.st;
+    if !st.has(Tool::Trap) || st.used.hunt != 0 || st.day >= st.max_days || old.beast == Beast::Lion || st.has(Tool::Pestle) {
+        return 0.0;
+    }
+    let w = st.params.replace_weights();
+    let total: f64 = (0..4).filter(|&b| b != old.beast.index()).map(|b| f64::from(w[b])).sum();
+    if total == 0.0 {
+        return 0.0;
+    }
+    let lion = f64::from(w[Beast::Lion.index()]) / total;
+    let sum: f64 = dist.iter().enumerate().take(TOP).filter(|&(_, &p)| p > 0.0).map(|(t, &p)| p * mark_worth(ctx, t as i32, st.position)).sum();
+    lion * sum
 }
 
 /// bestHunt: the target among `options` whose prey mark is worth the most, with its gain.
@@ -520,6 +647,15 @@ pub fn devour_scores(ctx: &mut Ctx, options: Vec<Bite>) -> Vec<(usize, f64)> {
     let mut ring = chains_ring(st);
     let chains_before = chains_loss(ctx, &ring);
     let block = if ring.is_empty() { 0 } else { st.board_count() };
+    // Executioner's Blacklist: a meal's cell seals again (`Params::reusable_cells`), one more door before the
+    // instrument fires, or one firing fewer (`Black`, `Params::w_black_seal`).
+    let reseal = match &ctx.black {
+        Some(b) if st.params.reusable_cells => {
+            let (sealed, left) = (st.sealed_count(), landings_left(st));
+            ctx.p.w_black_seal * (b.potential(sealed + 1, left) - b.potential(sealed, left))
+        }
+        _ => 0.0,
+    };
     let mut out: Vec<(usize, f64)> = options
         .into_iter()
         .map(|o| {
@@ -545,6 +681,9 @@ pub fn devour_scores(ctx: &mut Ctx, options: Vec<Bite>) -> Vec<(usize, f64)> {
             let stair_loss = if o.scratch { 0.0 } else { stair_delta(ctx, &mut comp, meal.tier as usize, meal.beast.index(), -1) };
             let delta = devour_delta(ctx, tier, beast, (meal.tier as usize, meal.beast.index()), o.scratch, &mut comp, crowd);
             let mut score = delta - loss + stair_loss;
+            if !o.scratch {
+                score += reseal;
+            }
             // Objective progress: a Consume, or the eater's sure landing reaching the rarity.
             if let Some(goal) = &ctx.goal {
                 let gain = match goal.kind {
@@ -576,6 +715,10 @@ pub fn swap_gain_here(ctx: &Ctx) -> f64 {
     let mut gain = swap_value(ctx, inmate.tier as usize, &comp, crowd - 1)
         - link_loss(ctx, Some(inmate), true)
         - coin_loss(ctx, &composition(st, None).0, &[inmate]);
+    // Blood-Stained Trap: the Hunt a Replace may open.
+    if ctx.p.w_hunt_swap != 0.0 {
+        gain += ctx.p.w_hunt_swap * hunt_after_swap(ctx, &inmate, &replace_odds(ctx, inmate.tier as usize, &comp, crowd - 1).0);
+    }
     // Gaoler's Execution Axe: a swap that raises the rarity, counting the
     // Stake's and the Maiden's rises, opens random sealed cells.
     if st.has(Tool::Axe) {
@@ -671,7 +814,7 @@ mod tests {
     use super::*;
     use crate::engine::new_game;
     use crate::engine::state::{ObjectiveState, Pending, Phase};
-    use crate::solver::{TUNED, context};
+    use crate::solver::{TUNED, context, landings_left};
 
     /// Opening instrument pick with the board not yet read (all locked): every simulated round randomly releases the
     /// opening inmates; once the board has been read they are not released.
@@ -787,6 +930,205 @@ mod tests {
         assert_eq!(devour_scores(&mut context(&st, &p), bite())[0].1, plain + 2.0);
         st.objective = Some(ObjectiveState { id: 2, progress: 4, done: true });
         assert_eq!(devour_scores(&mut context(&st, &p), bite())[0].1, plain);
+    }
+
+    /// Holding the Blacklist, a landing on a door scores the potential's rise over a landing on an empty cell, and a
+    /// bite pays the reseal: the fall of the potential, times `w_black_seal`. Without the Blacklist, or with
+    /// `w_black` 0, neither is priced.
+    #[test]
+    fn the_blacklist_potential_prices_doors_and_reseals() {
+        // The look-ahead is off: it prices the doors past each landing, which this test does not isolate.
+        let tuned = Params { w_ahead: 0.0, ..TUNED.clone() };
+        let mut st = bare(0);
+        st.objective = None;
+        (st.day, st.max_days, st.phase, st.position) = (5, 20, Phase::Patrol, 0);
+        for n in 1..9 {
+            st.cells[n].sealed = true;
+        }
+        st.cells[10].inmate = Some(Inmate { id: 900, beast: Beast::Rat, tier: 1 });
+        st.cells[12].inmate = Some(Inmate { id: 901, beast: Beast::Wolf, tier: 2 });
+        let (door, empty) = (3usize, 11usize);
+        let scores = |st: &State, p: &Params| {
+            let out = patrol_scores(&mut context(st, p), &[door, empty]);
+            let at = |n: usize| out.iter().find(|(c, _)| *c == n).expect("scored").1;
+            at(door) - at(empty)
+        };
+        let plain = Params { w_black: 0.0, ..tuned.clone() };
+        let gap_without = scores(&st, &plain);
+        assert!((scores(&st, &tuned) - gap_without).abs() < 1e-9, "no Blacklist held");
+        st.tools.push(Tool::Blacklist);
+        assert!((scores(&st, &plain) - gap_without).abs() < 1e-9, "w_black 0");
+        let gap = scores(&st, &tuned) - gap_without;
+        assert!(gap > 0.0, "{gap}");
+        // Eight doors and 16 landings to come: the potential rises by one door's share of the firings.
+        {
+            let ctx = context(&st, &tuned);
+            let b = ctx.black.as_ref().expect("potential");
+            assert!(b.fires(7, 15) > b.fires(8, 15) && b.fires(8, 15) > 0.0);
+            assert!((gap - (b.potential(7, 15) - b.potential(8, 15))).abs() < 1e-9);
+        }
+        // A bite: the warden with the Wolf, a Rat of its tier to eat.
+        (st.phase, st.position) = (Phase::Manage, 12);
+        st.cells[10].inmate = Some(Inmate { id: 900, beast: Beast::Rat, tier: 2 });
+        let bite = || vec![Bite { cell: 10, scratch: false }];
+        let without = devour_scores(&mut context(&st, &plain), bite())[0].1;
+        let with = devour_scores(&mut context(&st, &tuned), bite())[0].1;
+        let ctx = context(&st, &tuned);
+        let b = ctx.black.as_ref().expect("potential");
+        let fall = tuned.w_black_seal * (b.potential(9, 15) - b.potential(8, 15));
+        assert!(fall < 0.0 && (with - without - fall).abs() < 1e-9, "{with} {without} {fall}");
+    }
+
+    /// In a Cage Fight the Blacklist is held without its potential: a door and an empty cell score as without it,
+    /// and a bite pays no reseal.
+    #[test]
+    fn a_cage_fight_holds_no_blacklist_potential() {
+        use crate::engine::data::CAGE_FIGHT;
+        let mut st = bare(0);
+        st.objective = None;
+        (st.day, st.max_days, st.phase, st.position) = (5, 20, Phase::Patrol, 0);
+        for n in 1..9 {
+            st.cells[n].sealed = true;
+        }
+        st.cells[10].inmate = Some(Inmate { id: 900, beast: Beast::Rat, tier: 1 });
+        st.tools.push(Tool::Blacklist);
+        st.theme = Some(CAGE_FIGHT);
+        assert!(context(&st, &TUNED).black.is_none());
+        let plain = Params { w_black: 0.0, ..TUNED.clone() };
+        let with = patrol_scores(&mut context(&st, &TUNED), &[3, 11]);
+        let without = patrol_scores(&mut context(&st, &plain), &[3, 11]);
+        assert_eq!(with, without);
+        st.theme = None;
+        assert!(context(&st, &TUNED).black.is_some());
+    }
+
+    /// A second mark on a Lion already marked is worth its prey's climb alone.
+    #[test]
+    fn a_marked_lions_second_mark_counts_the_prey_alone() {
+        use crate::engine::state::PreyLink;
+        let mut st = bare(0);
+        st.objective = None;
+        st.tools = vec![Tool::Trap];
+        (st.day, st.max_days, st.phase, st.position) = (5, 20, Phase::Manage, 3);
+        st.cells[3].inmate = Some(Inmate { id: 900, beast: Beast::Lion, tier: 2 });
+        st.cells[4].inmate = Some(Inmate { id: 901, beast: Beast::Rat, tier: 2 });
+        st.cells[6].inmate = Some(Inmate { id: 902, beast: Beast::Wolf, tier: 2 });
+        let (both, climb) = {
+            let ctx = context(&st, &TUNED);
+            (best_hunt(&ctx, &[4]).expect("a mark").1, worth(&ctx, 5) - ctx.v[2])
+        };
+        assert!((both - 2.0 * climb).abs() < 1e-9);
+        st.prey.push(PreyLink { lion: 900, prey: 902, prey_beast: Beast::Wolf, rounds: 3, next: 6 });
+        let second = best_hunt(&context(&st, &TUNED), &[4]).expect("a mark").1;
+        assert!((second - climb).abs() < 1e-9, "{second} {climb}");
+    }
+
+    /// Holding the Trap with a Rat on the board, a Replace of the warden's Mammoth is worth a third of the mark a Lion
+    /// of the new inmate's tier could put on it; not without the Trap, not when the warden's inmate is a Lion, and not
+    /// once today's Hunt is made.
+    #[test]
+    fn a_replace_may_bring_a_lion_that_hunts() {
+        let mut st = bare(0);
+        st.objective = None;
+        (st.day, st.max_days, st.phase, st.position) = (5, 20, Phase::Manage, 3);
+        st.cells[3].inmate = Some(Inmate { id: 900, beast: Beast::Mammoth, tier: 1 });
+        st.cells[7].inmate = Some(Inmate { id: 901, beast: Beast::Rat, tier: 1 });
+        let gain = |st: &State, p: &Params| swap_gain_here(&context(st, p));
+        let plain = Params { w_hunt_swap: 0.0, ..TUNED.clone() };
+        let without = gain(&st, &plain);
+        assert!((gain(&st, &TUNED) - without).abs() < 1e-9, "no Trap held");
+        st.tools = vec![Tool::Trap];
+        assert!((gain(&st, &plain) - without).abs() < 1e-9, "w_hunt_swap 0");
+        let with = gain(&st, &TUNED);
+        assert!(with > without, "{with} {without}");
+        // The new inmate's tier odds say how often it matches the Rat; a Lion of tier 1 marking it climbs both.
+        let want = {
+            let ctx = context(&st, &TUNED);
+            let (comp, crowd) = composition(&st, Some(3));
+            let p1 = replace_odds(&ctx, 1, &comp, crowd - 1).0[1];
+            TUNED.w_hunt_swap / 3.0 * p1 * 2.0 * (worth(&ctx, 4) - ctx.v[1])
+        };
+        assert!((with - without - want).abs() < 1e-9, "{} {want}", with - without);
+        st.used.hunt = 1;
+        assert!((gain(&st, &TUNED) - without).abs() < 1e-9, "Hunt made today");
+        st.used.hunt = 0;
+        st.cells[3].inmate = Some(Inmate { id: 900, beast: Beast::Lion, tier: 1 });
+        assert!((gain(&st, &TUNED) - gain(&st, &plain)).abs() < 1e-9, "a Lion already");
+    }
+
+    /// Offered the Blacklist and the Claws, the strategy takes the Blacklist, but in a Cage Fight the Claws: there it
+    /// picks by the order of 2026-10-31.
+    #[test]
+    fn a_cage_fight_picks_instruments_by_the_old_order() {
+        use crate::engine::data::CAGE_FIGHT;
+        use crate::engine::state::ToolReason;
+        let mut st = bare(0);
+        st.pending = vec![Pending::Tool { options: vec![Tool::Claws, Tool::Blacklist], reason: ToolReason::Start }];
+        let pick = |st: &State| crate::solver::decide(st, &TUNED, &mut Rng32::new(1));
+        let take = |t: Tool| Some(Action::Choose { id: ChoiceId::Name(t.key().to_string()) });
+        assert_eq!(pick(&st), take(Tool::Blacklist));
+        st.theme = Some(CAGE_FIGHT);
+        assert_eq!(pick(&st), take(Tool::Claws));
+    }
+
+    /// Two empty landings, one with sealed doors past it, one with nothing: with `w_ahead` the first scores more by
+    /// the look-ahead, without it they tie.
+    #[test]
+    fn a_landing_with_doors_ahead_scores_the_look_ahead() {
+        let mut st = bare(0);
+        st.objective = None;
+        (st.day, st.max_days, st.phase, st.position) = (5, 20, Phase::Patrol, 0);
+        // Landing 3 has doors in 4, 5 and 6; landing 10 has only empty cells past it.
+        for n in 4..7 {
+            st.cells[n].sealed = true;
+        }
+        let gap = |p: &Params| {
+            let out = patrol_scores(&mut context(&st, p), &[3, 10]);
+            let at = |n: usize| out.iter().find(|(c, _)| *c == n).expect("scored").1;
+            at(3) - at(10)
+        };
+        let plain = Params { w_ahead: 0.0, ..TUNED.clone() };
+        let steps = plain.w_step * (3.0 - 10.0);
+        assert!((gap(&plain) - steps).abs() < 1e-9, "{}", gap(&plain));
+        let ctx = context(&st, &TUNED);
+        // Three doors of six cells: best = a door, mean = half a door.
+        let door = TUNED.w_open * ctx.open_value;
+        let want = TUNED.w_ahead * (0.5 * door + 0.5 * door * 3.0 / 6.0);
+        assert!((gap(&TUNED) - steps - want).abs() < 1e-9, "{} {want}", gap(&TUNED) - steps);
+    }
+
+    /// Today's landing counts while it is not yet made.
+    #[test]
+    fn landings_left_counts_todays_patrol() {
+        let mut st = bare(0);
+        (st.day, st.max_days, st.phase) = (20, 20, Phase::Patrol);
+        assert_eq!(landings_left(&st), 1);
+        st.phase = Phase::Manage;
+        assert_eq!(landings_left(&st), 0);
+        (st.day, st.phase) = (5, Phase::Patrol);
+        assert_eq!(landings_left(&st), 16);
+    }
+
+    /// Holding the Trap, a landing on a Lion that could mark a Rat as prey scores more than a landing on the Rat;
+    /// without the Trap the two score as before.
+    #[test]
+    fn the_trap_sends_the_patrol_to_a_lion_with_prey() {
+        let mut st = bare(0);
+        st.objective = None;
+        (st.day, st.max_days, st.phase, st.position) = (5, 20, Phase::Patrol, 0);
+        st.cells[4].inmate = Some(Inmate { id: 900, beast: Beast::Lion, tier: 2 });
+        st.cells[8].inmate = Some(Inmate { id: 901, beast: Beast::Rat, tier: 2 });
+        let lion_over_rat = |st: &State, p: &Params| {
+            let out = patrol_scores(&mut context(st, p), &[4, 8]);
+            let at = |n: usize| out.iter().find(|(c, _)| *c == n).expect("scored").1;
+            at(4) - at(8)
+        };
+        let plain = Params { w_hunt_walk: 0.0, ..TUNED.clone() };
+        let before = lion_over_rat(&st, &plain);
+        assert!((lion_over_rat(&st, &TUNED) - before).abs() < 1e-9, "no Trap held");
+        st.tools.push(Tool::Trap);
+        assert!((lion_over_rat(&st, &plain) - before).abs() < 1e-9, "w_hunt_walk 0");
+        assert!(lion_over_rat(&st, &TUNED) > before + 1.0);
     }
 
     #[test]

@@ -47,6 +47,22 @@ pub struct Settings {
     /// file still read (see [`float_places`]); an older version reading a newer file ignores the field.
     #[serde(deserialize_with = "float_places")]
     pub float_pos: std::collections::BTreeMap<String, [i32; 2]>,
+    /// Frame the map page's affixes graded danger or warning on the game (the affix page's switch, see
+    /// `affix_page.rs`); the map page is captured only while it is on (the user, 2026-11-09).
+    pub affix_frames: bool,
+    /// How the affix frames look (A frame by default, or B bar and tint); a value that does not read is the default,
+    /// the rest of the file still read (see [`affix_frame_style`]).
+    #[serde(deserialize_with = "affix_frame_style")]
+    pub affix_frame_style: crate::affix::FrameStyle,
+    /// The affix grades the user changed from our defaults, by sentence (its first id); a grade that does not read is
+    /// left out alone (see [`affix_grades`]).
+    #[serde(deserialize_with = "affix_grades")]
+    pub affix_grades: crate::affix::Grades,
+    /// Which defaults the affix grades were kept against: 0 for a file from before 1.2.0 (the table's own grades were
+    /// the defaults), [`AFFIX_DEFAULTS_GAME_COLOUR`] since (the game's colour). A file without the field is from
+    /// before; a new player starts at the current one. See `ui.rs` `configure_affixes`.
+    #[serde(default)]
+    pub affix_defaults: u32,
     /// Keep a log of each run's reads, advice and corrections, with the
     /// frames read, in %APPDATA%\Ascendant\runs, see [`super::runlog`].
     pub run_log: bool,
@@ -106,6 +122,10 @@ pub struct Settings {
     /// Saves the tank label strip after the Vorax resolve sound, to study the rules. Off by default (a developer aid;
     /// existing settings files keep their value).
     pub vorax_strips: bool,
+    /// Vorax: in the endgame battle with the panel at its last reward tier (1.12M taken, the next tier reads 999.9M),
+    /// a line on the game says giving up settles at once, and the panel's Give Up button is boxed: more battle adds
+    /// nothing (the player's request, 2026-11-09). Off by default and in older files.
+    pub vorax_give_up_hint: bool,
     /// Font size: overall scale, 1.0 standard, 1.15 large, 1.3 extra large (see `text_scale` in ui.rs). Old settings
     /// files without this field get standard.
     pub font_scale: f32,
@@ -138,6 +158,10 @@ impl Default for Settings {
             window_pos: None,
             window_size: None,
             float_pos: std::collections::BTreeMap::new(),
+            affix_frames: true,
+            affix_frame_style: crate::affix::FrameStyle::default(),
+            affix_grades: crate::affix::Grades::new(),
+            affix_defaults: AFFIX_DEFAULTS_GAME_COLOUR,
             run_log: true,
             keep_all_logs: false,
             observe: false,
@@ -155,6 +179,7 @@ impl Default for Settings {
             vorax_rollouts: 4096,
             vorax_learn: true,
             vorax_strips: false,
+            vorax_give_up_hint: false,
             font_scale: 1.0,
             layout: "auto".to_string(),
             game_log: None,
@@ -164,6 +189,9 @@ impl Default for Settings {
 }
 
 /// [`Settings::keep_all_logs`] for a settings file without the field: on, so nothing is deleted.
+/// [`Settings::affix_defaults`] since 1.2.0: an affix the user has not graded is framed by the game's colour.
+pub const AFFIX_DEFAULTS_GAME_COLOUR: u32 = 1;
+
 fn keep_all_when_missing() -> bool {
     true
 }
@@ -175,6 +203,21 @@ fn float_places<'de, D: serde::Deserializer<'de>>(d: D) -> Result<std::collectio
     let value = serde_json::Value::deserialize(d)?;
     let serde_json::Value::Object(map) = value else { return Ok(std::collections::BTreeMap::new()) };
     Ok(map.into_iter().filter_map(|(k, v)| serde_json::from_value::<[i32; 2]>(v).ok().map(|at| (k, at))).collect())
+}
+
+/// [`Settings::affix_grades`] as saved: each entry whose grade reads, the rest left out, and none for a value that is
+/// not a map (as [`float_places`]): a grade a later version adds or renames, or a hand edit gone wrong, loses only
+/// itself instead of failing the whole file (review 2026-11-08).
+fn affix_grades<'de, D: serde::Deserializer<'de>>(d: D) -> Result<crate::affix::Grades, D::Error> {
+    let value = serde_json::Value::deserialize(d)?;
+    let serde_json::Value::Object(map) = value else { return Ok(crate::affix::Grades::new()) };
+    Ok(map.into_iter().filter_map(|(k, v)| serde_json::from_value::<crate::affix::Grade>(v).ok().map(|g| (k, g))).collect())
+}
+
+/// [`Settings::affix_frame_style`] as saved; the default style for a value that does not read.
+fn affix_frame_style<'de, D: serde::Deserializer<'de>>(d: D) -> Result<crate::affix::FrameStyle, D::Error> {
+    let value = serde_json::Value::deserialize(d)?;
+    Ok(serde_json::from_value(value).unwrap_or_default())
 }
 
 /// The least opacity the window can be set to: below it the window is
@@ -237,6 +280,42 @@ fn dir_in(appdata: &Path) -> PathBuf {
 }
 
 impl Settings {
+    /// The settings a run log keeps (`settings` in its window line, and a `settings` row when they change, see
+    /// `runlog::set_settings`): those that change what is read, advised or shown, by name. Nothing personal or about
+    /// the machine: not the install id, the share consent, the game log's path (only whether one is set), the game
+    /// window's title, window places, the instruments held or the affix grades (only how many) (the user, 2026-11-09).
+    pub fn log_summary(&self) -> serde_json::Value {
+        let mut v = serde_json::json!({
+            "language": self.language,
+            "auto_read": self.auto_read,
+            "auto_place": self.auto_place,
+            "rollouts": self.rollouts,
+            "highlight": self.highlight,
+            "show_value": self.show_value,
+            "click_through": self.click_through,
+            "opacity": self.opacity,
+            "font_scale": self.font_scale,
+            "layout": self.layout,
+            "read_hotkey": self.read_hotkey,
+            "auto_hotkey": self.auto_hotkey,
+            "observe": self.observe,
+            "run_log": self.run_log,
+            "keep_all_logs": self.keep_all_logs,
+            "check_updates": self.check_updates,
+            "start_as_admin": self.start_as_admin,
+            "game_log_set": self.game_log.is_some(),
+            "vorax_enabled": self.vorax_enabled,
+            "vorax_rollouts": self.vorax_rollouts,
+            "vorax_learn": self.vorax_learn,
+            "vorax_strips": self.vorax_strips,
+            "vorax_give_up_hint": self.vorax_give_up_hint,
+        });
+        v["affix_frames"] = serde_json::json!(self.affix_frames);
+        v["affix_frame_style"] = serde_json::to_value(self.affix_frame_style).unwrap_or_default();
+        v["affix_grades_changed"] = serde_json::json!(self.affix_grades.len());
+        v
+    }
+
     fn path() -> Option<PathBuf> {
         app_dir().map(|d| d.join("settings.json"))
     }
@@ -315,6 +394,37 @@ mod tests {
         }
     }
 
+    /// An affix grade or a frame style that does not read is left out alone (the grade) or taken as the default (the
+    /// style); the other grades and every other setting still read (review 2026-11-08).
+    /// A settings file from before 1.2.0 (no `affix_defaults`) reads as kept against the old defaults; a new player
+    /// starts at the game's colour; the value saved reads back.
+    #[test]
+    fn affix_defaults_tell_a_file_from_before() {
+        let old: Settings = serde_json::from_str(r#"{"rollouts": 900}"#).unwrap();
+        assert_eq!(old.affix_defaults, 0);
+        assert_eq!(Settings::default().affix_defaults, super::AFFIX_DEFAULTS_GAME_COLOUR);
+        let back: Settings = serde_json::from_str(&serde_json::to_string(&Settings::default()).unwrap()).unwrap();
+        assert_eq!(back.affix_defaults, super::AFFIX_DEFAULTS_GAME_COLOUR);
+    }
+
+    #[test]
+    fn affix_settings_read_from_broken_files() {
+        use crate::affix::{FrameStyle, Grade};
+        let broken: Settings =
+            serde_json::from_str(r#"{"affix_grades": {"3500300": "warn", "3500301": "purple", "3500302": 5}, "affix_frame_style": "zigzag", "rollouts": 900}"#).unwrap();
+        assert_eq!(broken.affix_grades.len(), 1);
+        assert_eq!(broken.affix_grades.get("3500300"), Some(&Grade::Warn));
+        assert_eq!(broken.affix_frame_style, FrameStyle::default());
+        assert_eq!(broken.rollouts, 900);
+        let mut s = Settings::default();
+        s.affix_grades.insert("5112007".into(), Grade::Danger);
+        s.affix_frame_style = FrameStyle::Bar;
+        let back: Settings = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+        assert_eq!((back.affix_grades, back.affix_frame_style), (s.affix_grades, FrameStyle::Bar));
+        let none: Settings = serde_json::from_str(r#"{"affix_grades": null, "rollouts": 900}"#).unwrap();
+        assert!(none.affix_grades.is_empty());
+    }
+
     #[test]
     fn old_hotkey_field() {
         let s: Settings = serde_json::from_str(r#"{"hotkey": "F7", "rollouts": 300}"#).unwrap();
@@ -328,6 +438,7 @@ mod tests {
         assert_eq!((s.share_logs, s.shared_from.as_str(), s.install_id.as_str()), (None, "", ""));
         // Old settings files have no Vorax fields: use the defaults.
         assert_eq!((s.vorax_enabled, s.vorax_rollouts, s.vorax_learn, s.vorax_strips), (true, 4096, true, false));
+        assert!(!s.vorax_give_up_hint, "the give-up hint starts off");
         // Old settings files have no "Keep all run logs": on, so nothing is deleted; a new player gets off.
         assert!(s.keep_all_logs);
         assert!(!Settings::default().keep_all_logs);
@@ -434,5 +545,18 @@ mod tests {
         assert_eq!(rollouts(r#"{"rollouts": 300}"#), Some(300));
         assert_eq!(rollouts("{}"), Some(1600));
         assert_eq!(rollouts("not json"), None);
+    }
+
+    /// The settings a run log keeps: what changes reading, advice and showing; nothing personal or about the machine.
+    #[test]
+    fn the_log_summary_leaves_out_what_is_personal() {
+        let s = Settings { install_id: "abc-123".into(), shared_from: "x".into(), game_log: Some(std::path::PathBuf::from("D:/Logs/UE_game.log")), window_title: "Torchlight: Infinite - Alice".into(), rollouts: 3200, ..Settings::default() };
+        let v = s.log_summary();
+        let text = v.to_string();
+        for private in ["abc-123", "UE_game", "Alice", "install_id", "shared_from", "window_pos", "float_pos"] {
+            assert!(!text.contains(private), "{private} in {text}");
+        }
+        assert_eq!((v["rollouts"].as_u64(), v["game_log_set"].as_bool()), (Some(3200), Some(true)));
+        assert!(v["observe"].is_boolean() && v["vorax_rollouts"].is_u64() && v["language"].is_string());
     }
 }

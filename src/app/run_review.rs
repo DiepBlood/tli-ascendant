@@ -16,6 +16,7 @@
 //! drops them all (their text is in the language they were settled in), and "Review again" settles a run again.
 
 use super::report::{Game, ReportUi, RunEntry, Target, settled_of};
+use super::gamelog::RiotEnd;
 use super::settle::{Outcome, RunKind, Settled};
 use crate::lang::tr;
 use eframe::egui;
@@ -54,6 +55,9 @@ pub struct RunReview {
     cache: Vec<(PathBuf, Outcome)>,
     /// How many times the language was switched: a settlement started before the last switch is not kept in memory.
     language: u64,
+    /// The riot of the run that ended last, told after its settlement started (see [`RunReview::riot_done`]): put in
+    /// the settlement when it comes.
+    riot: Option<(PathBuf, RiotEnd)>,
 }
 
 /// A picked run and its result; None while it is being settled or waits for its turn.
@@ -141,6 +145,39 @@ impl RunReview {
         self.language += 1;
     }
 
+    /// The riot battle after the Tartarus run in `dir` is over ([`super::gamelog::Signal::RiotEnd`], about a minute
+    /// after the run's settlement started): every settlement of that run held puts it in, and one still running gets
+    /// it when it comes. Later settlements of the run read it from its log.
+    pub fn riot_done(&mut self, dir: &Path, end: RiotEnd) {
+        self.riot = Some((dir.to_path_buf(), end));
+        let put = |(d, out): &mut (PathBuf, Outcome)| {
+            if d == dir
+                && let Outcome::Settled(s) = out
+            {
+                s.riot = Some(end);
+            }
+        };
+        if let Some(held) = self.settled.as_mut() {
+            put(held);
+        }
+        if let Some(held) = self.picked.as_mut().and_then(|p| p.settled.as_mut()) {
+            put(held);
+        }
+        self.cache.iter_mut().for_each(put);
+    }
+
+    /// Puts the riot told before into `out` when it is the settlement of that run and has none (it read the log before
+    /// the riot row was written).
+    fn with_riot(&self, dir: &Path, out: &mut Outcome) {
+        if let (Some((d, end)), Outcome::Settled(s)) = (&self.riot, out)
+            && d == dir
+            && s.riot.is_none()
+            && s.kind == RunKind::Tartarus
+        {
+            s.riot = Some(*end);
+        }
+    }
+
     /// The result kept in memory for the run in `dir`.
     fn cached(&self, dir: &Path) -> Option<&Outcome> {
         self.cache.iter().find(|(d, _)| d == dir).map(|(_, out)| out)
@@ -164,13 +201,15 @@ impl RunReview {
     /// Takes the results that came in, and starts the picked run's settlement with `spawn` when nothing settles it:
     /// no picked settlement running (one at a time) and no automatic one for the same folder.
     pub fn poll(&mut self, spawn: &mut impl FnMut(PathBuf, Game) -> Receiver<Outcome>) {
-        if let Some((dir, out, language)) = take(&mut self.settling) {
+        if let Some((dir, mut out, language)) = take(&mut self.settling) {
+            self.with_riot(&dir, &mut out);
             self.auto_result(dir, out, language, Game::Tartarus);
         }
         if let Some((dir, out, language)) = take(&mut self.vorax_settling) {
             self.auto_result(dir, out, language, Game::Vorax);
         }
-        if let Some((dir, out, language)) = take(&mut self.running) {
+        if let Some((dir, mut out, language)) = take(&mut self.running) {
+            self.with_riot(&dir, &mut out);
             // Kept even when the run was picked before (its result is dropped from the pick, not lost).
             self.remember(&dir, &out, language);
             self.give_picked(&dir, &out);
@@ -342,6 +381,8 @@ mod tests {
             noise: (0.0, 0),
             luck: None,
             z: None,
+            expected_net: None,
+            z_net: None,
             cause: None,
             worst: None,
             scored: 1,
@@ -349,7 +390,48 @@ mod tests {
             rollouts: 1,
             kind: RunKind::Tartarus,
             reach: None,
+            riot: None,
         }))
+    }
+
+    fn with_riot(out: Outcome, end: RiotEnd) -> Outcome {
+        match out {
+            Outcome::Settled(s) => Outcome::Settled(Box::new(Settled { riot: Some(end), ..*s })),
+            other => other,
+        }
+    }
+
+    /// The riot ends about a minute after the run's settlement started: told after the result came, the result on
+    /// show and the one in memory take it; told while the settlement still runs, its result takes it when it comes.
+    /// Another run's riot changes nothing.
+    #[test]
+    fn the_riot_goes_into_the_runs_settlement() {
+        let (run, next) = (tartarus("2026-11-09_20-14-26"), tartarus("2026-11-09_20-16-20"));
+        let end = RiotEnd { fought: true, red: 1, color: 3, medium: 7, ..RiotEnd::default() };
+        let mut review = RunReview::default();
+        let mut spawns = Spawns::default();
+        let (tx, rx) = channel();
+        review.start_tartarus(run.dir.clone(), rx, 1);
+        tx.send(settled(&run.name)).unwrap();
+        poll(&mut review, &mut spawns);
+        assert_eq!(shown(&review), (false, Some(settled(&run.name))));
+        review.riot_done(&next.dir, end);
+        assert_eq!(shown(&review), (false, Some(settled(&run.name))), "another run's riot");
+        review.riot_done(&run.dir, end);
+        assert_eq!(shown(&review), (false, Some(with_riot(settled(&run.name), end))));
+        review.pick(run.clone());
+        assert_eq!(shown(&review), (false, Some(with_riot(settled(&run.name), end))), "from memory with it");
+        review.latest();
+
+        // Told while the settlement runs: its result takes it.
+        let (tx, rx) = channel();
+        review.start_tartarus(next.dir.clone(), rx, 2);
+        let abandoned = RiotEnd::default();
+        review.riot_done(&next.dir, abandoned);
+        assert!(shown(&review).0);
+        tx.send(settled(&next.name)).unwrap();
+        poll(&mut review, &mut spawns);
+        assert_eq!(shown(&review), (false, Some(with_riot(settled(&next.name), abandoned))));
     }
 
     /// A stand-in for the window's settlement threads: every start is recorded with the sender of its result.

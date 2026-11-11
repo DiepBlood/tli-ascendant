@@ -140,6 +140,51 @@ fn beast_feature(img: &Rgba, cell: u8) -> Vec<f32> {
     face(img, x, y)
 }
 
+/// Mean luma of the face patch above which the door-opening flash (or the Replace's) washes the portrait out: the
+/// padlock is gone already, so the cell reads as open, but the face has not come through, and the nearest template
+/// is then the Lion's pale mane. In the 2026-10-30 to 11-09 runs, 107 first reads of a newly revealed inmate read a
+/// Lion that later reads of the cell changed; the 94 of them this reader still reads as a Lion had a mean of 139-255
+/// (median 237). Of the 2290 such first reads, 276 open cells are above 150, and the Lion share of the rest is 25.7%.
+const FLASH_LUMA: f32 = 150.0;
+
+/// Whether the opening flash washes out the face of cell `cell`, so no beast can be read from it yet.
+fn face_washed_out(img: &Rgba, cell: u8) -> bool {
+    let (x, y) = portrait(cell);
+    let v = patch(img, x, y + 12, 13, 13, 4);
+    let mean = v.as_chunks::<3>().0.iter().map(|p| 0.299 * p[0] + 0.587 * p[1] + 0.114 * p[2]).sum::<f32>() / (v.len() / 3) as f32;
+    mean > FLASH_LUMA
+}
+
+/// Channel spread (brightest minus dimmest of R, G, B) above which a face-patch pixel counts as strongly coloured.
+const SHIELD_CHROMA: i32 = 80;
+
+/// Share of strongly coloured pixels in the face patch above which a portrait that no beast matches well or clearly
+/// ([`SHIELD_MATCH`], [`SHIELD_SURE`]) is taken as covered by a rarity effect. When a Replace or a door brings in an
+/// inmate, or an inmate rises a rarity, a shield in the rarity's colour (blue Magic, purple Rare, orange Legendary,
+/// red Ultimate) fills the portrait for a moment and hides the face, and the nearest template is then any beast. The
+/// door-opening flash test ([`FLASH_LUMA`]) already takes the bright blue and purple ones; a red shield is darker (a
+/// mean of 131 under one read as a Lion, run 2026-11-07_16-26-50 frame 12).
+/// In the 2026-11-04 to 11-10 runs (15720 saved frames), the plain portraits of 3000 sampled open cells had at
+/// most 0.072 of such pixels (99th percentile 0.021). The test covers 444 cells of those frames: 185 had read
+/// another beast than the cell's next plain read (a median 0.15 s later), 177 the same one (45 of them a new
+/// inmate, whose read now waits one read more), 54 have no later plain read and 28 had read an empty cell. Of 54
+/// checked by eye, 6 showed the face through the colour.
+const SHIELD_SHARE: f32 = 0.10;
+
+/// Best beast-template score under which a strongly coloured face may be a shield: a face seen through a fading
+/// shield or under a rarity glow mostly scores 0.6 and up, a shield 0.2 to 0.7.
+const SHIELD_MATCH: f32 = 0.70;
+
+/// Beast confidence (the margin to the next class, see [`beast_class`]) under which a face below [`SHIELD_MATCH`] is
+/// a shield: a face that shows through the colour still stands out from the next class by 0.15 (0.75) or more.
+const SHIELD_SURE: f32 = 0.75;
+
+/// The share of strongly coloured pixels in the face patch of cell `cell` (the 52 x 52 px [`face_washed_out`] takes).
+fn coloured_share(img: &Rgba, cell: u8) -> f32 {
+    let (x, y) = portrait(cell);
+    colour_share(img, (x - 26, x + 26), (y + 12 - 26, y + 12 + 26), |r, g, b| r.max(g).max(b) - r.min(g).min(b) > SHIELD_CHROMA)
+}
+
 /// The faces at the spots within +-`r` px of `(x, y)`, 2 px apart.
 fn faces_around(img: &Rgba, x: i32, y: i32, r: i32) -> Vec<Vec<f32>> {
     let mut out = Vec::new();
@@ -851,6 +896,12 @@ pub struct CellRead {
     pub prey: bool,
     /// A tooltip panel covers the cell, so the reads above are of the panel.
     pub covered: bool,
+    /// On an open cell, the door-opening flash still washes out the face (see [`FLASH_LUMA`]); `covered` is set too,
+    /// so the model keeps the last board's cell until the face shows.
+    pub flash: bool,
+    /// On an open cell, a rarity effect hides the face (see [`SHIELD_SHARE`]); `covered` is set too, and the model
+    /// keeps the last board's cell as for the flash.
+    pub shield: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -871,9 +922,9 @@ impl Scene {
     }
 }
 
-/// The nearest beast class of the best of the face features (one per spot)
-/// and the margin to the next one.
-fn beast_class(fs: &[Vec<f32>], t: &Templates) -> (usize, f32) {
+/// The nearest beast class of the best of the face features (one per spot),
+/// the margin to the next one and the best score.
+fn beast_class(fs: &[Vec<f32>], t: &Templates) -> (usize, f32, f32) {
     let mut scores: Vec<(f32, usize)> = t
         .beast
         .iter()
@@ -884,7 +935,7 @@ fn beast_class(fs: &[Vec<f32>], t: &Templates) -> (usize, f32) {
     scores.sort_by(|a, b| b.0.total_cmp(&a.0));
     let (top, k) = scores[0];
     let next = scores.get(1).map_or(0.0, |s| s.0);
-    (k, ((top - next) / 0.2).min(1.0))
+    (k, ((top - next) / 0.2).min(1.0), top)
 }
 
 /// How far from its spot a vault portrait's face is searched. The slots sit
@@ -898,7 +949,7 @@ const VAULT_SEARCH: i32 = 12;
 /// Chromatic Prisoner slot), with the embedded templates; None when the
 /// nearest class is an empty or closed cell.
 pub fn beast_at(img: &Rgba, (x, y): (i32, i32)) -> (Option<Beast>, f32) {
-    let (k, conf) = beast_class(&faces_around(img, x, y, VAULT_SEARCH), Templates::embedded());
+    let (k, conf, _) = beast_class(&faces_around(img, x, y, VAULT_SEARCH), Templates::embedded());
     (CLASSES[k], conf)
 }
 
@@ -968,6 +1019,9 @@ pub fn read_scene_with(img: &Rgba, t: &Templates) -> Scene {
             let mut r = CellRead { covered: tooltip_covers(img, c), ..CellRead::default() };
             let s = search(img, padlock_spot(c), &t.padlock, padlock_feature);
             (r.locked, r.locked_conf) = t.padlock_split.decide(s);
+            // Only an open cell: the glow behind a locked door is read on purpose (a Scratch mark).
+            r.flash = !r.locked && face_washed_out(img, c);
+            r.covered |= r.flash;
             let s = search(img, event_spot(c), &t.event, event_feature);
             (r.event, r.event_conf) = t.event_split.decide(s);
             if !r.event
@@ -979,13 +1033,21 @@ pub fn read_scene_with(img: &Rgba, t: &Templates) -> Scene {
             // The face at the spots within +-4 px of the usual one: on a lit
             // cell with a path line through it the face has been seen 4-8 px higher.
             let (x, y) = portrait(c);
-            let (k, conf) = beast_class(&faces_around(img, x, y, 4), t);
+            let (k, conf, top) = beast_class(&faces_around(img, x, y, 4), t);
             r.beast_conf = conf;
             // The jaws are looked for on every cell: on a door Avenger's
             // Casket just opened they cover a face that reads as no beast,
             // and that target went unseen (2026-10-28).
             r.target = has_target_jaws(img, c);
-            if let (Some(beast), false) = (CLASSES[k], r.locked) {
+            // Not on a target: its red jaws stay on screen for the whole pick and tint the face, which still reads.
+            r.shield = !r.locked
+                && !r.flash
+                && !r.target
+                && top < SHIELD_MATCH
+                && conf < SHIELD_SURE
+                && coloured_share(img, c) > SHIELD_SHARE;
+            r.covered |= r.shield;
+            if let (Some(beast), false, false, false) = (CLASSES[k], r.locked, r.flash, r.shield) {
                 let (tier, conf, halo) = glow_tier(img, c, warden == Some(c), t);
                 (r.tier_conf, r.halo) = (conf, halo);
                 r.inmate = Some((beast, tier));
@@ -1013,8 +1075,14 @@ mod tests {
     /// lit as a door it went unseen at the usual spot (2026-10-30).
     #[test]
     fn left_column_incident_marks() {
+        let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        // the public repository has no tests folder
+        if !fixtures.join("left-column-lit-16.png").is_file() {
+            println!("skipped: {} is missing", fixtures.display());
+            return;
+        }
         let board = |crop: &str| {
-            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures").join(crop);
+            let path = fixtures.join(crop);
             let crop = crate::reader::decode_png_raw(&std::fs::read(&path).unwrap()).unwrap();
             let mut img = Rgba { w: crate::reader::REF_W, h: crate::reader::REF_H, data: vec![0; crate::reader::REF_W * crate::reader::REF_H * 4] };
             for y in 0..crop.h {
@@ -1038,6 +1106,59 @@ mod tests {
                 img.data[i..i + 3].copy_from_slice(&rgb);
             }
         }
+    }
+
+    /// A portrait washed out by the door-opening flash is covered, not a beast; a dark face is read as usual. The
+    /// background is the board's warm stone: a flat grey is the tooltip panel's colour and covers every cell.
+    #[test]
+    fn the_opening_flash_covers_the_cell() {
+        let dark = Rgba { w: REF_W, h: REF_H, data: [46, 34, 26, 255].repeat(REF_W * REF_H) };
+        let (cx, cy) = portrait(9);
+        let mut flash = dark.clone();
+        paint(&mut flash, (cx - 40, cx + 40), (cy - 30, cy + 55), [235, 240, 250]);
+        assert!(face_washed_out(&flash, 9) && !face_washed_out(&flash, 10) && !face_washed_out(&dark, 9));
+        let scene = read_scene(&flash);
+        assert!(scene.cell(9).flash && scene.cell(9).covered && scene.cell(9).inmate.is_none());
+        assert!(!scene.cell(10).flash && !scene.cell(10).covered);
+        // A pale face at a portrait's usual brightness is not a flash.
+        let mut pale = dark.clone();
+        paint(&mut pale, (cx - 26, cx + 26), (cy - 14, cy + 38), [120, 115, 100]);
+        assert!(!face_washed_out(&pale, 9));
+    }
+
+    /// A rarity effect over the face (an Ultimate's red, darker than the flash, as in run 2026-11-07_16-26-50 frame
+    /// 12) is covered, not a beast; a Lion's face under the same red tint still reads, since the template match
+    /// ignores the tint.
+    #[test]
+    fn a_rarity_shield_covers_the_cell() {
+        let dark = Rgba { w: REF_W, h: REF_H, data: [46, 34, 26, 255].repeat(REF_W * REF_H) };
+        let (cx, cy) = portrait(9);
+        let mut shield = dark.clone();
+        paint(&mut shield, (cx - 32, cx + 32), (cy - 35, cy + 48), [235, 70, 80]);
+        assert!(!face_washed_out(&shield, 9) && coloured_share(&shield, 9) > SHIELD_SHARE);
+        let scene = read_scene(&shield);
+        let r = scene.cell(9);
+        assert!(r.shield && r.covered && !r.flash && r.inmate.is_none(), "{r:?}");
+        assert!(!scene.cell(10).shield && !scene.cell(10).covered);
+        // The Lion template drawn as the face patch's 13 x 13 blocks of 4 px, on the shield's red.
+        let mut lion = dark.clone();
+        let tpl = &Templates::embedded().beast[1];
+        for by in 0..13 {
+            for bx in 0..13 {
+                let i = ((by * 13 + bx) * 3) as usize;
+                let rgb = [0, 1, 2].map(|c| ([170.0, 60.0, 60.0][c] + 400.0 * tpl[i + c]).clamp(0.0, 255.0) as u8);
+                paint(&mut lion, (cx - 26 + bx * 4, cx - 22 + bx * 4), (cy - 14 + by * 4, cy - 10 + by * 4), rgb);
+            }
+        }
+        assert!(!face_washed_out(&lion, 9) && coloured_share(&lion, 9) > SHIELD_SHARE);
+        let scene = read_scene(&lion);
+        let r = scene.cell(9);
+        assert!(!r.shield && !r.covered);
+        assert_eq!(r.inmate.map(|(b, _)| b), Some(Beast::Lion));
+        // A plain grey face is not coloured at all.
+        let mut pale = dark.clone();
+        paint(&mut pale, (cx - 26, cx + 26), (cy - 14, cy + 38), [120, 115, 100]);
+        assert_eq!(coloured_share(&pale, 9), 0.0);
     }
 
     /// The tip of a "!" above a bracket's corner reads as an incident; the

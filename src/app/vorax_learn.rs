@@ -264,6 +264,12 @@ fn printed(card: &crate::vorax::names::CardName) -> Option<&str> {
     if english() { Some(card.printed_en()) } else { card.zh.as_deref() }
 }
 
+/// The name a card read in the hand prints on the client read, to find it in a tooltip: the English client's (by its
+/// index), the Traditional Chinese otherwise. Shared by [`tooltip_match`] and the session's hovered card.
+pub fn card_printed(c: &read::Card) -> Option<&str> {
+    if english() { c.index.and_then(|i| names().cards.get(i)).map(|n| n.printed_en()) } else { c.zh.as_deref() }
+}
+
 /// The card matched by the tooltip (English name): the one in the hand whose printed name ([`printed`]) appears in
 /// the tooltip raw text ([`tooltip_has`]). On the English client the English name: with the Traditional Chinese one
 /// no English tooltip ever matched and each was saved (2026-11-08 live-log scan, 177 tooltips).
@@ -272,10 +278,7 @@ pub fn tooltip_match(r: &Reading) -> Option<String> {
     if tip.is_empty() {
         return None;
     }
-    fn name(c: &read::Card) -> Option<&str> {
-        if english() { c.index.and_then(|i| names().cards.get(i)).map(|n| n.printed_en()) } else { c.zh.as_deref() }
-    }
-    r.cards.iter().find(|c| name(c).is_some_and(|z| tooltip_has(&tip, z))).and_then(|c| c.en.clone())
+    r.cards.iter().find(|c| card_printed(c).is_some_and(|z| tooltip_has(&tip, z))).and_then(|c| c.en.clone())
 }
 
 /// The tooltip raw text contains some name from the name table the client prints (card or monster, [`printed`] and

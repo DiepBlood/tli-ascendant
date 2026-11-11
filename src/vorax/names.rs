@@ -287,8 +287,11 @@ mod tests {
         zh.dedup();
         assert_eq!(zh.len(), all);
         assert!(n.monsters.iter().any(|(m, a)| m == "苦行大教宗" && *a == Archetype::Agito));
-        // The English monster names: all but 禁典學者 (never seen in the English games), each once.
-        assert_eq!(n.monsters_en.len(), n.monsters.len() - 1);
+        // The English monster names: every monster's, each once (禁典學者's, Taboo Scholar, seen in the English game of
+        // 2026-11-08 13:05, the one name missing on either side, an Agito on both).
+        assert_eq!(n.monsters_en.len(), n.monsters.len());
+        assert!(n.monsters_en.iter().any(|(m, a)| m == "Taboo Scholar" && *a == Archetype::Agito));
+        assert!(n.monsters.iter().any(|(m, a)| m == "禁典學者" && *a == Archetype::Agito));
         assert!(n.monsters_en.iter().any(|(m, a)| m == "Apostate" && *a == Archetype::Agito));
         let mut en: Vec<&str> = n.monsters_en.iter().map(|(m, _)| m.as_str()).collect();
         en.sort_unstable();

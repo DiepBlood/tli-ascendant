@@ -1,0 +1,89 @@
+[[zh-TW]]
+Ascendant 1.2.0：關卡詞綴框線
+
+關卡詞綴（新功能）
+- 地圖頁「基礎詞綴」面板上的詞綴直接在遊戲畫面上框起來：危險的框紅框、要注意的框黃框。預設開啟，可以在「詞綴」頁關掉；關掉時，地圖頁也不再擷取畫面。
+- 預設照遊戲的顏色框：遊戲標紅的框紅框、標黃的框黃框。內建 142 句詞綴。
+- 新的「詞綴」頁：每條詞綴有四個按鈕（危險、警告、不標、遊戲顏色），可以逐條改成你自己的分級。目前地圖上的詞綴列在最上面，可以依等級篩選、搜尋。
+- 框線兩種樣式：整圈外框，或左側色條加淡底色。
+- 開頁後約 1.3 秒上框。按「添加詞綴」時，框跟著詞綴移，新加的那條讀好再框（約 0.4 秒）；滿 6 條時框不動。捲動面板時框先收起，停住再框。
+- 關掉詞綴面板或切到別的視窗時，框在 1～2 秒內收起。
+- 遊戲各種介面縮放都能上框（有把握才框，量不準時詞綴頁會說明）；1920×1080 的視窗、帶底線的關鍵字、英文的藍色關鍵字都讀得準。
+- 只差一個字、等級不同的兩條詞綴，同一次開頁讀到兩次相同文字就照那句框（大多 0.4 秒內），不再一直標「不確定」。
+- 清單沒有的詞綴，進入那張地圖後會從遊戲日誌學起來，標成「新」，先照遊戲顏色框；開程式時也會從已有的遊戲日誌補學（只取詞綴編號與文字）。
+- 關掉地圖頁後「這張地圖」清單還留著；開頁太快沒讀完時，用遊戲日誌補上。回到藏身處就清掉。
+- 讀不準的詞綴不框，在詞綴頁標「未知」「不確定」或「不完整」；藏身處、渴血手術準備畫面等不會被誤框。Ascendant 的語言和遊戲不同時，詞綴頁會提示。
+  （遊戲語言要和 Ascendant 設定相同，Windows 也要裝同一種 OCR 語言；遊戲視窗要是 16:9。繁體中文客戶端第一次遇到、內建表還沒有中文的詞綴會是「未知」，進過那張地圖後就認得。）
+
+塔羅斯
+- 一般局拿掉提早淘汰：每個選項都跑滿 1600 輪、算完才顯示建議，平均每局約多收容 0.23 名綺彩囚犯（4 核電腦約 0.26 名；至臻、傳奇依比例折算）；建議會稍晚一點出現。囚徒困鬥照舊。
+- 模擬打法重新設計：持有「執刑官的黑名冊」時算進開門與重新封門、持有陷阱時往可狩獵的獅子移動、刑具排序重新量過、巡邏也看明天的落點。同一批 200 局照建議模擬，平均每局收容 7.50 → 8.04 名綺彩囚犯。
+- 連鎖選目標時，被大獠牙蓋住的有劃痕的門不會再讀低一級（遊戲標了門卻沒有建議）。
+- 開門、換掉或連鎖的閃光蓋住頭像時，不會再讀成獅子。
+- 囚犯換進來、開門或升階時，頭像會被稀有度的彩色特效短暫蓋住；這時不會再隨便讀成某種動物，等臉出現才讀（新囚犯約晚 0.15 秒顯示）。
+- 連續開好幾個珍藏時，每一個都會重新讀、給新的建議。
+- 門卡的號碼不會再拿到另一張相似門卡的讀取結果。
+- 每局結束放掉求解快取，閒置時最多少佔約 300 MB 記憶體。
+
+本局頁
+- 塔羅斯的判定先扣掉「照建議通常比預期多拿」的部分，再分成：預期範圍內、運氣偏高、運氣偏低、決策有失分。決策損失也包含當時建議和重算的差，不一定是你的失誤。
+- 被提早淘汰的實際所選，會和最佳選項一起補算到 1600 輪，不再把淘汰時的雜訊算成損失。
+- 判定卡片下方多一列圖示：鎮壓戰打或放棄、特殊 Boss（獄卒）有沒有擊殺、彩箱／紅箱／中箱各幾個。
+
+渴血
+- 新選項「分數達上限時提示放棄」（渴血面板底部，預設關閉）：終局戰鬥分數到 1.12M、所有獎勵都拿到後，遊戲畫面上方提示可以放棄快速結算，並框出「放棄」按鈕；約 0.5 秒內出現。
+- 英文客戶端：水箱數字讀不全時用總活性反推，不會再從中途開始整局沒有建議；英文說明框也認得出滑鼠停在哪張卡；讀壞的 Spinal Solution、被切掉種族字尾的卡名都認得；怪物 Taboo Scholar 對上「禁典學者」。
+- 遊戲介面縮放接近 1 倍（例如 1.0073）時，水箱標籤最下面一列的數字讀得到。
+- 對局紀錄用選完後的盤面認卡，滑鼠經過別張卡時不會再記錯（不影響建議）。
+- 觀察模式改存無損的區域拼圖（只在觀察模式開著時，一局約 12 MB）。
+
+其他
+- 側邊欄的設定圖示改成齒輪、詞綴頁是摺疊地圖。
+- 找遊戲視窗時，略過標題含遊戲名稱的 Discord、瀏覽器、檔案總管視窗。
+- 開啟點擊穿透時，需要捲動的頁面可以用滑鼠滾輪捲動（空白處點擊不再穿到遊戲）。
+- 對局紀錄多記了當時的設定與電腦負荷，回報問題時比較好查（不影響使用）。
+
+[[en]]
+Ascendant 1.2.0: map affix frames
+
+Map affixes (new)
+- The affixes on the map page's Base Affix panel are framed right on the game screen: dangerous ones red, ones to watch yellow. On by default; turn it off on the Affixes page, and the map page is no longer captured then.
+- By default an affix is framed in the colour the game shows it in: red for red, yellow for yellow. The built-in list has 142 affixes.
+- A new Affixes page: four buttons under each affix (Danger, Warning, Not framed, Game colour) to set your own grade. The affixes on the map you have open come first; the list can be filtered by grade and searched.
+- Two frame styles: a full outline, or a bar on the left with a light tint.
+- The frames come up about 1.3 s after the page opens. On Add Affixes the frames move with their affixes and the new one is framed once read (about 0.4 s); with six affixes the frames stay. Scrolling the panel takes the frames down until it stops.
+- Close the affix panel or switch to another window and the frames go within 1-2 s.
+- Every interface scale of the game is framed where the panel is measured surely (otherwise the Affixes page says why); a 1920 x 1080 window, underlined keywords and the English client's blue keywords read well.
+- Two affixes one character apart with different grades: when the same text reads twice in one opening of the page, it is framed as that one (mostly within 0.4 s), no longer marked unsure throughout.
+- An affix not in the list is learned from the game log once you enter that map, marked New, and framed in the game's colour; at start, the game logs already written are read for them too (affix ids and texts only).
+- With the map page closed, the This map list stays; when the page closed before it was read in full, the game log fills it in. Back in the hideout it clears.
+- An affix that can't be read reliably is not framed and is marked unknown, unsure or cut off on the Affixes page; the hideout or the Vorax surgery setup are not framed. When Ascendant's language differs from the game's, the Affixes page says so.
+  (The game's language must match Ascendant's setting, and Windows needs the same OCR language; the game window must be 16:9. On a Traditional Chinese client an affix met for the first time whose Chinese text the built-in list lacks is unknown until you have entered that map.)
+
+Tartarus
+- No early dropping in most runs: every option plays the full 1600 playouts and the advice shows once they are done, about 0.23 Chromatics more a run on average (about 0.26 on a 4-core computer); the advice comes a little later. Cage Fight runs work as before.
+- The playouts were redesigned: with the Executioner's Blacklist they count doors opened and sealed again, with traps they move toward Lions to hunt, the instruments were ranked again, and patrols look at tomorrow's landing too. On the same 200 runs played by the advice, 7.50 -> 8.04 Chromatics a run on average.
+- On a chain's target screen, a scratched door under the big jaws no longer reads one rarity lower (the game marked the door and no advice showed).
+- A flash over a portrait (a door opening, a Replace, a chain) no longer reads as a Lion.
+- When an inmate comes in, a door opens or an inmate rises a rarity, the coloured rarity effect that briefly covers the portrait no longer reads as some beast: the face is read once it shows (a new inmate shows about 0.15 s later).
+- Treasures opened one after another are each read again and get their own advice.
+- A door card's number is never taken from another door card's read that looked alike.
+- The solver's cache is let go at the end of each run: up to about 300 MB less memory while idle.
+
+Run tab
+- The Tartarus verdict first takes out the usual gain the advice makes over the expectation, then reads: within the expected range, luck ran high, luck ran low, or decisions lost points. The decision loss also counts where the advice at the time differed from the re-solve: not always the player's mistake.
+- A move made that the re-solve dropped early is played out with the best one to 1600 playouts, so the noise where it was dropped no longer counts as a loss.
+- A row of icons under the verdict card: the Riot fought or given up, the special Boss (the Jailer) killed or not, and the rainbow, red and middle chests.
+
+Vorax
+- New option "Hint to give up at the score cap" (at the bottom of the Vorax panel, off by default): in the endgame battle, once the score reaches 1.12M and every reward is taken, a line at the top of the game says giving up settles at once, and the Give Up button is boxed; it shows within about 0.5 s.
+- English client: tank numbers that do not read in full are worked out from the total activity, so advice no longer stops partway through a game; the description box tells which card the mouse is on; misread Spinal Solution names and names cut before their type are recognized; the monster Taboo Scholar is matched.
+- With the game's interface scale near 1 (for example 1.0073), the bottom row of the tank labels reads.
+- The game log tells the card picked by the board after the pick, so a card raised as the mouse passes over it is no longer taken for it (the advice was not affected).
+- Observe mode saves lossless patches of the screen (only with observe mode on, about 12 MB a game).
+
+Other
+- In the sidebar, Settings is a gear and Affixes a folded map.
+- Looking for the game window skips Discord, browser and Explorer windows whose title names the game.
+- With click-through on, pages that scroll can be scrolled with the mouse wheel (clicks on their empty parts no longer pass to the game).
+- Run logs also keep the settings and the computer's load at the time, which helps when a problem is reported (nothing changes in use).

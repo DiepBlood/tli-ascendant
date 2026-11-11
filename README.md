@@ -1,9 +1,10 @@
 # Ascendant
 
-《火炬之光：無限》（Torchlight: Infinite）的 Windows 輔助視窗，支援兩種玩法：
+《火炬之光：無限》（Torchlight: Infinite）的 Windows 輔助視窗，支援三種玩法：
 
 - **塔羅斯（Tartarus）**：讀取監獄盤面，建議下一步要去哪一格、吃掉或替換哪個囚犯、選哪個刑具或典獄長寶藏獎勵，以及要不要重新隨機。
 - **渴血手術（Vorax）**：讀取藥劑卡、水箱與手術用具，建議這一手選哪張卡、加到哪個水箱，並顯示每個選項達到 840k 的機率與平均分數；終局戰鬥時顯示波次、活性、加成與解藥瓶掉落加成。
+- **關卡詞綴（地圖頁）**：在地圖頁「基礎詞綴」面板上，把危險的詞綴框紅框、要注意的框黃框；預設照遊戲顯示的顏色，也可以在「詞綴」頁逐條自訂。
 
 > 非官方工具，與《火炬之光：無限》的開發商、發行商無關，也未經其認可。
 > Ascendant 只讀取遊戲視窗的畫面和遊戲自己寫出的日誌：不碰遊戲的記憶體、檔案或網路，也不會替你點擊或打字。
@@ -18,8 +19,10 @@ English summary at the [end of this page](#english).
 |---|---|---|
 | 塔羅斯：讀盤面與建議 | 支援 | 支援，測試較少 |
 | 渴血手術：讀卡片、水箱與建議（含終局戰鬥） | 支援 | 支援，測試較少：卡名讀不準時顯示讀不到，不亂猜；終局戰鬥面板已實測 |
+| 關卡詞綴：讀面板與框線 | 支援：第一次遇到、內建表還沒有中文的詞綴先標「未知」不框，進過那張地圖後就認得 | 支援 |
+| 關卡詞綴：從遊戲日誌學詞綴 | 支援 | 支援 |
 | 進度頁：累積次數、可玩局數 | 支援 | 應可使用（讀遊戲日誌裡不分語言的數值），尚未實測 |
-| 本局頁：運氣／決策分析 | 支援 | 支援 |
+| 本局頁：結果分析（預期範圍、運氣、決策） | 支援 | 支援 |
 | 本局頁：匯出這一局（回報資料） | 支援 | 支援 |
 
 - 本局頁的分析要用當局遊玩時的語言設定來看；語言不同時會提示先到設定頁切換。
@@ -66,9 +69,16 @@ English summary at the [end of this page](#english).
 - **字體大小**：標準／大／特大。
 - **標示要點擊的位置**（預設關閉）：在遊戲畫面上用綠色框標出建議要點的格子、卡片或按鈕。
 - **在遊戲上顯示期望值**（預設開啟）：在遊戲上要點擊的位置正上方，以小字顯示建議選項的期望值（塔羅斯：預期收容；渴血：預期最終活性）。不需要開綠框也能用，點擊會穿透到遊戲；渴血一律要拿的卡顯示「必拿」；沒有可靠數值時不顯示。
+- **關卡詞綴框線**（預設開啟，在「詞綴」頁開關）：打開地圖頁時，「基礎詞綴」面板上危險的詞綴框紅框、要注意的框黃框，約 1.3 秒內出現；按「添加詞綴」後框線會跟著移動，新加的那條讀好再框。關掉面板或切到別的視窗，框在 1～2 秒內收起。
+  - 預設照遊戲顯示的顏色框（遊戲標紅的框紅、標黃的框黃），內建 142 句詞綴。
+  - 「詞綴」頁可以自訂：每條詞綴四個按鈕（危險、警告、不標、遊戲顏色），逐條改成你自己的分級；目前地圖上的詞綴列在最上面，可以依等級篩選、搜尋。框線可選整圈外框或左側色條。
+  - 詞綴表沒有的詞綴：進入那張地圖後會從遊戲日誌自動學起來，標成「新」，先照遊戲顏色框；開程式時也會從現有的遊戲日誌補學（只取詞綴編號與文字，不讀其他內容）。
+  - 讀不準的詞綴不框，在詞綴頁標「未知」「不確定」或「不完整」；只差一個字、等級不同的兩條詞綴，同一次開頁讀到兩次相同文字才框。遊戲各種介面縮放都能上框，量不準時不框，詞綴頁會說明。
+  - Ascendant 的語言和遊戲客戶端不同時，詞綴頁會提示到設定頁改。
+  - 關掉框線時，地圖頁不再擷取畫面。
 - **不透明度**：最低 50%。
 - **進度頁**：顯示渴血與塔羅斯的累積次數與可玩局數（從遊戲日誌讀取）。
-- **本局頁**：一局結束後，分析這局的結果主要是運氣還是決策，並列出損失最大的一步。頂端的選單可以改看以前打完的局（「最近一局」會跟著每局結束更新），下方「匯出這一局」匯出的就是同一局。
+- **本局頁**：一局結束後，判斷這局的結果是在預期範圍內、運氣偏高或偏低，還是決策有失分（塔羅斯會先扣掉建議通常比預期多拿的部分；決策損失明顯時，即使運氣補回來也會標出），並列出損失最大的一步。決策損失比的是實際所選與重算的最佳，也包含當時建議和重算的差，不一定是你的失誤。塔羅斯的判定下方另有一列圖示：鎮壓戰打或放棄、獄卒有沒有擊殺、彩箱／紅箱／中箱數。頂端的選單可以改看以前打完的局（「最近一局」會跟著每局結束更新），下方「匯出這一局」匯出的就是同一局。
 - 讀錯的格子可以直接點來修正。
 
 設定存在 `%APPDATA%\Ascendant\settings.json`，「還原預設值」按鈕可以回到預設設定。
@@ -129,10 +139,11 @@ cargo build --release --bin ascendant-cli   # 命令列工具
 
 ## English
 
-Ascendant is a Windows companion app for *Torchlight: Infinite*, modified from [arcasti/tli-warden](https://github.com/arcasti/tli-warden). It reads the game window and recommends moves for two modes:
+Ascendant is a Windows companion app for *Torchlight: Infinite*, modified from [arcasti/tli-warden](https://github.com/arcasti/tli-warden). It reads the game window and helps with three things:
 
 - **Tartarus**: which destination to take, which Inmate to consume or replace, which Torture Instrument or Warden's Treasure reward to pick, and when to re-roll.
 - **Vorax**: which card to pick and which tank to add it to, with each option's chance to reach 840k and its average score, plus the endgame battle's wave, activity, bonus and Antidote Vial drop bonus. Vorax advice works on both the Traditional Chinese and the English game client.
+- **Map affixes**: on the map page's Base Affix panel, dangerous affixes are framed red and ones to watch yellow; by default in the colour the game shows them in, and yours to set on the Affixes page.
 
 Unofficial and not affiliated with the game's developers or publishers. It only reads pixels from the game window and the game's own log; it never touches the game's memory, files or network traffic, and never clicks or types for you.
 
@@ -142,8 +153,10 @@ Unofficial and not affiliated with the game's developers or publishers. It only 
 |---|---|---|
 | Tartarus: board reading and advice | yes | yes, less tested |
 | Vorax: cards, tanks and advice (endgame battle included) | yes | yes, less tested: a card that cannot be read reliably shows as unread instead of a guess; the endgame battle panel was tested in live games |
+| Map affixes: reading the panel and framing | yes: an affix met for the first time whose Chinese text the built-in list lacks is unknown (not framed) until you have entered that map | yes |
+| Map affixes: learning from the game log | yes | yes |
 | Progress tab: counts and games left | yes | should work (it reads language-neutral values from the game log), not tested yet |
-| Run tab: luck vs decisions | yes | yes |
+| Run tab: result review (expected range, luck, decisions) | yes | yes |
 | Run tab: Export this run (report data) | yes | yes |
 
 A run is reviewed in the language it was played in; when the setting differs, the Run tab asks you to switch it first. The Traditional Chinese client is the most tested and is recommended. Vorax on the English client is new in 1.1.0: the round is read about 97% of the time and card names on the choice screen about 98%, with 0 misreads in a manual spot check, but more cards show as unread, so glance at the board before you pick.
@@ -162,8 +175,9 @@ A run is reviewed in the language it was played in; when the setting differs, th
 - Auto read (on by default) reads whenever the screen changes. F8 toggles auto read, F9 reads once. When the game runs as administrator, F8 and F9 do nothing while it is in front, and the status bar says so: switch to another window first, press "Restart as administrator" on that notice, or turn on "Start as administrator" under Settings → "Advice and controls" (Windows then asks at every start). The keys can be changed under Settings → "Advice and controls": press "Change", then press the new key (Esc cancels). A key that is the other hotkey, taken by another program, a letter or digit without Ctrl or Alt, or a copy/cut/paste key is refused with the reason; the Win key cannot be recorded, and number pad digits are recorded as the top-row digits.
 - Click-through: click the "Thru" light in the side rail to turn it on or off; it is green while on. Clicks on the window's empty space then go to the game, while its buttons, cells and the side rail still take clicks.
 - "Layout": Auto, Full or Compact (Auto switches to Compact when the window is short). "Text size": Standard, Large or Extra large. "Highlight where to click" (off by default) puts a green box on the advised cell, card or button in the game. "Show the expected value on the game" (on by default) shows the advised move's expected value in small text just above where to click (Tartarus: expected loot, Vorax: expected final activity); it works with the green box off too. Clicks go through it; a Vorax card always taken shows "Always take"; nothing shows when there is no reliable value. "Opacity" goes down to 50%.
+- **Map affix frames** (on by default, switched on the Affixes page): open a map page and the dangerous affixes on its Base Affix panel are framed red and the ones to watch yellow, within about 1.3 s; on Add Affixes the frames move with their affixes and the new one is framed once read. Close the panel or switch windows and they go within 1-2 s. By default an affix is framed in the colour the game shows it in (142 affixes built in). The Affixes page sets your own grade for any affix with four buttons (Danger, Warning, Not framed, Game colour), with the affixes on the open map first, a filter and a search, and two frame styles. An affix not in the list is learned from the game log once you enter that map, and from the logs already written when the app starts (affix ids and texts only; nothing else is read), and framed in the game's colour meanwhile. An affix that can't be read reliably is not framed and is marked on the Affixes page; two affixes one character apart with different grades are framed once the same text reads twice. Every interface scale of the game is framed where the panel is measured surely; otherwise the Affixes page says why, and it also says when Ascendant's language differs from the game's. With the frames off, the map page is not captured. On a Traditional Chinese client an affix met for the first time whose Chinese text the built-in list lacks is unknown until you have entered that map.
 - Progress tab: Vorax and Tartarus counts and games left, read from the game log.
-- Run tab: after a game, whether it came down to luck or decisions, and the most costly step. The picker at the top reviews an earlier finished run ("Latest run" follows each game as it ends), and "Export this run" below exports the same run.
+- Run tab: after a game, whether the result was within the expected range, luck ran high or low, or decisions lost points (for Tartarus the usual gain the advice makes over the expectation is taken out first; a clear decision loss is shown even when luck made up for it), and the most costly step. The decision loss compares the move made with the re-solved best, so it also counts where the advice at the time differed from the re-solve: not always the player's mistake. Under a Tartarus verdict, icons show the Riot fought or given up, the Jailer killed or not, and the chests. The picker at the top reviews an earlier finished run ("Latest run" follows each game as it ends), and "Export this run" below exports the same run.
 - A misread cell can be clicked to correct it.
 - Settings live in `%APPDATA%\Ascendant\settings.json`; "Restore defaults" goes back to the defaults. Log sharing is off in this build.
 - "Keep a run log" (on by default) must stay on for the Run tab and the export. Run logs go to `%APPDATA%\Ascendant\runs` and `vorax`, where Tartarus and Vorax each keep only their newest 10 finished games (`log.jsonl`, `frame-*.jpg` and other screenshots) and older folders are deleted automatically, unless "Keep all run logs" (off by default) is turned on, which keeps every log and screenshot (watch your disk space); only empty folders from opening and closing Ascendant without any read are still deleted.

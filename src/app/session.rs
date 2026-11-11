@@ -825,11 +825,16 @@ pub const BITE_READABLE: std::time::Duration = std::time::Duration::from_millis(
 /// Playouts per option before the playouts can overrule the strategy's pick.
 const LIVE_MIN: usize = 150;
 /// Playouts per option before the advice shows, with its mark, before the
-/// solve ends: in 143 solves of two 2026-10-30 runs, the advice at 150
-/// changed later 17 times, at 500 four times (half the solves end by 900).
-/// The mark waited for the solve's end, 0.11 to 0.17 s after it began and
-/// up to 0.4 s.
+/// solve ends, in a Cage Fight run (see [`Session::races`]): in 143 solves of
+/// two 2026-10-30 runs, the advice at 150 changed later 17 times, at 500 four
+/// times (half the solves end by 900). The mark waited for the solve's end,
+/// 0.11 to 0.17 s after it began and up to 0.4 s.
 const SHOW_MIN: usize = 500;
+
+/// The threads a solve plays on: all cores but one, at least one.
+pub fn solve_threads() -> usize {
+    std::thread::available_parallelism().map_or(1, |n| n.get().saturating_sub(1).max(1))
+}
 /// Playouts per option a slow solve stops at once it has run [`SLOW_SOLVE`]:
 /// a Cage Fight board with Avenger's Casket took about 1 s to its 1600
 /// (0.1 to 0.3 s in other runs), as its chains run long. On 120 Cage Fight
@@ -918,6 +923,13 @@ fn scan(frame: Rgba, keep: bool, hint: Option<f32>) -> Scanned {
 
 /// How the line for a game window narrower than 16:9 starts.
 const SHAPE: &str = "The game window is ";
+
+/// The `top` of an advice row: the best three moves played out, as ranked, each [label, mean, standard error,
+/// playouts] (means and errors to 3 decimals).
+fn top_moves(ranking: &[SolveOption]) -> Vec<serde_json::Value> {
+    let round = |x: f64| (x * 1000.0).round() / 1000.0;
+    ranking.iter().filter(|o| o.n > 0).take(3).map(|o| json!([o.label, round(o.mean), round(o.se), o.n])).collect()
+}
 
 /// A window as wide as 16:9 or wider is read: [`crate::reader::layout::lay_out_scaled`] lays it out as
 /// the reference frame. A window narrower than 16:9 (by more than 1%) has
@@ -1368,6 +1380,9 @@ pub struct Session {
     pub solving: bool,
     /// Playouts per option for a full solve.
     pub rollouts: usize,
+    /// The threads a solve plays on, [`solve_threads`] unless set (a test or a replay sets it to stand for another
+    /// machine).
+    pub threads: usize,
     /// The state the running solve plays from.
     state: Option<State>,
     /// The stored read, its days replaced by the clock's count.
@@ -1732,6 +1747,7 @@ impl Session {
             rounds: 0,
             solving: false,
             rollouts: rollouts.max(1),
+            threads: solve_threads(),
             state: None,
             scene: None,
             size: (REF_W, REF_H),
@@ -3042,6 +3058,25 @@ impl Session {
         }
     }
 
+    /// Writes how the riot went ([`Signal::RiotEnd`]) as a `riot` row into the folder of the run that just ended (its
+    /// run_end row was written up to [`RIOT_AFTER_END`] before), and gives that folder for the run review. Nothing
+    /// when no run ended that recently: the riot could be another run's (a log followed from mid-riot), and a run
+    /// given up before its last day has no settlement to show it on.
+    pub fn log_riot_end(&self, end: gamelog::RiotEnd) -> Option<std::path::PathBuf> {
+        let log = self.log.as_ref()?;
+        let (dir, _) = self.ended.as_ref().filter(|(_, at)| at.elapsed() < RIOT_AFTER_END)?;
+        let fields = json!({
+            "fought": end.fought,
+            "boss": end.boss,
+            "boss_killed": end.boss_killed,
+            "red": end.red,
+            "color": end.color,
+            "medium": end.medium,
+        });
+        log.event_in(dir, "riot", SystemTime::now(), fields);
+        Some(dir.clone())
+    }
+
     /// The window language was switched, so Windows OCR reads in another language now: the window line is written
     /// again with it, and later run folders start with it.
     pub fn log_language(&mut self) {
@@ -3078,6 +3113,11 @@ impl Session {
         if let Some(u) = self.ui_scale {
             fields["u"] = json!(logged_scale(u));
         }
+        // The Usurpation stage the solve weighs (see `note_usurpation`): the audit's rebuild takes it from here, as
+        // the game's log names stage IV only.
+        if let Some(id) = self.usurped {
+            fields["usurped"] = json!(id);
+        }
         if let Some(why) = why {
             fields["unshown"] = why;
         }
@@ -3107,6 +3147,12 @@ impl Session {
             "sd": best.map(|o| round(o.se * (o.n as f64).sqrt())),
             "memo_held": memo_held,
             "memo_mb": memo_bytes / (1 << 20),
+            // The best three moves as ranked (label, mean, standard error, playouts): a flip of the advice between two
+            // solves of a board, and how close the moves were, read off the log without solving again (the user's ask
+            // of 2026-11-09; about 150 bytes a row).
+            "top": top_moves(&self.ranking),
+            // The playouts' version (solver::PLAYOUT_VERSION): the audit takes out the drift fitted for it.
+            "playout": crate::solver::PLAYOUT_VERSION,
         });
         log.event("advice", SystemTime::now(), fields);
     }
@@ -3440,6 +3486,13 @@ impl Session {
                         // the game marked it (2026-11-01, day 1).
                         (&CellModel::Scratch { tier: door, .. }, &CellModel::Inmate { beast, tier, ivory, prey, event }) if tier < door => {
                             CellModel::Inmate { beast, tier: door, ivory, prey, event }
+                        }
+                        // A scratched door under the big jaws keeps the board's rarity as well: the inmate behind a
+                        // locked door does not change, and the red of the jaws over its glow read a Magic door as
+                        // Normal. The Magic Wolf eating it then had no meal on the board read, and no advice showed
+                        // while the game marked the door (2026-11-10 day 13, cell 12; 2026-10-31, cell 10).
+                        (&CellModel::Scratch { tier: door, .. }, &CellModel::Scratch { event, .. }) if jaws.contains(&n) && unedited(n) => {
+                            CellModel::Scratch { tier: door, event }
                         }
                         _ => read.clone(),
                     };
@@ -3897,10 +3950,15 @@ impl Session {
         if self.suspended {
             return;
         }
+        // The gift advised on this pick's screen: outside a Cage Fight `shown` is noted only at a solve's end
+        // (see `note_shown`), so while this pick still solves it is the treasure before's, for the whole solve
+        // (a median 66 ms, up to 238 ms, 2026-11-11). The advice on show is the one held for this very read, or
+        // none; with none the gift stays unknown rather than wrong.
+        let on_show = if self.races() { self.shown.clone() } else { self.shown_advice().map(|a| a.action) };
         self.gifts_taken += 1;
         self.gift_unanswered = true;
         if self.reading.as_ref().is_some_and(|r| r.screen == Screen::TreasurePick)
-            && let Some(Action::Choose { id: ChoiceId::Name(key) }) = &self.shown
+            && let Some(Action::Choose { id: ChoiceId::Name(key) }) = &on_show
             && let Some(gift) = Gift::from_key(key)
         {
             self.unseen_gifts.push(gift);
@@ -4381,6 +4439,23 @@ impl Session {
         plan
     }
 
+    /// Whether the solve races its options and its advice shows before the solve ends: only in a Cage Fight run.
+    /// Other runs play every option to the full rounds and show the advice once, at the solve's end. Racing dropped
+    /// options that trailed early, the advice showed past SHOW_MIN playouts, and `keep_shown` kept the first leader
+    /// past LIVE_MIN to the end while within the margin of error (now it keeps only a move on show, see
+    /// `note_shown`): in 9 runs of 2026-11-09/10, 40 decisions ended on
+    /// a move 0.02 or more behind the first row, never shown before the end in 39 of them, at 0.07 Chromatics each by
+    /// 6400-playout re-solves (0.32 a run). Every option to 1600 playouts took a median 66 ms, p90 134 ms, at most
+    /// 238 ms on 787 boards of those runs (19 threads, 2026-11-11), 45 ms more than racing at the median, while the
+    /// player clicked 0.33 to 0.65 s after the solve's end. Cage Fight boards took a median 130 ms, p90 313 ms, at
+    /// most 1.7 s on 991 boards, so they race as before. On 3 threads, as a 4-core machine solves, the advice first
+    /// showed a median 252 ms, p90 409 ms, at most 617 ms after the solve began against 71, 340 and 512 ms racing
+    /// as 1.1.0 did (the same 11 runs replayed, 2026-11-11), for 0.26 Chromatics a run more by 6400-playout
+    /// re-solves; 1.1.0 itself took up to 0.73 s (2026-10-31), so every machine plays every option to the end.
+    pub fn races(&self) -> bool {
+        self.theme == Some(CAGE_FIGHT)
+    }
+
     /// What the window recommends now; see [`advise`].
     pub fn advice(&self) -> Option<Advice> {
         let a = advise(self.pick.as_ref(), &self.ranking, self.live())?;
@@ -4482,7 +4557,13 @@ impl Session {
         if self.live()
             && let Some(a) = self.advice()
         {
-            self.shown = Some(a.action.clone());
+            // Outside a Cage Fight only a move on show is kept: there the advice shows at the solve's end, and the
+            // leader noted from LIVE_MIN on, never shown, was kept over the first row at the end (see `races`). A
+            // read of the same screen whose board changed a little, 0.2 s after the last, still keeps the move on show
+            // within the margin of error: 09 gave way to 07 and came back 0.2 s on without it (2026-11-10, day 5).
+            if self.races() || self.settled() {
+                self.shown = Some(a.action.clone());
+            }
             if self.reading.as_ref().is_some_and(|r| r.screen == Screen::Manage) {
                 self.manage_bite = matches!(a.action, Action::Devour { .. }).then(|| a.clone());
                 self.manage_loot = self.manage_bite.as_ref().and_then(|a| self.ranking.get(a.option?)).filter(|o| o.n > 0).map(|o| o.mean);
@@ -4544,7 +4625,8 @@ impl Session {
         // `Session::poll`), and "Hunt 09" gave way to "Hunt 12", the same
         // card and a Mammoth alike, 0.06 s later (2026-11-02, 6 times in 8
         // runs). The solve's end rates it as ever. Only a move shown on this
-        // very screen (its held key): `shown` outlives the day.
+        // very screen (its held key): `shown` outlives the day. Only a Cage
+        // Fight run shows moves early now (see `Session::races`).
         let here = |r: &Reading| self.held.as_ref().is_some_and(|(key, held)| *key == held_key(r, self.gifts_taken) && held.action == *shown);
         let manage = self.solving && self.reading.as_ref().is_some_and(|r| r.screen == Screen::Manage && here(r)) && same_card(shown, &a.action);
         let kept = if manage { (0..self.ranking.len()).find(|&k| same(&self.ranking[k].action)) } else { also_good(&self.ranking, a.option).into_iter().find(|&k| same(&self.ranking[k].action)) };
@@ -4878,16 +4960,18 @@ impl Session {
         self.rx = Some(rx);
         self.solving = true;
         (self.advice_steady, self.last_best) = (false, None);
-        let (notify, rollouts) = (self.notify.clone(), self.rollouts);
+        let (notify, rollouts, race, threads) = (self.notify.clone(), self.rollouts, self.races(), self.threads);
         let unseen = if reading_pick { self.unseen_gifts.clone() } else { Vec::new() };
         // The playouts use all cores but one, below normal priority so the
         // game keeps its frame rate, once they can overrule the strategy's
         // pick: before, at normal priority, as the game busy with a new day
         // held a patrol's advice back 3 s (0.5 s in a replay, 2026-10-28).
-        let threads = std::thread::available_parallelism().map_or(1, |n| n.get().saturating_sub(1).max(1));
         std::thread::spawn(move || {
             let started = std::time::Instant::now();
             let mut r = Rollouts::with(&st, SEED, &TUNED, first.then_some(&bites[..])).after(&unseen);
+            if !race {
+                r = r.without_racing();
+            }
             loop {
                 #[cfg(windows)]
                 {
@@ -5042,6 +5126,9 @@ impl Session {
         if self.run_over.is_some() {
             return;
         }
+        // The solver's playout threads keep their chain memos between solves (150 to 300 MB, 2026-11-08); in town
+        // until the next run they only take memory. Released off this thread: it waits for every playout thread.
+        std::thread::spawn(crate::solver::release_memos);
         // The game's log counts the gifts confirmed: the run's last
         // treasures leave no board to read (2026-10-28: 4 read for 6).
         let taken = (self.gifts_taken / treasure_picks(self.theme) as usize).min(VAULT_CAP as usize);
@@ -5195,7 +5282,8 @@ impl Session {
         // On the manage screen a Consume (or a Hunt) is its card whatever
         // its target: moves alike there need not wait, as the first click is
         // the same (ties held the advice 0.1 s longer in a 2026-10-30 run).
-        if changed && self.solving && self.rounds >= SHOW_MIN {
+        // Only in a Cage Fight run: others show the advice at the solve's end (see `races`).
+        if changed && self.solving && self.rounds >= SHOW_MIN && self.races() {
             let manage = self.reading.as_ref().is_some_and(|r| r.screen == Screen::Manage);
             let alike = |a: &Action, b: &Action| if manage { same_card(a, b) } else { a == b };
             let advice = self.advice();
@@ -5384,6 +5472,46 @@ mod tests {
         scene
     }
 
+    /// A cell the door-opening flash washes out keeps the last board's cell under a note of its own (not the
+    /// tooltip's), counts as the least sure read so the board is read again, and with no board to keep reads as a
+    /// door, not an empty cell.
+    #[test]
+    fn a_door_still_opening_keeps_the_last_board() {
+        let panels = screen_panels(Screen::Manage, Some(12));
+        let before = to_model(&scene_with(&[(9, Beast::Wolf, 1, 1.0)]), &panels, &[], None, RUN_DAYS).0;
+        let mut flash = scene_with(&[]);
+        (flash.cells[7].flash, flash.cells[7].covered) = (true, true);
+        assert_eq!(least_sure(&flash), 0.0);
+        let opening = |w: &Warning| w.text.contains("still opening") || w.text.contains("\u{9580}\u{9084}\u{5728}\u{958b}");
+        let tooltip = |w: &Warning| w.text.contains("tooltip") || w.text.contains("\u{63d0}\u{793a}\u{6846}");
+        let (kept, warns) = to_model(&flash, &panels, &[], Some(&before), RUN_DAYS);
+        assert_eq!(kept.cells[8], before.cells[8]);
+        assert!(warns.iter().any(opening) && !warns.iter().any(tooltip));
+        let (alone, warns) = to_model(&flash, &panels, &[], None, RUN_DAYS);
+        assert!(matches!(alone.cells[8], CellModel::Sealed { .. }));
+        assert!(warns.iter().any(opening) && !warns.iter().any(tooltip));
+    }
+
+    /// A cell a rarity effect hides is kept from the last board the same way, under a note of its own (not the
+    /// flash's nor the tooltip's): an inmate rising to Ultimate keeps its beast instead of a guess.
+    #[test]
+    fn a_rarity_shield_keeps_the_last_board() {
+        let panels = screen_panels(Screen::Patrol, Some(12));
+        let before = to_model(&scene_with(&[(9, Beast::Rat, 3, 1.0)]), &panels, &[], None, RUN_DAYS).0;
+        let mut shield = scene_with(&[]);
+        (shield.cells[7].shield, shield.cells[7].covered) = (true, true);
+        assert_eq!(least_sure(&shield), 0.0);
+        let shielded = |w: &Warning| w.text.contains("rarity effect") || w.text.contains("\u{7279}\u{6548}");
+        let opening = |w: &Warning| w.text.contains("still opening") || w.text.contains("\u{9580}\u{9084}\u{5728}\u{958b}");
+        let tooltip = |w: &Warning| w.text.contains("tooltip") || w.text.contains("\u{63d0}\u{793a}\u{6846}");
+        let (kept, warns) = to_model(&shield, &panels, &[], Some(&before), RUN_DAYS);
+        assert_eq!(kept.cells[8], before.cells[8]);
+        assert!(warns.iter().any(shielded) && !warns.iter().any(opening) && !warns.iter().any(tooltip));
+        let (alone, warns) = to_model(&shield, &panels, &[], None, RUN_DAYS);
+        assert!(matches!(alone.cells[8], CellModel::Sealed { .. }));
+        assert!(warns.iter().any(shielded) && !warns.iter().any(tooltip));
+    }
+
     /// The panels of `screen` with `days` until the riot and every decision button on show.
     fn screen_panels(screen: Screen, days: Option<u32>) -> Panels {
         Panels {
@@ -5492,6 +5620,49 @@ mod tests {
         assert_eq!(s.loot(Some(0)), Some(7.25), "played out: its own mean");
         assert_eq!(s.loot(None), None);
         assert_eq!(s.loot(Some(3)), None);
+    }
+
+    /// An advice row's `top`: the best three played-out moves, a lone move's unplayed mean left out.
+    #[test]
+    fn an_advice_row_names_the_best_three_moves() {
+        let option = |to: usize, mean: f64, n: usize| SolveOption { label: format!("Eat {to}"), action: Action::Devour { to }, mean, se: 0.12345, gap_se: 0.0, n, best: 0.0, policy: false };
+        let mut ranking = vec![option(4, 7.25, 1600), option(6, 7.1234, 1600), option(8, 6.0, 900), option(9, 5.0, 900)];
+        let top = top_moves(&ranking);
+        assert_eq!(top, [json!(["Eat 4", 7.25, 0.123, 1600]), json!(["Eat 6", 7.123, 0.123, 1600]), json!(["Eat 8", 6.0, 0.123, 900])]);
+        ranking[0].n = 0;
+        assert_eq!(top_moves(&ranking)[0][0], json!("Eat 6"), "an unplayed move is no prediction");
+    }
+
+    /// How the riot went goes into the folder of the run that just ended as one riot row, and the folder is given for
+    /// the review; with no run just ended (the next run started), nothing is written.
+    #[test]
+    fn the_riot_end_goes_to_the_run_just_ended() {
+        let root = std::env::temp_dir().join(format!("ascendant-riot-end-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let mut s = Session::new(100, Vec::new(), None, Some(10));
+        s.log = Some(RunLog::new(root.clone()));
+        let rows = |dir: &std::path::Path| -> Vec<serde_json::Value> {
+            std::fs::read_to_string(dir.join("log.jsonl")).unwrap_or_default().lines().map(|l| serde_json::from_str(l).unwrap()).collect()
+        };
+        let log = s.log.as_mut().unwrap();
+        log.event("run_end", SystemTime::now(), json!({ "vaulted": 6 }));
+        let ended = log.dir().to_path_buf();
+        log.new_run();
+        s.ended = Some((ended.clone(), std::time::Instant::now()));
+        let end = gamelog::RiotEnd { fought: true, boss: true, boss_killed: true, red: 1, color: 3, medium: 7 };
+        assert_eq!(s.log_riot_end(end).as_deref(), Some(ended.as_path()));
+        s.log.as_ref().unwrap().wait();
+        let got = rows(&ended);
+        assert_eq!(got.len(), 2);
+        let row = &got[1];
+        assert_eq!(row["kind"], "riot");
+        assert_eq!((row["fought"].as_bool(), row["boss"].as_bool(), row["boss_killed"].as_bool()), (Some(true), Some(true), Some(true)));
+        assert_eq!((row["red"].as_u64(), row["color"].as_u64(), row["medium"].as_u64()), (Some(1), Some(3), Some(7)));
+        s.note_game(Signal::RunStart);
+        assert_eq!(s.log_riot_end(gamelog::RiotEnd::default()), None);
+        s.log.as_ref().unwrap().wait();
+        assert_eq!(rows(&ended).len(), 2);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// The riot battle's boss goes into the folder of the run that just ended, as one riot_boss row with the game
@@ -5616,6 +5787,12 @@ mod tests {
     /// (2026-11-05 day 5: "Chain on into 08" showed for 0.08 s before one jawless read cleared it).
     #[test]
     fn a_jawless_read_in_a_chain_keeps_its_advice_and_mark() {
+        // A whole solve runs between the bite and the read that must fall within BITE_SHOWS of it: in a debug build
+        // under load that took 4.9 s and the read was no longer held (2026-11-09).
+        if cfg!(debug_assertions) {
+            eprintln!("skipped: times a read against BITE_SHOWS after a solve, too slow in a debug build; run `cargo test --profile fast-test`");
+            return;
+        }
         let (_, after, jawed) = bite_boards();
         for refill in [false, true] {
             let mut s = chain_advised(|s| {
@@ -6275,6 +6452,12 @@ mod tests {
     /// the eater's portrait still changes (a Wolf so taken was a Lion 0.23 s on, 2026-11-02).
     #[test]
     fn the_same_eater_from_the_jaws_right_after_a_bite_is_still_a_guess() {
+        // Two solves run before the last check, which must fall within DIFFER_STEADY of the bite: too slow for that
+        // in a debug build under load (2026-11-09).
+        if cfg!(debug_assertions) {
+            eprintln!("skipped: times a read against DIFFER_STEADY after a solve, too slow in a debug build; run `cargo test --profile fast-test`");
+            return;
+        }
         let board = scene_with(&[(3, Beast::Rat, 0, 1.0), (7, Beast::Mammoth, 1, 1.0), (9, Beast::Wolf, 0, 1.0)]);
         let jaws = with_jaws(&board, &[7]);
         let mut s = chain_on(&board);
@@ -6539,6 +6722,84 @@ mod tests {
         assert!(s.mark().is_some(), "the eater read: the mark shows");
     }
 
+    /// Outside a Cage Fight the advice shows once, at the solve's end: past SHOW_MIN playouts with the same clear
+    /// leader it stays hidden, and that leader, never shown, is not kept over the first row. A Cage Fight run shows
+    /// it early and keeps it, as before (see `Session::races`).
+    #[test]
+    fn the_advice_shows_early_and_is_kept_in_a_cage_fight_only() {
+        let opt = |action: Action, mean: f64, gap_se: f64| SolveOption { label: String::new(), action, mean, se: 0.05, gap_se, n: 1600, best: 0.0, policy: false };
+        let (a, b) = (Action::Patrol { cell: 3 }, Action::Patrol { cell: 5 });
+        // However few the threads, only a Cage Fight shows early.
+        for (theme, threads) in [(None, 19), (Some(CAGE_FIGHT), 19), (None, 1)] {
+            let cage = theme.is_some();
+            let mut s = Session::new(1600, Vec::new(), theme, None);
+            s.threads = threads;
+            assert_eq!(s.races(), cage);
+            s.reading = Some(Reading { model: board(), warnings: Vec::new(), screen: Screen::Patrol, days_left: None, at: SystemTime::now(), eater_inferred: false });
+            // Two progresses past SHOW_MIN with A clear of B.
+            let (tx, rx) = channel();
+            (s.rx, s.solving) = (Some(rx), true);
+            for rounds in [SHOW_MIN, SHOW_MIN + 50] {
+                tx.send(Progress { rounds, done: false, options: vec![opt(a.clone(), 9.0, 0.0), opt(b.clone(), 8.0, 0.05)] }).unwrap();
+                s.poll();
+            }
+            assert_eq!(s.shown_advice().is_some(), cage, "early showing, theme {theme:?}, {threads} threads");
+            // The solve ends with B first and A within the margin of error.
+            tx.send(Progress { rounds: 1600, done: true, options: vec![opt(b.clone(), 9.02, 0.0), opt(a.clone(), 9.0, 0.1)] }).unwrap();
+            s.poll();
+            let want = if cage { a.clone() } else { b.clone() };
+            assert_eq!(s.shown_advice().map(|x| x.action), Some(want), "kept, theme {theme:?}, {threads} threads");
+        }
+    }
+
+    /// Outside a Cage Fight every option that applies plays every round, on any number of threads; a Cage Fight's
+    /// solve races, so a trailing option stops early (see `Session::races`). The thread counts are set, not the
+    /// machine's.
+    #[test]
+    fn every_option_plays_every_round_outside_a_cage_fight() {
+        let before = day7_scene((Beast::Lion, 2), (Beast::Wolf, 2, 1.0), (Beast::Rat, 2, 1.0), &[14, 16]);
+        for (theme, threads) in [(None, 19), (Some(CAGE_FIGHT), 19), (None, 1)] {
+            let mut s = Session::new(1600, Vec::new(), theme, Some(13));
+            s.threads = threads;
+            assert_eq!(s.races(), theme.is_some());
+            s.live = true;
+            installs(&mut s, &before, screen_panels(Screen::Manage, Some(13)));
+            s.wait();
+            assert!(s.ranking.len() >= 2, "{theme:?}: {} options", s.ranking.len());
+            let played: Vec<usize> = s.ranking.iter().map(|o| o.n).filter(|&n| n > 0).collect();
+            if !s.races() {
+                // Every option plays the same rounds: 1600, or fewer when the wall-clock stop (ENOUGH playouts past
+                // SLOW_SOLVE) ends the solve on a busy machine, as when the test groups run side by side.
+                assert!(s.rounds >= ENOUGH && played.iter().all(|&n| n == s.rounds), "every round: {played:?} of {}", s.rounds);
+            } else {
+                // Racing drops trailing options: some stop early, or all but one and the solve ends early.
+                assert!(s.rounds < 1600 || played.iter().any(|&n| n < s.rounds), "racing: {played:?} of {}", s.rounds);
+            }
+        }
+    }
+
+    /// A read of the same screen whose board changed a little keeps the move shown at the last solve's end while
+    /// within the margin of error: 2026-11-10 day 5, the patrol read three times 0.2 s apart, the middle read's
+    /// board a little off with 07 ahead of 09 by 0.001; 09 stayed on show.
+    #[test]
+    fn a_move_shown_stays_through_a_read_within_the_margin() {
+        let opt = |action: Action, mean: f64, gap_se: f64| SolveOption { label: String::new(), action, mean, se: 0.05, gap_se, n: 1600, best: 0.0, policy: false };
+        let (nine, seven) = (Action::Patrol { cell: 8 }, Action::Patrol { cell: 6 });
+        let mut s = Session::new(1600, Vec::new(), None, None);
+        s.reading = Some(Reading { model: board(), warnings: Vec::new(), screen: Screen::Patrol, days_left: None, at: SystemTime::now(), eater_inferred: false });
+        let (tx, rx) = channel();
+        (s.rx, s.solving) = (Some(rx), true);
+        tx.send(Progress { rounds: 1600, done: true, options: vec![opt(nine.clone(), 7.8452, 0.0), opt(seven.clone(), 7.8442, 0.01)] }).unwrap();
+        s.poll();
+        assert_eq!(s.shown_advice().map(|a| a.action), Some(nine.clone()));
+        // The next read solves again: 07 first by 0.001.
+        let (tx, rx) = channel();
+        (s.rx, s.solving) = (Some(rx), true);
+        tx.send(Progress { rounds: 1600, done: true, options: vec![opt(seven.clone(), 7.8453, 0.0), opt(nine.clone(), 7.8442, 0.01)] }).unwrap();
+        s.poll();
+        assert_eq!(s.shown_advice().map(|a| a.action), Some(nine));
+    }
+
     /// The advice on an eater taken from the jaws is not held: the eater
     /// read as another beast solves again with nothing of it on show.
     #[test]
@@ -6711,15 +6972,29 @@ mod tests {
     #[test]
     fn gifts_confirmed_unseen_are_kept_for_the_next_pick() {
         let reading = Reading { model: board(), warnings: Vec::new(), screen: Screen::TreasurePick, days_left: None, at: SystemTime::now(), eater_inferred: false };
+        let opt = |action: Action| SolveOption { label: String::new(), action, mean: 9.0, se: 0.05, gap_se: 0.0, n: 100, best: 0.0, policy: false };
+        let brand = Action::Choose { id: ChoiceId::Name(Gift::Brand.key().to_string()) };
+        // Outside a Cage Fight: the gift on show for this read, from the solve's end.
         let mut s = Session::new(100, Vec::new(), None, None);
-        s.reading = Some(reading);
-        s.shown = Some(Action::Choose { id: ChoiceId::Name(Gift::Brand.key().to_string()) });
+        s.reading = Some(reading.clone());
+        s.ranking = vec![opt(brand.clone())];
         s.note_treasure();
         s.note_treasure();
         assert_eq!(s.unseen_gifts, vec![Gift::Brand, Gift::Brand]);
-        s.shown = Some(Action::End);
+        s.ranking = vec![opt(Action::End)];
         s.note_treasure();
         assert_eq!(s.unseen_gifts.len(), 2);
+        // Confirmed while this read still solves, nothing held for it: the gift noted before (the treasure before's)
+        // is not taken; it stays unknown.
+        (s.solving, s.rounds, s.shown) = (true, 400, Some(brand.clone()));
+        s.note_treasure();
+        assert_eq!(s.unseen_gifts.len(), 2);
+        // A Cage Fight takes the move noted, as before.
+        let mut s = Session::new(100, Vec::new(), Some(CAGE_FIGHT), None);
+        s.reading = Some(reading);
+        s.shown = Some(brand);
+        s.note_treasure();
+        assert_eq!(s.unseen_gifts, vec![Gift::Brand]);
     }
 
     /// A Cage Fight Rat, risen to Rare and read mid-change as another beast,

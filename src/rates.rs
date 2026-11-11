@@ -43,6 +43,8 @@ struct Line {
     #[serde(default)]
     theme: Option<String>,
     #[serde(default)]
+    usurped: Option<u32>,
+    #[serde(default)]
     model: Option<Value>,
 }
 
@@ -92,6 +94,9 @@ pub struct Read {
     pub model: Model,
     /// The run's theme the session held at the read (the data's English name), which the model lacks.
     pub theme: Option<String>,
+    /// The last Usurpation stage (incident 252 to 255) the session held at the read: stages I to III play the
+    /// shared popup sound in the game's log, so only the popup read names them. Rows before 2026-11-11 have none.
+    pub usurped: Option<u32>,
 }
 
 /// One row of the log: a board read or a game signal; ms is the time (milliseconds).
@@ -156,7 +161,7 @@ pub fn parse_run(name: &str, text: &str) -> Run {
                 if l.theme.is_some() && l.theme.as_deref() == cage {
                     run.cage_fight = true;
                 }
-                run.events.push(Event::Read(Read { at: l.at, screen: l.screen.unwrap_or_default(), model: Model::from(model), theme: l.theme }));
+                run.events.push(Event::Read(Read { at: l.at, screen: l.screen.unwrap_or_default(), model: Model::from(model), theme: l.theme, usurped: l.usurped }));
             }
             _ => {}
         }

@@ -475,6 +475,9 @@ pub fn norm(s: &str) -> String {
         // OCR always reads `嗅` in `驚醒嗅鹽` as `臭` (2026-11-04 ranked game); no other character in the
         // name tables (card names, monster names) contains `嗅` or `臭`.
         '嗅' => '臭',
+        // OCR reads `獸` in monster names as the Japanese form `獣` (`異獣`, `蠍獣`: 2026-11-08 to 11-11, logged as
+        // unknown); no name in the tables contains `獣`.
+        '獣' => '獸',
         c => c,
     })
     .collect();
@@ -558,6 +561,47 @@ fn tank_values(i: usize) -> Rect {
 /// Archetype icon.
 fn tank_icon(i: usize) -> Rect {
     Rect::new(TANK_X[i] - 12, 485, 24, 23)
+}
+
+/// The parts of a board a read takes its fields from, at the original setting on the reference screen, one row of
+/// the [`evidence`] image each: the left panel's round, the ultimate activity and its change, the next reward and the
+/// tooltip's name; each tank's icon, name, rarity line and values; the card names (normal, fanned and raised); the
+/// card type band; the reroll count.
+const EVIDENCE_ROWS: [&[Rect]; 4] = [
+    &[ROUND, ROUND_OF, Rect::new(100, 612, 200, 60), REWARD, TOOLTIP_NAME],
+    &[
+        Rect::new(TANK_X[0] - 110, 485, 220, 92),
+        Rect::new(TANK_X[1] - 110, 485, 220, 92),
+        Rect::new(TANK_X[2] - 110, 485, 220, 92),
+        Rect::new(TANK_X[3] - 110, 485, 220, 92),
+        Rect::new(TANK_X[4] - 110, 485, 220, 92),
+        Rect::new(TANK_X[5] - 110, 485, 220, 92),
+    ],
+    &[Rect::new(600, 1040, 1640, 95)],
+    &[TYPE_BAND, REROLL],
+];
+
+/// The parts of a board read (`EVIDENCE_ROWS`) cut from `img` (the frame at the reference size and the original
+/// setting, see [`crate::vorax::ui_scale::unscale`]) and laid out in rows, left to right, the rest black: the
+/// observe mode's lossless record of what a read saw (about a fifth of the frame's pixels).
+pub fn evidence(img: &Rgba) -> Rgba {
+    let rows: Vec<Vec<Rgba>> = EVIDENCE_ROWS.iter().map(|row| row.iter().map(|&r| img.crop(r)).collect()).collect();
+    let w = rows.iter().map(|row| row.iter().map(|c| c.w).sum::<usize>()).max().unwrap_or(0);
+    let h: usize = rows.iter().map(|row| row.iter().map(|c| c.h).max().unwrap_or(0)).sum();
+    let mut out = Rgba { w, h, data: [0, 0, 0, 255].repeat(w * h) };
+    let mut top = 0;
+    for row in &rows {
+        let mut left = 0;
+        for c in row {
+            for y in 0..c.h {
+                let to = ((top + y) * w + left) * 4;
+                out.data[to..to + c.w * 4].copy_from_slice(&c.data[y * c.w * 4..(y + 1) * c.w * 4]);
+            }
+            left += c.w;
+        }
+        top += row.iter().map(|c| c.h).max().unwrap_or(0);
+    }
+    out
 }
 
 /// The area where the card name sits: normally at y≈1100, and for a selected, raised card at y≈1062. A crop
@@ -654,14 +698,73 @@ const MAX_REPAIRS: usize = 2;
 /// - that field may only have `?` replaced by digits (at most 2), or have a thin "1" that was dropped as a
 ///   speck put back (at most 1), at most 2 places in total;
 /// - adopt it only when exactly one way of repairing fits across the three fields; with several solutions or
-///   none, use what was read (if inconsistent, that means unknown).
+///   none, use what was read (if inconsistent, that means unknown);
+/// - last, with the total read cleanly and the row past those repairs (both fields with `?`, or more of them), the
+///   total's one factor pair that fits the row ([`from_factors`]), counted only once the tanks' sum matches.
 pub fn tank_numbers(raw_values: &str, raw_total: &str) -> Numbers {
     let parsed = raw_values.split_once('x').and_then(|(a, q)| Some((number(a)?, number(q)?)));
     let read = Numbers { activity: parsed.map(|v| v.0), quantity: parsed.map(|v| v.1), total: number(raw_total), repaired: None, needs_sum: false };
     if matches!((read.activity, read.quantity, read.total), (Some(a), Some(q), Some(t)) if a * q == t) {
         return read;
     }
-    x_from_total(raw_values, raw_total).or_else(|| repair(raw_values, raw_total)).or_else(|| from_product(raw_values, raw_total)).unwrap_or(read)
+    x_from_total(raw_values, raw_total)
+        .or_else(|| repair(raw_values, raw_total))
+        .or_else(|| from_product(raw_values, raw_total))
+        .or_else(|| from_factors(raw_values, raw_total))
+        .unwrap_or(read)
+}
+
+/// Most unrecognized glyphs (`?`) [`from_factors`] fills in one "activity x count" row.
+const MAX_FACTOR_UNKNOWNS: usize = 6;
+
+/// The total activity read cleanly while "activity x count" has unrecognized glyphs in both fields, or more than
+/// [`repair`] fills in one: the total's factor pairs are lined up with the row, each `?` one digit and every digit
+/// read kept, and the one pair that fits is taken, marked in `repaired`. 2026-11-09 English game: from round 5 the
+/// three left tanks read `1?7x??4` (38148), `?7x2?3` (17621), `247x???` (81510), `??7x???` (141662), the round
+/// digits lost on every frame, and with both fields broken no tank could be repaired, so every selection screen of
+/// rounds 5 to 10 went without advice; 23 of the 24 such rows have exactly one pair (187x204, 67x263, 247x330,
+/// 367x386, each as the frames show). Like the other repairs that lean on the total, it counts only once the tanks'
+/// sum matches the final activity (`needs_sum`): the sum checks the total, the row's digits and lengths the split.
+/// None when the row has no digit read, a field is empty, more than [`MAX_FACTOR_UNKNOWNS`] `?`, or no pair or
+/// several fit.
+fn from_factors(raw_values: &str, raw_total: &str) -> Option<Numbers> {
+    let (a, q) = raw_values.split_once('x')?;
+    let total = number(raw_total).filter(|&t| t >= 1 && !raw_total.starts_with('0'))?;
+    let pattern = |s: &str| !s.is_empty() && s.len() <= 9 && s.bytes().all(|b| b.is_ascii_digit() || b == b'?');
+    if !pattern(a) || !pattern(q) {
+        return None;
+    }
+    let unknown = raw_values.matches('?').count();
+    if unknown == 0 || unknown > MAX_FACTOR_UNKNOWNS || !raw_values.bytes().any(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let fits = |s: &str, v: i64| {
+        let w = v.to_string();
+        w.len() == s.len() && s.bytes().zip(w.bytes()).all(|(s, w)| s == b'?' || s == w)
+    };
+    // every activity the row's first field can stand for, at most 10^MAX_FACTOR_UNKNOWNS
+    let mut activities = vec![0i64];
+    for b in a.bytes() {
+        let digits: Vec<i64> = if b == b'?' { (0..10).collect() } else { vec![i64::from(b - b'0')] };
+        activities = activities.iter().flat_map(|v| digits.iter().map(move |d| v * 10 + d)).collect();
+    }
+    let mut found = None;
+    for act in activities.into_iter().filter(|&v| v >= 1 && fits(a, v)) {
+        if total % act == 0 && fits(q, total / act) {
+            if found.is_some() {
+                return None;
+            }
+            found = Some((act, total / act));
+        }
+    }
+    let (act, qty) = found?;
+    Some(Numbers {
+        activity: Some(act),
+        quantity: Some(qty),
+        total: Some(total),
+        repaired: Some(format!("活性 x 數量「{raw_values}」→{act}x{qty}（由總活性 {total} 因數分解）")),
+        needs_sum: true,
+    })
 }
 
 /// "activity x count" read with the "x" unrecognized (`2?72`, the 1080p frames): no "x" and exactly one `?`.
@@ -896,6 +999,34 @@ fn panel_number(text: &Text, r: Rect, min_h: i32, heights: std::ops::RangeInclus
         return None;
     }
     number(&chars(&gs, templates))
+}
+
+/// The English client's next reward when [`panel_number`] reads none: each glyph's nearest template, far enough
+/// ahead of the next (6, as [`chars`]) but at any distance, taken only when the whole is a tier of the reward
+/// ladder ([`BATTLE_LADDER`]). The English reward templates are learned with the panel's digits (their own samples
+/// have no 9), and on the game's lossless frames every digit was 44 to 56 away, over the limit of 42, so no reward
+/// was read at all (17 of 17 uncovered boards of the 2026-11-08 captures; 85 of 136 on the saved JPEGs). Every
+/// glyph must be a digit's height: one dropped could leave another tier (38000 without its 3 is 8000).
+#[cfg(feature = "en-vorax")]
+fn reward_on_ladder(text: &Text) -> Option<i64> {
+    ladder_reward(&text.glyphs(REWARD, 14, Ink::Plain))
+}
+
+/// [`reward_on_ladder`] of glyphs already cut.
+#[cfg(feature = "en-vorax")]
+fn ladder_reward(gs: &[Glyph]) -> Option<i64> {
+    if gs.len() < 4 || gs.iter().any(|g| !(17..=24).contains(&g.h())) {
+        return None;
+    }
+    let read: Option<String> = gs
+        .iter()
+        .map(|g| match digits::classify(g, tpl(templates::REWARD)) {
+            Some((c, d, second)) if second - d >= 6.0 => Some(c),
+            _ => None,
+        })
+        .collect();
+    let v = number(&read?)?;
+    BATTLE_LADDER.contains(&(v as f64)).then_some(v)
 }
 
 /// The digits of a panel number at another interface scale: the panel is translucent, and unscaled the 3D scene
@@ -1386,6 +1517,10 @@ fn read_text(img: &Rgba, text: Text) -> Reading {
     // the tooltip).
     reading.panel_covered = tooltip_shown(img);
     reading.ultimate_pending = !reading.panel_covered && has_green(img, ULTIMATE_DELTA);
+    #[cfg(feature = "en-vorax")]
+    if english() && reading.next_reward.is_none() && !reading.panel_covered && !text.ui() {
+        reading.next_reward = reward_on_ladder(&text);
+    }
 
     // Tanks. Those where a "1" was added to a total activity that was read cleanly are noted, to be checked
     // against the sum.
@@ -2728,8 +2863,34 @@ mod tests {
         assert_eq!(rarity_of([222.0, 120.0, 98.0]), None);
     }
 
-    /// The second read with the warm cast taken out ([`neutral_labels`]) only fills the `?`, and counts only when the
-    /// rows then multiply (the reads of the 2026-11-08 English game, round 5, `Putrid Fly`).
+    /// [`ladder_reward`] on glyphs made from the English reward templates: a tier of the ladder is taken, a value off
+    /// it is not, nor one with a glyph no nearer one digit than another, nor fewer than four glyphs or a glyph of
+    /// another height.
+    #[cfg(feature = "en-vorax")]
+    #[test]
+    fn the_english_next_reward_is_a_tier_of_the_ladder() {
+        set_english_here(Some(true));
+        let feat = |ch: char| tpl(templates::REWARD).iter().find(|t| t.ch == ch).unwrap().feat.to_vec();
+        let glyph = |feat: Vec<u8>| Glyph { x0: 0, x1: 12, y0: 0, y1: 20, feat };
+        let read = |s: &str| ladder_reward(&s.chars().map(|c| glyph(feat(c))).collect::<Vec<_>>());
+        assert_eq!(read("38000"), Some(38_000));
+        assert_eq!(read("1120000"), Some(1_120_000));
+        assert_eq!(read("39000"), None, "not a tier");
+        assert_eq!(read("800"), None, "fewer than four glyphs");
+        // A glyph half a 3 and half an 8: neither ahead, so nothing is read rather than 38000 or 88000.
+        let mix: Vec<u8> = feat('3').iter().zip(feat('8')).map(|(&a, b)| ((u16::from(a) + u16::from(b)) / 2) as u8).collect();
+        let mut gs: Vec<Glyph> = "38000".chars().map(|c| glyph(feat(c))).collect();
+        gs[0] = glyph(mix);
+        assert_eq!(ladder_reward(&gs), None);
+        // A glyph of another height (a speck or a glint) gives up the whole number.
+        let mut gs: Vec<Glyph> = "38000".chars().map(|c| glyph(feat(c))).collect();
+        gs[0].y1 = 30;
+        assert_eq!(ladder_reward(&gs), None);
+        set_english_here(None);
+    }
+
+    /// [`reroll_digit`]: a whole digit is read, one no nearer one digit than another is not, and one with its top cut
+    /// off by a red shard is still read when far ahead of the rest.
     #[test]
     fn a_reroll_digit_far_ahead_of_the_rest_is_read() {
         let feat = |ch: char| templates::REROLL.iter().find(|t| t.ch == ch).unwrap().feat.to_vec();
@@ -2747,6 +2908,8 @@ mod tests {
         }
     }
 
+    /// The second read with the warm cast taken out ([`neutral_labels`]) only fills the `?`, and counts only when the
+    /// rows then multiply (the reads of the 2026-11-08 English game, round 5, `Putrid Fly`).
     #[test]
     fn a_second_read_only_fills_the_unknown_glyphs() {
         assert_eq!(fill_unknowns("572?", "5724").as_deref(), Some("5724"));
@@ -2787,12 +2950,15 @@ mod tests {
         // No solution: as read (inconsistent or a missing field, which the solver does not use).
         assert_eq!(got("?99x198", "39403"), (None, None, Some(39403), false));
         assert_eq!(got("2x3", "7"), (Some(2), Some(3), Some(7), false));
-        // Both fields need repair, more than 2 `?`, more than 2 repairs, the x unreadable along with another
-        // glyph, a clean field starting with 0: none are back-derived. (The x unreadable alone, `5?204` with a
-        // total of 1020, is found from the total: see `the_x_is_found_from_the_total`.)
-        assert_eq!(got("?99x19?", "39402"), (None, None, Some(39402), false));
+        // Both fields need repair, or more than 2 `?`, with the total read cleanly: no one-field repair, but the
+        // total's one fitting factor pair (`from_factors`), which waits for the tanks' sum (needs_sum).
+        assert_eq!(got("?99x19?", "39402"), (Some(199), Some(198), Some(39402), true));
+        assert_eq!(got("???x198", "39402"), (Some(199), Some(198), Some(39402), true));
+        assert!(tank_numbers("?99x19?", "39402").needs_sum && tank_numbers("???x198", "39402").needs_sum);
+        // More than 2 repairs, the x unreadable along with another glyph, a clean field starting with 0, no fitting
+        // pair: none are back-derived. (The x unreadable alone, `5?204` with a total of 1020, is found from the
+        // total: see `the_x_is_found_from_the_total`.)
         assert_eq!(got("x36", "3?"), (None, None, None, false));
-        assert_eq!(got("???x198", "39402"), (None, None, Some(39402), false));
         assert_eq!(got("??x198", "39402"), (None, None, Some(39402), false));
         assert_eq!(got("5?2?4", "1020"), (None, None, Some(1020), false));
         // All three fields were read cleanly but do not multiply: the activity and count fields may not have a "1"
@@ -2812,6 +2978,34 @@ mod tests {
 
     /// The total activity unreadable but "activity x count" clean: the product, marked as such (2026-11-06 1080p
     /// game, tank 3 `赤螳螂` from round 3 on, before the digits were read from the frame itself).
+    #[test]
+    fn tank_values_from_the_total_factors() {
+        // the 2026-11-09 English game's rows, each with the values its frame shows
+        for (values, total, want) in [
+            ("1?7x??4", "38148", (187, 204)),
+            ("?7x2?3", "17621", (67, 263)),
+            ("247x???", "81510", (247, 330)),
+            ("??7x???", "141662", (367, 386)),
+            ("1?7x2??", "48246", (187, 258)),
+            ("4?7x47?", "194546", (407, 478)),
+        ] {
+            let n = tank_numbers(values, total);
+            assert_eq!((n.activity, n.quantity, n.total, n.needs_sum), (Some(want.0), Some(want.1), total.parse().ok(), true), "{values} {total}");
+            assert_eq!(n.repaired, Some(format!("活性 x 數量「{values}」→{}x{}（由總活性 {total} 因數分解）", want.0, want.1)));
+        }
+        // two pairs fit (407x630 and 777x330): nothing is guessed
+        assert_eq!(tank_numbers("??7x???", "256410").activity, None);
+        // no pair fits, no digit read, a total with a `?`, too many `?`, an empty field
+        assert_eq!(tank_numbers("1?7x??5", "38148").activity, None);
+        assert_eq!(tank_numbers("???x???", "141662").activity, None);
+        assert_eq!(tank_numbers("1?7x??4", "3814?").activity, None);
+        assert_eq!(tank_numbers("????x???", "141662").activity, None);
+        assert_eq!(tank_numbers("x??4", "38148").activity, None);
+        // the one-field repairs come first and stay as they were (no sum needed)
+        let n = tank_numbers("121x1??", "23716");
+        assert_eq!((n.quantity, n.needs_sum), (Some(196), false));
+    }
+
     #[test]
     fn tank_total_from_the_product() {
         let n = tank_numbers("10x204", "20?");
@@ -2957,6 +3151,15 @@ mod tests {
     /// Match a printed or OCR-read name against the potion table and return the English name of the card.
     fn potion(text: &str) -> Option<String> {
         match_name(text, Category::Potion, false, None, None).map(|(i, _)| names().cards[i].en.clone())
+    }
+
+    /// `獣`, the Japanese form OCR gives for `獸` in monster names, reads as `獸`; the name tables hold only `獸`.
+    #[test]
+    fn the_japanese_beast_character_reads_as_the_traditional_one() {
+        assert_eq!(norm("異獣"), norm("異獸"));
+        assert_eq!(norm("蠍獣"), norm("蠍獸"));
+        let table = include_str!("../../data/vorax-names-zh-TW.json");
+        assert!(!table.contains('獣') && table.contains("異獸"));
     }
 
     /// The unsimulated Supreme potions are found under every spelling the game or OCR may produce, never as a
@@ -3254,6 +3457,42 @@ const BATTLE_NUMBERS: Rect = Rect::new(24, 698, 340, 40);
 const BATTLE_PERCENT: Rect = Rect::new(255, 758, 115, 40);
 /// The archived panel crop (about 360x330).
 pub const BATTLE_PANEL: Rect = Rect::new(14, 552, 362, 330);
+/// The panel's Give Up button (`放棄`): centre x, y, half width, half height on the reference screen at the original
+/// interface setting, as a [`super::Target`]'s box. Measured on the saved panel crops of 2026-11-08 18-41-59 wave 2
+/// and 18-44-54 wave 3 (the button about x 103..256, y 257..301 of the 362x330 crop).
+pub const BATTLE_GIVE_UP: (f32, f32, f32, f32) = (193.5, 831.0, 77.0, 22.0);
+/// The inside of the Give Up button in the panel crop at the original interface setting (x, y, width, height from
+/// the crop's top left), and the mean brightness at which it is on show: 74 to 81 on every saved crop with the button,
+/// 37 to 47 with it gone (the battle won: 2026-11-08_08-51-00 and 18-51-19, wave 3), 79 crops of 2026-11-05..08.
+const GIVE_UP_INSIDE: (usize, usize, usize, usize) = (110, 262, 140, 35);
+const GIVE_UP_SHOWN: f64 = 60.0;
+
+/// Whether the battle panel's crop (`crop`, [`BATTLE_PANEL`] drawn at interface scale `s`, None for the original)
+/// shows the Give Up button: its inside is lit ([`GIVE_UP_SHOWN`]); it goes once the battle is won. False when the
+/// crop is too small to hold it.
+pub fn give_up_shown(crop: &Rgba, s: Option<f64>) -> bool {
+    give_up_light(crop, s).is_some_and(|l| l >= GIVE_UP_SHOWN)
+}
+
+/// The mean brightness of the Give Up button's inside in `crop` ([`give_up_shown`]); None when the crop is too small.
+fn give_up_light(crop: &Rgba, s: Option<f64>) -> Option<f64> {
+    let s = s.unwrap_or(1.0);
+    let (x0, y0, w, h) = GIVE_UP_INSIDE;
+    let at = |v: usize| (v as f64 * s).round() as usize;
+    let (x0, y0, x1, y1) = (at(x0), at(y0), at(x0 + w), at(y0 + h));
+    if x1 > crop.w || y1 > crop.h || x1 <= x0 || y1 <= y0 {
+        return None;
+    }
+    let (mut sum, mut n) = (0.0, 0.0);
+    for y in (y0..y1).step_by(2) {
+        for x in (x0..x1).step_by(2) {
+            let [r, g, b] = crop.rgb(x as i32, y as i32);
+            sum += 0.299 * f64::from(r) + 0.587 * f64::from(g) + 0.114 * f64::from(b);
+            n += 1.0;
+        }
+    }
+    Some(sum / n)
+}
 
 /// What was read from the endgame battle panel. The numbers are the panel's abbreviations converted back
 /// (836.4K → 836400), so they only have thousands-level precision.
@@ -3280,6 +3519,13 @@ impl Battle {
     pub fn readable(&self) -> bool {
         self.activity.is_some() && self.bonus.is_some()
     }
+
+    /// Every reward tier taken: the next tier reads 999.9M ([`BATTLE_ALL`]), which the panel shows from 1.12M on
+    /// (81 of the 82 saved battle rows with it had activity plus bonus over 1.12M, the 82nd a bonus misread a digit
+    /// short).
+    pub fn all_taken(&self) -> bool {
+        self.next == Some(BATTLE_ALL)
+    }
 }
 
 /// The three numbers of one panel row: (activity, bonus, next tier).
@@ -3292,7 +3538,9 @@ const BATTLE_LADDER: [f64; 17] = [
     2e3, 8e3, 18e3, 28e3, 38e3, 57e3, 76e3, 114e3, 152e3, 190e3, 266e3, 342e3, 512e3, 607e3, 721e3, 854e3, 1.12e6,
 ];
 /// The panel's threshold after all rewards are taken.
-const BATTLE_ALL: f64 = 999_900_000.0;
+pub const BATTLE_ALL: f64 = 999_900_000.0;
+/// The last reward tier (1.12M): once activity plus bonus reach it the panel's next tier reads [`BATTLE_ALL`].
+pub const BATTLE_LAST: f64 = BATTLE_LADDER[BATTLE_LADDER.len() - 1];
 
 /// Which rung of the ladder `v` is: the panel has only one decimal place, so 1.12M may be displayed as 1.1M (the
 /// K rungs are all exact). The tolerance is not relaxed: "1114.0K" must be taken as 114.0K with an extra 1, not
@@ -3460,5 +3708,67 @@ fn battle_from_texts(waves: &[String], numbers: &[String], percents: &[String]) 
         next: pick(|p| p.2),
         percent: vote(&percents.iter().map(|t| battle_percent(t)).collect::<Vec<_>>()),
         raw: format!("{} | {} | {}", waves.join(" / "), numbers.join(" / "), percents.join(" / ")),
+    }
+
+}
+
+#[cfg(test)]
+mod give_up_tests {
+    use super::*;
+
+    /// The Give Up button on the saved battle panel crops (skipped when the games are gone): lit while fighting,
+    /// gone once the battle is won; at a larger interface scale the inside is looked for scaled.
+    #[test]
+    fn the_give_up_button_shows_until_the_battle_is_won() {
+        let home = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("home").join("vorax");
+        for (frame, shown) in [
+            ("2026-11-08_18-44-54/frame-battle-0032.jpg", true),
+            ("2026-11-08_18-41-59/frame-battle-0059.jpg", true),
+            ("2026-11-06_16-24-14/frame-battle-0103.jpg", true),
+            ("2026-11-08_07-42-56/frame-battle-0109.jpg", true),
+            ("2026-11-08_08-51-00/frame-battle-0118.jpg", false),
+            ("2026-11-08_18-51-19/frame-battle-0038.jpg", false),
+            ("2026-11-06_16-24-14/frame-battle-0104.jpg", false),
+        ] {
+            let path = home.join(frame);
+            if !path.is_file() {
+                println!("skipped: {} is missing", path.display());
+                continue;
+            }
+            let crop = crate::reader::load_image_raw(&path).unwrap();
+            println!("{frame}: {}x{} light {:?}", crop.w, crop.h, give_up_light(&crop, None));
+            assert_eq!(give_up_shown(&crop, None), shown, "{frame}");
+        }
+        let lit = Rgba { w: 362, h: 330, data: vec![110; 362 * 330 * 4] };
+        assert!(give_up_shown(&lit, None));
+        assert!(!give_up_shown(&lit, Some(1.5)), "a crop too small for the scale");
+        assert!(!give_up_shown(&Rgba { w: 362, h: 330, data: vec![30; 362 * 330 * 4] }, None));
+    }
+}
+
+#[cfg(test)]
+mod evidence_tests {
+    use super::*;
+
+    /// The evidence image lays its parts out in rows, each part's pixels as they are on the frame: the round's corner
+    /// first, the first tank's box on the second row, the card names on the third.
+    #[test]
+    fn the_evidence_keeps_each_part_pixel_for_pixel() {
+        let mut img = Rgba { w: W, h: H, data: vec![0; W * H * 4] };
+        let mut set = |x: i32, y: i32, c: [u8; 4]| {
+            let i = (y as usize * W + x as usize) * 4;
+            img.data[i..i + 4].copy_from_slice(&c);
+        };
+        set(ROUND.x, ROUND.y, [1, 2, 3, 255]);
+        set(TANK_X[0] - 110, 485, [4, 5, 6, 255]);
+        set(600, 1040, [7, 8, 9, 255]);
+        let e = evidence(&img);
+        let first_row = EVIDENCE_ROWS[0].iter().map(|r| r.h).max().unwrap() as usize;
+        assert_eq!(e.w, EVIDENCE_ROWS.iter().map(|row| row.iter().map(|r| r.w as usize).sum::<usize>()).max().unwrap());
+        assert_eq!(e.rgb(0, 0), [1, 2, 3]);
+        assert_eq!(e.rgb(0, first_row as i32), [4, 5, 6]);
+        assert_eq!(e.rgb(0, first_row as i32 + 92), [7, 8, 9]);
+        // about a fifth of the frame's pixels, the rest of each row black
+        assert!(e.w * e.h < W * H / 4);
     }
 }

@@ -4,7 +4,7 @@
 
 use super::chain::chain_odds;
 use super::scores::patrol_why;
-use super::{Params, Rng32, TOOL_RANK, TUNED, composition, decide, decide_bite};
+use super::{Params, Rng32, TUNED, composition, decide, decide_bite, tool_rank};
 use crate::engine::data::{Beast, Gift, RAINBOW, Tool};
 use crate::engine::gifts::apply_gift;
 use crate::engine::devour::{can_devour_now, hunt_targets, start_options};
@@ -253,6 +253,22 @@ pub fn solve(st: &State, rollouts: usize, seed: u32, p: &Params) -> Vec<SolveOpt
     r.ranking()
 }
 
+/// `solve` on the candidates in `only` (every candidate with None), with or without racing. The audit's top-up
+/// (`audit::top_up`) re-solves the move made and the best move together this way, every round for both on the same
+/// futures, so the gap between them is measured to the full round count instead of being frozen where the racing
+/// dropped the move made.
+pub fn solve_with(st: &State, rollouts: usize, seed: u32, p: &Params, only: Option<&[Action]>, race: bool) -> Vec<SolveOption> {
+    let mut r = Rollouts::new(st, seed, p);
+    if let Some(only) = only {
+        r.list.retain(|c| only.contains(&c.action));
+        let n = r.list.len();
+        (r.vals, r.best, r.live) = (vec![Vec::new(); n], vec![0.0; n], vec![true; n]);
+    }
+    r.race = race;
+    r.run(rollouts);
+    r.ranking()
+}
+
 /// `solve` in steps: `run` adds rounds and `ranking` ranks the rounds so far,
 /// so a caller can show partial rankings. Running N rounds in any number of
 /// steps, on any number of threads, gives the same ranking as `solve` with N
@@ -274,6 +290,8 @@ pub struct Rollouts<'a> {
     best: Vec<f64>,
     /// The candidates still playing rounds.
     live: Vec<bool>,
+    /// Whether trailing candidates are dropped at the checkpoints (see [`solve_with`]).
+    race: bool,
     rounds: usize,
     /// Gifts taken that the board does not show yet, see [`Rollouts::after`].
     taken: Vec<Gift>,
@@ -325,7 +343,7 @@ impl<'a> Rollouts<'a> {
             None => decide(&base, p, roll),
         };
         let n = list.len();
-        Rollouts { base, p, list, pick, random: Rng32::new(seed), vals: vec![Vec::new(); n], best: vec![0.0; n], live: vec![true; n], rounds: 0, taken: Vec::new() }
+        Rollouts { base, p, list, pick, random: Rng32::new(seed), vals: vec![Vec::new(); n], best: vec![0.0; n], live: vec![true; n], race: true, rounds: 0, taken: Vec::new() }
     }
 
     /// The board is from before `gifts` were taken (a treasure's picks
@@ -333,6 +351,12 @@ impl<'a> Rollouts<'a> {
     /// hidden future is.
     pub fn after(mut self, gifts: &[Gift]) -> Rollouts<'a> {
         self.taken = gifts.to_vec();
+        self
+    }
+
+    /// No racing: every candidate plays every round (see [`solve_with`]).
+    pub fn without_racing(mut self) -> Rollouts<'a> {
+        self.race = false;
         self
     }
 
@@ -359,7 +383,7 @@ impl<'a> Rollouts<'a> {
             let step = (rounds - ran).min(checkpoint - self.rounds);
             self.play(step, threads);
             ran += step;
-            if self.rounds == checkpoint {
+            if self.rounds == checkpoint && self.race {
                 self.race();
             }
         }
@@ -681,11 +705,12 @@ pub fn reason(st: &State, action: &Action) -> String {
                 trf!("{} leaves this board worth more than the other card, on average.", tool_name(key))
             }
             _ => {
+                let order = tool_rank(st);
                 let rank = match id {
-                    ChoiceId::Name(key) => TOOL_RANK.iter().position(|t| t.key() == key),
+                    ChoiceId::Name(key) => order.iter().position(|t| t.key() == key),
                     ChoiceId::Cell(_) => None,
                 };
-                rank.map_or(String::new(), |r| trf!("Ranked #{} of {} {}s in training.", r + 1, TOOL_RANK.len(), crate::engine::text::instrument_term()))
+                rank.map_or(String::new(), |r| trf!("Ranked #{} of {} {}s in training.", r + 1, order.len(), crate::engine::text::instrument_term()))
             }
         },
     }

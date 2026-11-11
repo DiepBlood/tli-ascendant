@@ -63,17 +63,69 @@ const ALIKE_DIFF: u8 = 24;
 /// Crops kept per slot, the last read first.
 const ENTRIES: usize = 8;
 
+/// The side of the finer thumb's block that a number field ([`number_field`]) must match too. At [`BLOCK`] two door
+/// cards read alike with another number on them: on the saved frames of 2026-11-04..08 read in a shuffled order, a
+/// "Go to Cell 7" card's text came back for a "Go to Cell 13" one, and a day count's for another (2026-11-09).
+/// Blocks of 2 pixels, alike within [`ALIKE_DIFF`], took every such hit out (0 of 6,048 number field hits shuffled,
+/// 0 of 17,791 in time order beyond the OCR's own noise on near-same crops) and kept 98% of the hits of the short
+/// fields: 58% of the door cards', 97% of the day count's.
+const FINE_BLOCK: usize = 2;
+
+/// Number fields hold at most this many characters (spaces aside): a door card or the day count, not an objective's
+/// sentence, whose background flicker would leave the finer thumb few hits and whose numbers are counts read again.
+const NUMBER_FIELD_CHARS: usize = 16;
+
+/// A cached read whose crop must match a new one: its thumb, its lines, and for a number field its finer thumb.
+struct Kept {
+    thumb: Thumb,
+    lines: Lines,
+    fine: Option<Thumb>,
+}
+
+/// Whether `lines` read a number field: a short text with a digit, whose number another crop alike at [`BLOCK`] may not
+/// share (see [`FINE_BLOCK`]).
+fn number_field(lines: &Lines) -> bool {
+    let chars = lines.iter().flat_map(|(t, _)| t.chars()).filter(|c| !c.is_whitespace());
+    let (mut n, mut digit) = (0, false);
+    for c in chars {
+        n += 1;
+        digit |= c.is_ascii_digit();
+    }
+    digit && n <= NUMBER_FIELD_CHARS
+}
+
+/// The cached lines of `slot` for `crop` (its thumb `thumb`): of the first kept read alike, a number field's only when
+/// its finer thumb is alike as well (the crop's made once, and only when needed).
+fn recall(cached: &Cache, slot: &Slot, thumb: &Thumb, crop: &Rgba) -> Option<Lines> {
+    let fine = std::cell::OnceCell::new();
+    let fine = || fine.get_or_init(|| thumb_of(crop, FINE_BLOCK));
+    cached.get(slot)?.iter().find(|k| alike(&k.thumb, thumb) && k.fine.as_ref().is_none_or(|f| alike(f, fine()))).map(|k| k.lines.clone())
+}
+
+/// Keeps the lines read from `crop` (its thumb `thumb`) first among `slot`'s, with the finer thumb of a number field.
+fn keep(cached: &mut Cache, slot: Slot, thumb: Thumb, crop: &Rgba, lines: Lines) {
+    let fine = number_field(&lines).then(|| thumb_of(crop, FINE_BLOCK));
+    let kept = cached.entry(slot).or_default();
+    kept.insert(0, Kept { thumb, lines, fine });
+    kept.truncate(ENTRIES);
+}
+
 /// `crop`'s thumb after the contrast stretch the engine reads it with: under
 /// a dialog's dark veil the days counter's "19" and "20" differ by less than
 /// [`ALIKE_DIFF`], and so does a target banner fading in from none.
 fn thumb(crop: &Rgba) -> Thumb {
+    thumb_of(crop, BLOCK)
+}
+
+/// [`thumb`] with blocks of `block` pixels.
+fn thumb_of(crop: &Rgba, block: usize) -> Thumb {
     let crop = &stretch(crop);
-    let (w, h) = (crop.w.div_ceil(BLOCK), crop.h.div_ceil(BLOCK));
+    let (w, h) = (crop.w.div_ceil(block), crop.h.div_ceil(block));
     let mut sum = vec![0u32; w * h * 3];
     let mut count = vec![0u32; w * h];
     for (y, row) in crop.data.chunks_exact(crop.w * 4).enumerate() {
         for (x, p) in row.as_chunks::<4>().0.iter().enumerate() {
-            let k = (y / BLOCK) * w + x / BLOCK;
+            let k = (y / block) * w + x / block;
             for c in 0..3 {
                 sum[k * 3 + c] += u32::from(p[c]);
             }
@@ -97,7 +149,7 @@ fn cache() -> &'static Mutex<Cache> {
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-type Cache = HashMap<Slot, Vec<(Thumb, Lines)>>;
+type Cache = HashMap<Slot, Vec<Kept>>;
 
 static HITS: AtomicU64 = AtomicU64::new(0);
 static MISSES: AtomicU64 = AtomicU64::new(0);
@@ -116,17 +168,27 @@ pub fn cache_counts() -> (u64, u64) {
 /// Why the game can't be read: Windows has no OCR language for the game's
 /// language. None when it has one.
 pub fn problem() -> Option<String> {
-    problem_with(language())
+    // The set language is read once, for both the engine asked and the check: read twice (the engine's language, then
+    // `fits`), a language switched by another thread in between gave a false "OCR reads only ..." (the affix session,
+    // 2026-11-09: tests switching languages side by side). Live, the language changes only at start and when the
+    // player picks another, so this hardly showed there.
+    let want = lang::lang();
+    problem_in(imp::language_in(want), want)
 }
 
 /// [`problem`] for an engine reading in `language` (None: no OCR language
 /// installed); the preview uses it to show the missing-OCR line without
 /// touching the system's OCR.
 pub fn problem_with(language: Option<String>) -> Option<String> {
+    problem_in(language, lang::lang())
+}
+
+/// [`problem_with`] for the game language `want`, given rather than read.
+fn problem_in(language: Option<String>, want: Lang) -> Option<String> {
     // One note line at 296 wide (each note is one line): the install button sits under it, and the
     // manual command shows in its hover and after a failed install.
     match language {
-        Some(tag) if fits(&tag, lang::lang()) => None,
+        Some(tag) if fits(&tag, want) => None,
         Some(tag) => Some(trf!("OCR reads only {}, which misreads the game: install below.", tag)),
         None => Some(tr("No OCR for the game's language: install it below.").to_string()),
     }
@@ -173,10 +235,8 @@ pub fn ocr_all<const N: usize>(imgs: [&Rgba; N], regions: &[(Rect, f32); N]) -> 
         slots
             .iter()
             .zip(&thumbs)
-            .map(|(s, t)| {
-                let (s, t) = (s.as_ref()?, t.as_ref()?);
-                cached.get(s)?.iter().find(|(known, _)| alike(known, t)).map(|(_, l)| l.clone())
-            })
+            .zip(&crops)
+            .map(|((s, t), crop)| recall(&cached, s.as_ref()?, t.as_ref()?, crop))
             .collect()
     };
     // Each region's upscale and contrast stretch took 5 ms or more, 67 ms in
@@ -197,12 +257,10 @@ pub fn ocr_all<const N: usize>(imgs: [&Rgba; N], regions: &[(Rect, f32); N]) -> 
     let read = imp::recognize_all(inputs);
     {
         let mut cached = cache().lock().unwrap_or_else(|e| e.into_inner());
-        for (((slot, fresh), s), t) in lines.iter_mut().zip(read).zip(&slots).zip(thumbs.iter_mut()) {
+        for ((((slot, fresh), s), t), crop) in lines.iter_mut().zip(read).zip(&slots).zip(thumbs.iter_mut()).zip(&crops) {
             // A failed read is not cached.
             if let (Some(fresh), Some(s), Some(t)) = (fresh, s, t.take()) {
-                let kept = cached.entry(*s).or_default();
-                kept.insert(0, (t, fresh.clone()));
-                kept.truncate(ENTRIES);
+                keep(&mut cached, *s, t, crop, fresh.clone());
                 *slot = Some(fresh);
             }
         }
@@ -341,9 +399,13 @@ mod imp {
 
     /// Runs `f` on this thread's engine for the set language.
     fn with_engine<T>(f: impl FnOnce(Option<&OcrEngine>) -> T) -> T {
+        with_engine_in(lang::lang(), f)
+    }
+
+    /// Runs `f` on this thread's engine for the game language `want`.
+    fn with_engine_in<T>(want: Lang, f: impl FnOnce(Option<&OcrEngine>) -> T) -> T {
         ENGINE.with(|cell| {
             let mut slot = cell.borrow_mut();
-            let want = lang::lang();
             let stale = |made_for: &Lang, unfit: &Option<(Instant, Duration)>| *made_for != want || unfit.is_some_and(|(at, wait)| at.elapsed() >= wait);
             if slot.as_ref().is_none_or(|(made_for, _, unfit)| stale(made_for, unfit)) {
                 // The wait before this look, when this thread's engine for the same language did not fit.
@@ -371,7 +433,12 @@ mod imp {
     }
 
     pub fn language() -> Option<String> {
-        with_engine(|e| Some(e?.RecognizerLanguage().ok()?.LanguageTag().ok()?.to_string()))
+        language_in(lang::lang())
+    }
+
+    /// The OCR language of this thread's engine for the game language `want`.
+    pub fn language_in(want: Lang) -> Option<String> {
+        with_engine_in(want, |e| Some(e?.RecognizerLanguage().ok()?.LanguageTag().ok()?.to_string()))
     }
 
     type Lines = super::Lines;
@@ -475,4 +542,100 @@ mod imp {
         None
     }
 
+    pub fn language_in(_want: super::Lang) -> Option<String> {
+        None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The check takes the game language it is given, so the language the engine was asked for and the one checked
+    /// are the same even when another thread switches the set language in between.
+    #[test]
+    fn the_problem_is_judged_for_the_language_given() {
+        assert_eq!(problem_in(Some("en-US".into()), Lang::En), None, "English given, whatever the set language");
+        assert!(problem_in(Some("en-US".into()), Lang::ZhTw).is_some());
+        assert_eq!(problem_in(Some("zh-Hant-TW".into()), Lang::ZhTw), None);
+        assert!(problem_in(None, Lang::En).is_some());
+    }
+
+    /// A small dark crop with a bright block of "text", and the same with single bright pixels added (a stroke the
+    /// coarse thumb hardly sees): two door cards with another number on them.
+    fn cards() -> (Rgba, Rgba) {
+        let mut a = Rgba { w: 64, h: 16, data: vec![30; 64 * 16 * 4] };
+        let set = |img: &mut Rgba, x: usize, y: usize| img.data[(y * 64 + x) * 4..(y * 64 + x) * 4 + 3].copy_from_slice(&[200, 200, 200]);
+        for y in 4..12 {
+            for x in 4..12 {
+                set(&mut a, x, y);
+            }
+        }
+        let mut b = a.clone();
+        for (x, y) in [(21, 5), (41, 9), (53, 2)] {
+            set(&mut b, x, y);
+        }
+        (a, b)
+    }
+
+    fn lines(text: &str) -> Lines {
+        vec![(text.to_string(), [0.0, 0.0, 10.0, 10.0])]
+    }
+
+    /// Short texts with a digit are number fields; an objective's sentence and a text without a digit are not.
+    #[test]
+    fn short_texts_with_a_digit_are_number_fields() {
+        assert!(number_field(&lines("去 13 號")));
+        assert!(number_field(&lines("Go to Cell 13")));
+        assert!(number_field(&lines("距 離 暴 動 剩 餘 | 6 天")));
+        assert!(!number_field(&lines("目 標 牢 門 之 後 | 累 計 開 10 間 牢 房 已 完 成")));
+        assert!(!number_field(&lines("請 進 行 決 策")));
+        assert!(!number_field(&Vec::new()));
+    }
+
+    /// Two door cards alike on the coarse thumb but with another number do not share a read: the finer thumb tells
+    /// them apart. The same card shares it; a text that is no number field keeps the coarse match alone.
+    #[test]
+    fn cards_with_another_number_share_no_read() {
+        let (a, b) = cards();
+        assert!(alike(&thumb(&a), &thumb(&b)), "alike at BLOCK");
+        assert!(!alike(&thumb_of(&a, FINE_BLOCK), &thumb_of(&b, FINE_BLOCK)), "apart at FINE_BLOCK");
+        let slot: Slot = (0, 0, 64, 16, 1.0f32.to_bits(), 64, 16, 0);
+        let mut cached = Cache::new();
+        keep(&mut cached, slot, thumb(&a), &a, lines("去 7 號"));
+        assert_eq!(recall(&cached, &slot, &thumb(&a), &a), Some(lines("去 7 號")), "the same card");
+        assert_eq!(recall(&cached, &slot, &thumb(&b), &b), None, "another number: read");
+        // read, it is kept first; each card finds its own
+        keep(&mut cached, slot, thumb(&b), &b, lines("去 13 號"));
+        assert_eq!(recall(&cached, &slot, &thumb(&a), &a), Some(lines("去 7 號")));
+        assert_eq!(recall(&cached, &slot, &thumb(&b), &b), Some(lines("去 13 號")));
+        // no number field: the coarse thumb alone, as before
+        let mut cached = Cache::new();
+        keep(&mut cached, slot, thumb(&a), &a, lines("請 進 行 決 策"));
+        assert_eq!(recall(&cached, &slot, &thumb(&b), &b), Some(lines("請 進 行 決 策")));
+    }
+
+    /// Threads reading the two cards at once through one cache (as the reader, the confirm read and Vorax share it)
+    /// each get their own card's text.
+    #[test]
+    fn threads_at_once_get_their_own_cards() {
+        let (a, b) = cards();
+        let slot: Slot = (-7, -7, 64, 16, 1.0f32.to_bits(), 64, 16, 0);
+        let cached = Mutex::new(Cache::new());
+        std::thread::scope(|scope| {
+            for k in 0..8 {
+                let (cached, crop, text) = (&cached, if k % 2 == 0 { &a } else { &b }, if k % 2 == 0 { "去 7 號" } else { "去 13 號" });
+                scope.spawn(move || {
+                    for _ in 0..200 {
+                        let t = thumb(crop);
+                        let got = recall(&cached.lock().unwrap(), &slot, &t, crop);
+                        match got {
+                            Some(l) => assert_eq!(l, lines(text)),
+                            None => keep(&mut cached.lock().unwrap(), slot, t, crop, lines(text)),
+                        }
+                    }
+                });
+            }
+        });
+    }
 }

@@ -19,10 +19,16 @@
 //!   - Instrument pick: a `Reroll` right after is a re-roll; otherwise see which instrument was added in the later
 //!     reads (up to the next day).
 //! - Decision loss = best option's mean - mean of the move made; a gap within 2x gap_se of the move made counts as
-//!   noise, listed separately and not included in the loss total.
+//!   noise, listed separately and not included in the loss total. The means are the solver's as the advice ranks
+//!   them. The rows of the 2026-11-09 afternoon builds carry an instrument pick's Blacklist correction in `ev` and
+//!   `best_ev` (`tool_bias`, since removed) and the playouts' own means in `ev_raw` and `best_ev_raw`.
 //! - The expected value at the start takes best_ev and sd from the first advice row of a run that has a round count
-//!   (the session's full model); actual = the vaulted count from `run_end` + the last read board's value and objective
+//!   (the session's full model; best_ev_raw instead when the row has one, the playouts' own prediction); actual = the vaulted count from `run_end` + the last read board's value and objective
 //!   reward (the `State::loot` scoring). Luck = actual - expected + loss total.
+//! - The expected value is a floor: the playouts follow the plain strategy, the player the advice, which gains a little
+//!   at every step, so the actual comes out above it on average (the calibration of 2026-11-09). Beside luck and z,
+//!   drift-corrected ones take that out: [`DRIFT_AT_START`] and [`SPREAD_AT_START`], times the share of the run's days
+//!   still to come at the first advice row (`luck_net`, `z_net`).
 
 use crate::app::latency::log_millis;
 use crate::board::{CellModel, ChoiceKind, Model, build_state};
@@ -32,7 +38,7 @@ use crate::engine::{Action, ChoiceId, State};
 use crate::lang::{self, Lang};
 use crate::rates::{Event, Read, Run, SAME_CLICK_MS, Signal, last_stable, pad, parse_run, reads_after, replace_at, t, width};
 use crate::solver::TUNED;
-use crate::solver::solve::{SolveOption, candidates, solve};
+use crate::solver::solve::{SolveOption, candidates, solve, solve_with};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::fmt::Write;
@@ -66,10 +72,20 @@ struct Row {
     ev: Option<f64>,
     #[serde(default)]
     best_ev: Option<f64>,
+    /// `ev` and `best_ev` without an instrument pick's Blacklist correction: the rows of the 2026-11-09 afternoon
+    /// builds have them (`tool_bias`, since removed), written
+    /// only when it was not 0: the playouts' own prediction, which the expected value compares with the run.
+    #[serde(default)]
+    ev_raw: Option<f64>,
+    #[serde(default)]
+    best_ev_raw: Option<f64>,
     #[serde(default)]
     sd: Option<f64>,
     #[serde(default)]
     vaulted: Option<u32>,
+    /// The playouts' version (`solver::PLAYOUT_VERSION`); rows before the field have none (version 1).
+    #[serde(default)]
+    playout: Option<u32>,
 }
 
 /// One advice row.
@@ -80,6 +96,7 @@ struct Advice {
     ev: Option<f64>,
     best_ev: Option<f64>,
     sd: Option<f64>,
+    playout: Option<u32>,
 }
 
 /// One decision: the board at the time of the advice, the advice, the move actually made, and the re-solve result.
@@ -163,6 +180,27 @@ impl Decision {
     }
 }
 
+/// The upward drift of a run's actual over the expected value of its first advice row, at day 1 (times the share of
+/// the days still to come there), actual - expected fitted on that share through 0. Fitted again on 2026-11-09 evening
+/// for the redesigned playouts (the Blacklist potential, the Hunt walk, TOOL_RANK measured again, `w_ahead`): the start
+/// boards of 200 runs of 2026-10-30..11-09 (all but 3 began at day 1) solved again with them, whose expected values
+/// came out 0.91 above the logged ones on average; 2.04 against the logged values, 1.08 against the new ones (1.10
+/// and 1.05 on either half). Runs logged before that build carry the old playouts' expected values, about 0.9 lower,
+/// so their luck reads about that much low unless they take [`DRIFT_AT_START_V1`]: an advice row of these playouts
+/// names their version (`playout` 2, `solver::PLAYOUT_VERSION`), the rows before have none. See [`Game::drift_at_start`].
+pub const DRIFT_AT_START: f64 = 1.08;
+
+/// [`DRIFT_AT_START`] for the runs logged before the playouts' version was written (version 1, no `playout` field),
+/// against the expected values they logged: 2.04 on the same 200 runs of the 2026-11-09 evening refit (the first fit,
+/// on 192 runs of 2026-10-30..11-08, gave 1.96).
+pub const DRIFT_AT_START_V1: f64 = 2.04;
+
+/// The spread a run's actual has beyond the playouts' sd at day 1 (times the same share), added in quadrature: fitted so
+/// the mean of `z_net`^2 over the runs is 1. On the 192 runs of 2026-10-30..11-08: sum of z^2 654 -> 192, |z| > 2 48 ->
+/// 6 runs (9 expected at 4.6%). Unchanged by the refit of [`DRIFT_AT_START`] (2.16 again; |z_net| > 2 6 of 200 runs;
+/// fitted on half of the runs and checked on the other half, mean z^2 0.75 and 1.44).
+pub const SPREAD_AT_START: f64 = 2.16;
+
 /// One run.
 pub struct Game {
     /// Folder name.
@@ -173,6 +211,11 @@ pub struct Game {
     pub end: Option<String>,
     /// Expected value at the start and the single-run standard deviation.
     pub expected: Option<(f64, f64)>,
+    /// The share of the run's days still to come at the advice row `expected` comes from (1 at day 1); None when its
+    /// read is not in the log.
+    pub start_left: Option<f64>,
+    /// The playouts' version of that advice row (`solver::PLAYOUT_VERSION`); None for the rows before the field.
+    pub playout: Option<u32>,
     pub vaulted: Option<u32>,
     /// The last read board's value and objective reward.
     pub board: Option<f64>,
@@ -206,6 +249,37 @@ impl Game {
     /// Luck = actual - expected + loss total.
     pub fn luck(&self) -> Option<f64> {
         Some(self.actual()? - self.expected?.0 + self.loss())
+    }
+
+    /// The drift at day 1 for the playouts that solved the run: [`DRIFT_AT_START`] for version 2 and later (a later
+    /// version takes the latest fit until it has its own), [`DRIFT_AT_START_V1`] for the rows without a version.
+    pub fn drift_at_start(&self) -> f64 {
+        match self.playout {
+            Some(v) if v >= 2 => DRIFT_AT_START,
+            _ => DRIFT_AT_START_V1,
+        }
+    }
+
+    /// The drift expected above the start's expected value ([`Game::drift_at_start`] times the share of days to come).
+    pub fn drift(&self) -> Option<f64> {
+        Some(self.drift_at_start() * self.start_left?)
+    }
+
+    /// [`Game::luck`] less the drift: what is luck once the advice's usual gain over the playouts is taken out.
+    pub fn luck_net(&self) -> Option<f64> {
+        Some(self.luck()? - self.drift()?)
+    }
+
+    /// The single-run sd widened by [`SPREAD_AT_START`] (times the share of days to come), what [`Game::z_net`] divides by.
+    pub fn spread_net(&self) -> Option<f64> {
+        let ((_, sd), left) = (self.expected?, self.start_left?);
+        Some((sd * sd + (SPREAD_AT_START * left).powi(2)).sqrt())
+    }
+
+    /// [`Game::z`] less the drift, over the spread widened by [`SPREAD_AT_START`] (times the share of days to come).
+    pub fn z_net(&self) -> Option<f64> {
+        let ((e, _), actual, drift, spread) = (self.expected?, self.actual()?, self.drift()?, self.spread_net()?);
+        (spread > 0.0).then(|| (actual - e - drift) / spread)
     }
 }
 
@@ -267,7 +341,7 @@ pub fn games(folder: &str, text: &str) -> Vec<Game> {
                 }
                 let (Some(read_at), Some(pick)) = (r.read_at, r.pick) else { continue };
                 if let Some(sp) = spans.last_mut() {
-                    sp.advice.push(Advice { read_at, pick, rounds: r.rounds.unwrap_or(0), ev: r.ev, best_ev: r.best_ev, sd: r.sd });
+                    sp.advice.push(Advice { read_at, pick, rounds: r.rounds.unwrap_or(0), ev: r.ev_raw.or(r.ev), best_ev: r.best_ev_raw.or(r.best_ev), sd: r.sd, playout: r.playout });
                 }
             }
             _ => {}
@@ -283,7 +357,14 @@ fn game(run: &Run, raws: &[(i64, String)], index: &HashMap<&str, usize>, sp: Spa
     let until = sp.end.as_deref().and_then(log_millis).unwrap_or(i64::MAX);
     // Advice rows with a round count (rounds 0 is a single option; before the 08:47 build ev was recorded as 0).
     let usable: Vec<&Advice> = sp.advice.iter().filter(|a| a.rounds > 0 && a.ev.is_some() && a.best_ev.is_some()).collect();
-    let expected = usable.iter().find_map(|a| Some((a.best_ev?, a.sd?)));
+    let first = usable.iter().find(|a| a.best_ev.is_some() && a.sd.is_some());
+    let expected = first.and_then(|a| Some((a.best_ev?, a.sd?)));
+    let playout = first.and_then(|a| a.playout);
+    // the share of the days to come at that advice row, from the read it was solved on
+    let start_left = first.and_then(|a| index.get(a.read_at.as_str())).and_then(|&i| ev[i].read()).and_then(|r| {
+        let m = &r.model;
+        (m.max_days > 0).then(|| (m.max_days - m.day).clamp(0, m.max_days) as f64 / m.max_days as f64)
+    });
     // Of several advice rows for the same decision point keep only the last: same screen, same day, no board-changing
     // signal between.
     let mut kept: Vec<(&Advice, usize)> = Vec::new();
@@ -315,7 +396,7 @@ fn game(run: &Run, raws: &[(i64, String)], index: &HashMap<&str, usize>, sp: Spa
     // End-of-run board: the board value that was the same in the last 2 consecutive reads; if none, take the last read.
     let board_vals: Vec<Option<f64>> = ev.iter().filter_map(Event::read).filter(|r| in_span(r, from, until)).map(|r| Some(board_loot(&r.model))).collect();
     let board = last_stable(&board_vals).map(|(v, _)| v).or_else(|| board_vals.last().copied().flatten());
-    Game { folder: run.name.clone(), start: sp.start, end: sp.end, expected, vaulted: sp.vaulted, board, decisions, skipped }
+    Game { folder: run.name.clone(), start: sp.start, end: sp.end, expected, start_left, playout, vaulted: sp.vaulted, board, decisions, skipped }
 }
 
 fn in_span(r: &Read, from: i64, until: i64) -> bool {
@@ -358,7 +439,8 @@ fn decide(run: &Run, raws: &[(i64, String)], i: usize, from: i64, until: i64, a:
     let r = run.events[i].read().expect("read");
     let m = &r.model;
     let theme = theme_id(r.theme.as_deref());
-    let usurped = usurped_by(raws, from, log_millis(&r.at).unwrap_or(i64::MAX));
+    // The stage the read row holds (the popup read, since 2026-11-11) or the game's log named, whichever is later.
+    let usurped = usurped_by(raws, from, log_millis(&r.at).unwrap_or(i64::MAX)).max(r.usurped);
     let (st, problems) = rebuild(m, theme, usurped);
     let cands: Vec<Action> = candidates(&st).into_iter().map(|c| c.action).collect();
     let actual = if !problems.is_empty() {
@@ -414,6 +496,19 @@ fn first_stable<T: PartialEq + Clone>(vals: &[Option<T>]) -> Option<T> {
     vals.windows(2).find_map(|w| match (&w[0], &w[1]) {
         (Some(a), Some(b)) if a == b => Some(a.clone()),
         _ => None,
+    })
+}
+
+/// The first value read twice in a row ([`first_stable`]), or else the one value read when every read that has one
+/// agrees: the screen after a move is often covered (an instrument or treasure pick, the next Manage advice) after a
+/// single read of the new position, and that read was right in every such case checked (2026-11-08_18-24-48 and
+/// 18-55-08, five Patrol moves: each single read named the advised cell). A move that is not among the options is
+/// still dropped by the caller.
+fn agreed<T: PartialEq + Clone>(vals: &[Option<T>]) -> Option<T> {
+    first_stable(vals).or_else(|| {
+        let mut seen = vals.iter().flatten();
+        let first = seen.next()?;
+        seen.all(|v| v == first).then(|| first.clone())
     })
 }
 
@@ -478,7 +573,7 @@ fn patrol(ev: &[Event], raws: &[(i64, String)], i: usize, m: &Model) -> Result<A
         .filter(|r| !matches!(r.screen.as_str(), "InstrumentPick" | "TreasurePick" | "CellPick"))
         .map(|r| (r.model.day == m.day && r.model.warden != m.warden).then_some(r.model.warden))
         .collect();
-    let w = first_stable(&vals).ok_or(("the warden's new cell was not read twice", "典獄長的新位置沒有連續讀到 2 次"))?;
+    let w = agreed(&vals).ok_or(("the warden's new cell was not read, or read differently", "典獄長的新位置沒有讀到，或讀到的不一致"))?;
     usize::try_from(w).map(|cell| Action::Patrol { cell }).map_err(|_| ("bad warden cell", "典獄長位置不合理"))
 }
 
@@ -593,7 +688,7 @@ fn hunt(ev: &[Event], k: usize, until: i64, m: &Model, cands: &[Action]) -> Opti
             if let [c] = new[..] { Some(c) } else { None }
         })
         .collect();
-    let target = first_stable(&vals).and_then(|c| usize::try_from(c).ok()).filter(|c| opts.contains(c));
+    let target = agreed(&vals).and_then(|c| usize::try_from(c).ok()).filter(|c| opts.contains(c));
     Some(match (target, &opts[..]) {
         (Some(cell), _) | (None, &[cell]) => Ok(Action::Hunt { cell }),
         _ => Err(("the Hunt target is unclear", "獵殺的對象看不出來")),
@@ -696,6 +791,57 @@ pub fn score(games: &mut [Game], rollouts: usize) {
     });
 }
 
+/// [`score`], then [`top_up`]: the re-solve the run review and `ascendant-cli audit` use.
+pub fn score_topped(games: &mut [Game], rollouts: usize) -> usize {
+    score(games, rollouts);
+    top_up(games, rollouts)
+}
+
+/// Whether a scored decision needs the top-up: the move made is not the re-solve's best and the racing dropped it
+/// before the full round count.
+fn needs_top_up(d: &Decision, rollouts: usize) -> bool {
+    let Ok(actual) = &d.actual else { return false };
+    let Some(chosen) = d.ranking.iter().find(|o| &o.action == actual) else { return false };
+    d.ranking.len() > 1 && &d.ranking[0].action != actual && chosen.n < rollouts
+}
+
+/// Re-solves, for every scored decision whose move made trailed and was dropped early by the racing, the move made
+/// and the best move together on the same futures to the full round count (no racing), and puts those values into the
+/// ranking. A dropped move keeps the values of the checkpoint that dropped it, and its gap there is past the racing's
+/// 2.2 paired standard errors by construction, so the audit (2 gap_se) judged every such move a loss of that
+/// checkpoint's noise: on 25 runs the losses it reported summed to 1.74 times what 6400-round solves without racing
+/// measured on the same decisions, and on Replace-or-End-the-day decisions 2.7 times (2026-11-10). With the top-up the
+/// audit matches re-solving every option without racing, at about 1.17 times the time of the plain re-solve.
+/// Returns how many decisions were topped up. Decisions in parallel on the caller's rayon pool.
+pub fn top_up(games: &mut [Game], rollouts: usize) -> usize {
+    use rayon::prelude::*;
+    let mut jobs: Vec<&mut Decision> = games.iter_mut().flat_map(|g| g.decisions.iter_mut()).filter(|d| needs_top_up(d, rollouts)).collect();
+    let n = jobs.len();
+    jobs.par_iter_mut().for_each(|d| {
+        let Ok(actual) = d.actual.clone() else { return };
+        let best = d.ranking[0].action.clone();
+        let (st, _) = rebuild(&d.model, d.theme, d.usurped);
+        let pair = solve_with(&st, rollouts, SEED, &TUNED, Some(&[best, actual]), false);
+        merge_pair(&mut d.ranking, &pair, rollouts);
+    });
+    n
+}
+
+/// Puts the values of `pair` (two options re-solved together, the leader first) into `ranking`: the two options take
+/// their new mean, se, best and round count, and the ranking is ordered again as `solve` orders it, the options that
+/// played every round first (the pair, and any that was never dropped), then by mean, so an option the racing froze
+/// cannot come out ahead on its checkpoint's noise. The leader's gap_se is 0 and the other's is their paired one; the
+/// other options keep their values and their gap_se against the former leader.
+fn merge_pair(ranking: &mut [SolveOption], pair: &[SolveOption], rollouts: usize) {
+    let [lead, other] = pair else { return };
+    for o in ranking.iter_mut() {
+        let Some(p) = pair.iter().find(|p| p.action == o.action) else { continue };
+        (o.mean, o.se, o.best, o.n) = (p.mean, p.se, p.best, p.n);
+        o.gap_se = if o.action == lead.action { 0.0 } else { other.gap_se };
+    }
+    ranking.sort_by(|a, b| (b.n >= rollouts).cmp(&(a.n >= rollouts)).then(b.mean.partial_cmp(&a.mean).unwrap_or(std::cmp::Ordering::Equal)));
+}
+
 fn screen_name(s: &str) -> &'static str {
     match s {
         "Patrol" => t("Patrol", "巡邏"),
@@ -733,6 +879,9 @@ fn game_report(o: &mut String, g: &Game, each: bool) {
     };
     let z = g.z().map_or_else(|| "-".to_string(), |z| format!("{z:+.2}"));
     let _ = writeln!(o, "{} {expected}; {} {actual}; z = {z}", t("expected at the start", "開局期望"), t("actual", "實際"));
+    if let (Some(drift), Some(z_net)) = (g.drift(), g.z_net()) {
+        let _ = writeln!(o, "{} {drift:+.2}: z = {z_net:+.2}", t("less the usual drift", "扣掉一般漂移"));
+    }
     let n = g.decisions.len();
     let followed = g.decisions.iter().filter(|d| d.followed() == Some(true)).count();
     let not = g.decisions.iter().filter(|d| d.followed() == Some(false)).count();
@@ -753,6 +902,10 @@ fn game_report(o: &mut String, g: &Game, each: bool) {
     let (noise, noise_n) = g.noise();
     let losses = g.decisions.iter().filter(|d| matches!(d.verdict(), Verdict::Loss { .. })).count();
     let luck = g.luck().map_or_else(|| "-".to_string(), |l| format!("{l:+.2}"));
+    let luck = match g.luck_net() {
+        Some(net) => format!("{luck}（{} {net:+.2}）", t("less drift", "扣漂移")),
+        None => luck,
+    };
     let _ = writeln!(
         o,
         "{} {:.3}（{losses}）; {} {noise:.3}（{noise_n}）; {} {luck}",
@@ -832,24 +985,30 @@ pub fn report(games: &[Game], rollouts: usize, each: bool) -> String {
     if games.len() > 1 {
         let _ = writeln!(o, "\n== {} ==", t("summary", "總表"));
         let name_w = games.iter().map(|g| width(&g.folder)).max().unwrap_or(0).max(width(t("run", "局")));
-        let _ = writeln!(o, "{}  {:>6}  {:>5}  {:>6}  {:>6}  {:>6}  {:>6}", pad(t("run", "局"), name_w), "exp", "sd", "actual", "z", "loss", "luck");
-        let (mut z2, mut nz) = (0.0, 0);
+        let _ = writeln!(o, "{}  {:>6}  {:>5}  {:>6}  {:>6}  {:>6}  {:>6}  {:>6}  {:>6}", pad(t("run", "局"), name_w), "exp", "sd", "actual", "z", "loss", "luck", "z_net", "luck_n");
+        let (mut z2, mut nz, mut z2_net, mut n_net) = (0.0, 0, 0.0, 0);
         for g in games {
             let f = |x: Option<f64>, p: usize| x.map_or_else(|| "-".to_string(), |v| format!("{v:.p$}"));
             let _ = writeln!(
                 o,
-                "{}  {:>6}  {:>5}  {:>6}  {:>6}  {:>6.3}  {:>6}",
+                "{}  {:>6}  {:>5}  {:>6}  {:>6}  {:>6.3}  {:>6}  {:>6}  {:>6}",
                 pad(&g.folder, name_w),
                 f(g.expected.map(|e| e.0), 2),
                 f(g.expected.map(|e| e.1), 2),
                 f(g.actual(), 2),
                 g.z().map_or_else(|| "-".to_string(), |z| format!("{z:+.2}")),
                 g.loss(),
-                g.luck().map_or_else(|| "-".to_string(), |l| format!("{l:+.2}"))
+                g.luck().map_or_else(|| "-".to_string(), |l| format!("{l:+.2}")),
+                g.z_net().map_or_else(|| "-".to_string(), |z| format!("{z:+.2}")),
+                g.luck_net().map_or_else(|| "-".to_string(), |l| format!("{l:+.2}"))
             );
             if let Some(z) = g.z() {
                 z2 += z * z;
                 nz += 1;
+            }
+            if let Some(z) = g.z_net() {
+                z2_net += z * z;
+                n_net += 1;
             }
         }
         let _ = writeln!(
@@ -859,14 +1018,186 @@ pub fn report(games: &[Game], rollouts: usize, each: bool) -> String {
             t("runs", "局數"),
             t(" (with a well-sized spread the sum is about the number of runs)", "（模型散布合適時，z² 總和約等於局數）")
         );
+        let _ = writeln!(o, "{} {z2_net:.2}, {} {n_net}", t("sum of z_net^2 (less the usual drift)", "扣漂移後的 z² 總和"), t("runs", "局數"));
     }
     let _ = writeln!(
         o,
         "\n{}",
         t(
             "Expected: the first advice row's best_ev and sd (the session's full model). Actual: run_end's vaulted plus the last board's loot and objective cache (State::loot). Loss: best mean minus the mean of the move made, re-solved on the logged board with the run's theme and Usurpation weights; within 2 gap_se of it is noise, listed apart and not summed. Only Patrol, Manage, Interrogation and Instrument pick are re-solved; a move that cannot be told from the log is unknown and not counted.",
-            "期望：一局第一個建議列的 best_ev 與 sd（session 的完整模型）。實際：run_end 的收容數加上最後讀盤的盤面價值與目標獎勵（State::loot）。損失：在紀錄的盤面上重算（帶入本局主題與篡位權重），最佳平均減實際所選平均；在 2 倍 gap_se 內算雜訊，另列、不加總。只重算巡邏、管理、審訊、選刑具；從紀錄看不出實際所選的標「不明」，不計。"
+            "期望：一局第一個建議列的 best_ev 與 sd（session 的完整模型）。實際：run_end 的收容數加上最後讀盤的盤面價值與目標獎勵（State::loot）。損失：在紀錄的盤面上重算（帶入本局主題與僭越權重），最佳平均減實際所選平均；在 2 倍 gap_se 內算雜訊，另列、不加總。只重算巡邏、管理、審訊、選刑具；從紀錄看不出實際所選的標「不明」，不計。"
         )
     );
     o
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Decision, SolveOption, Verdict, agreed};
+    use crate::engine::Action;
+
+    /// A value read twice in a row wins; else one value read alone, or several reads that all agree, is taken; reads
+    /// that disagree with no two in a row, or no read at all, give nothing.
+    #[test]
+    fn a_position_read_once_or_in_agreement_is_taken() {
+        assert_eq!(agreed(&[Some(3), Some(4), Some(4)]), Some(4), "twice in a row");
+        assert_eq!(agreed(&[None, Some(13), None]), Some(13), "read once, the screen covered after");
+        assert_eq!(agreed(&[Some(7), None, Some(7)]), Some(7), "agreeing reads apart");
+        assert_eq!(agreed(&[Some(3), None, Some(5)]), None, "disagreeing reads");
+        assert_eq!(agreed::<i64>(&[None, None]), None);
+        assert_eq!(agreed::<i64>(&[]), None);
+    }
+
+    /// Luck and z less the usual drift: the drift and the wider spread scale with the share of the days to come at the
+    /// first advice row; a run whose start is not known has none; the original luck and z stay as they were.
+    #[test]
+    fn drift_corrected_luck_and_z() {
+        let game = |left: Option<f64>| super::Game {
+            folder: "t".into(),
+            start: String::new(),
+            end: None,
+            expected: Some((6.0, 2.0)),
+            start_left: left,
+            playout: Some(crate::solver::PLAYOUT_VERSION),
+            vaulted: Some(10),
+            board: Some(0.0),
+            decisions: Vec::new(),
+            skipped: 0,
+        };
+        let g = game(Some(1.0));
+        assert_eq!((g.z(), g.luck()), (Some(2.0), Some(4.0)), "the original fields unchanged");
+        assert!((g.luck_net().unwrap() - (4.0 - super::DRIFT_AT_START)).abs() < 1e-12);
+        let spread = (4.0 + super::SPREAD_AT_START * super::SPREAD_AT_START).sqrt();
+        assert!((g.z_net().unwrap() - (4.0 - super::DRIFT_AT_START) / spread).abs() < 1e-12);
+        // half the run to come: half the drift and of the extra spread
+        let half = game(Some(0.5));
+        assert!((half.drift().unwrap() - super::DRIFT_AT_START / 2.0).abs() < 1e-12);
+        let spread = (4.0 + (super::SPREAD_AT_START / 2.0).powi(2)).sqrt();
+        assert!((half.z_net().unwrap() - (4.0 - super::DRIFT_AT_START / 2.0) / spread).abs() < 1e-12);
+        let unknown = game(None);
+        assert_eq!((unknown.z_net(), unknown.luck_net(), unknown.z()), (None, None, Some(2.0)));
+        // a run logged before the playouts' version: the old playouts' drift
+        let old = super::Game { playout: None, ..game(Some(1.0)) };
+        assert!((old.luck_net().unwrap() - (4.0 - super::DRIFT_AT_START_V1)).abs() < 1e-12);
+        assert!((old.z_net().unwrap() - (4.0 - super::DRIFT_AT_START_V1) / spread_one()).abs() < 1e-12);
+    }
+
+    fn option(action: Action, mean: f64, gap_se: f64, n: usize) -> SolveOption {
+        SolveOption { label: format!("{action:?}"), action, mean, se: 0.05, gap_se, n, best: 1.0, policy: false }
+    }
+
+    /// A patrol decision from a hand-made log (the Warden moved from the Interrogation Room to cell 04), whose ranking
+    /// the tests set by hand.
+    fn patrol_decision() -> Decision {
+        let read = |at: &str, screen: &str, warden: i64, step: &str| {
+            format!(
+                "{{\"at\":\"2026-11-03T10:{at}Z\",\"kind\":\"read\",\"screen\":\"{screen}\",\"theme\":null,\"model\":{{\"v\":1,\"day\":2,\"maxDays\":20,\"step\":\"{step}\",\"warden\":{warden},\"dest\":[3,5],\"devourUsed\":false,\"swapUsed\":false,\"huntUsed\":true,\"eventKind\":\"chain\",\"choice\":{{\"kind\":\"tool\",\"options\":[]}},\"chainArmed\":false,\"tools\":[],\"vault\":[],\"cells\":[{{\"kind\":\"office\"}}{}]}}}}",
+                ",{\"kind\":\"sealed\",\"event\":null}".repeat(15)
+            )
+        };
+        let log = [
+            "{\"at\":\"2026-11-03T10:00:00.500Z\",\"kind\":\"game\",\"signal\":\"RunStart\"}".to_string(),
+            read("00:01.000", "Patrol", 0, "patrol"),
+            "{\"at\":\"2026-11-03T10:00:01.100Z\",\"kind\":\"advice\",\"pick\":\"Go to cell 04 (a locked door)\",\"read_at\":\"2026-11-03T10:00:01.000Z\",\"rounds\":100,\"ev\":6.0,\"best_ev\":6.0,\"sd\":2.0}".to_string(),
+            "{\"at\":\"2026-11-03T10:00:02.000Z\",\"kind\":\"game\",\"signal\":\"Moved\"}".to_string(),
+            read("00:02.500", "Manage", 3, "manage"),
+            read("00:02.600", "Manage", 3, "manage"),
+            "{\"at\":\"2026-11-03T10:00:05.000Z\",\"kind\":\"run_end\",\"vaulted\":1}".to_string(),
+        ];
+        let mut g = super::games("t", &log.join("\n"));
+        let d = g.remove(0).decisions.remove(0);
+        assert_eq!(d.actual, Ok(Action::Patrol { cell: 3 }));
+        d
+    }
+
+    /// The top-up is for a move made that is not the best and was dropped by the racing (fewer rounds than asked):
+    /// the best move, a move that played every round, a single option and a move that cannot be told need none.
+    #[test]
+    fn the_top_up_is_for_dropped_moves_that_were_not_best() {
+        let (made, other) = (Action::Patrol { cell: 3 }, Action::Patrol { cell: 5 });
+        let mut d = patrol_decision();
+        d.ranking = vec![option(other.clone(), 6.5, 0.0, 1600), option(made.clone(), 6.0, 0.2, 200)];
+        assert!(super::needs_top_up(&d, 1600), "dropped at 200 and not the best");
+        d.ranking[1].n = 1600;
+        assert!(!super::needs_top_up(&d, 1600), "played every round: its gap is measured already");
+        d.ranking = vec![option(made.clone(), 6.5, 0.0, 1600), option(other.clone(), 6.0, 0.2, 200)];
+        assert!(!super::needs_top_up(&d, 1600), "the move made is the best");
+        d.ranking = vec![option(made.clone(), 6.5, 0.0, 1600)];
+        assert!(!super::needs_top_up(&d, 1600), "a single option");
+        d.ranking = vec![option(other, 6.5, 0.0, 1600), option(made, 6.0, 0.2, 200)];
+        d.actual = Err(("x", "x"));
+        assert!(!super::needs_top_up(&d, 1600), "the move made cannot be told");
+    }
+
+    /// The pair's values replace the two options' and the ranking is ordered by mean again: the leader of the pair
+    /// takes gap_se 0 and the other the pair's gap_se, the rest keep theirs; a move made that comes out ahead becomes
+    /// the best (and so the verdict Best).
+    #[test]
+    fn the_pair_values_go_into_the_ranking() {
+        let (made, other, third) = (Action::Patrol { cell: 3 }, Action::Patrol { cell: 5 }, Action::End);
+        let mut d = patrol_decision();
+        d.ranking = vec![option(other.clone(), 6.5, 0.0, 1600), option(third.clone(), 6.2, 0.15, 1600), option(made.clone(), 6.0, 0.2, 200)];
+        assert!(matches!(d.verdict(), Verdict::Loss { .. }));
+        // The move made still trails, by less: a gap within the noise now.
+        super::merge_pair(&mut d.ranking, &[option(other.clone(), 6.45, 0.0, 1600), option(made.clone(), 6.38, 0.06, 1600)], 1600);
+        assert_eq!(d.ranking.iter().map(|o| (o.action.clone(), o.n)).collect::<Vec<_>>(), vec![(other.clone(), 1600), (made.clone(), 1600), (third.clone(), 1600)]);
+        assert_eq!((d.ranking[0].mean, d.ranking[0].gap_se), (6.45, 0.0));
+        assert_eq!((d.ranking[1].mean, d.ranking[1].gap_se), (6.38, 0.06));
+        assert_eq!((d.ranking[2].mean, d.ranking[2].gap_se), (6.2, 0.15), "the third option keeps its values");
+        assert!(matches!(d.verdict(), Verdict::Noise { .. }), "{:?}", d.verdict());
+        // The move made comes out ahead: it is the best.
+        super::merge_pair(&mut d.ranking, &[option(made.clone(), 6.5, 0.0, 1600), option(other.clone(), 6.4, 0.05, 1600)], 1600);
+        assert_eq!(d.ranking[0].action, made);
+        assert_eq!((d.ranking[0].gap_se, d.ranking[1].gap_se), (0.0, 0.05));
+        assert_eq!(d.verdict(), Verdict::Best);
+        // A frozen option (fewer rounds) with a higher checkpoint mean does not come out ahead of the pair.
+        d.ranking = vec![option(other.clone(), 6.3, 0.0, 1400), option(third.clone(), 6.27, 0.3, 200), option(made.clone(), 6.0, 0.2, 200)];
+        super::merge_pair(&mut d.ranking, &[option(other.clone(), 6.25, 0.0, 1600), option(made.clone(), 6.1, 0.06, 1600)], 1600);
+        assert_eq!(d.ranking.iter().map(|o| o.action.clone()).collect::<Vec<_>>(), vec![other.clone(), made.clone(), third]);
+        // A pair that is not two options changes nothing.
+        let before: Vec<f64> = d.ranking.iter().map(|o| o.mean).collect();
+        super::merge_pair(&mut d.ranking, &[option(other, 1.0, 0.0, 1600)], 1600);
+        assert_eq!(d.ranking.iter().map(|o| o.mean).collect::<Vec<_>>(), before);
+    }
+
+    /// The single-run sd 2 widened at day 1.
+    fn spread_one() -> f64 {
+        (4.0 + super::SPREAD_AT_START * super::SPREAD_AT_START).sqrt()
+    }
+
+    /// The drift follows the first advice row's playouts version: version 2 takes DRIFT_AT_START, a row without the
+    /// field (the logs before it) DRIFT_AT_START_V1.
+    #[test]
+    fn the_drift_follows_the_playouts_version() {
+        let log = |extra: &str| {
+            format!(
+                "{{\"at\":\"2026-11-09T10:00:00.000Z\",\"kind\":\"game\",\"signal\":\"RunStart\"}}
+{{\"at\":\"2026-11-09T10:00:01.000Z\",\"kind\":\"advice\",\"read_at\":\"2026-11-09T10:00:00.500Z\",\"pick\":\"Go to cell 04\",\"rounds\":1600,\"ev\":6.0,\"best_ev\":6.0,\"sd\":2.0{extra}}}"
+            )
+        };
+        let new = super::games("t", &log(",\"playout\":2")).remove(0);
+        assert_eq!(new.playout, Some(2));
+        assert_eq!(new.drift_at_start(), super::DRIFT_AT_START);
+        let old = super::games("t", &log("")).remove(0);
+        assert_eq!(old.playout, None);
+        assert_eq!(old.drift_at_start(), super::DRIFT_AT_START_V1);
+        // a later version takes the latest fit until it has its own
+        let later = super::Game { playout: Some(3), ..super::games("t", &log("")).remove(0) };
+        assert_eq!(later.drift_at_start(), super::DRIFT_AT_START);
+    }
+
+    /// The expected value comes from the first advice row's playouts: on an opening instrument pick whose Blacklist
+    /// carried its correction, `best_ev_raw` rather than the `best_ev` shown; a row without it gives `best_ev`.
+    #[test]
+    fn the_expected_value_leaves_the_blacklist_bias_out() {
+        let row = |extra: &str| {
+            format!(
+                "{{\"at\":\"2026-11-09T10:00:00.000Z\",\"kind\":\"game\",\"signal\":\"RunStart\"}}
+{{\"at\":\"2026-11-09T10:00:01.000Z\",\"kind\":\"advice\",\"read_at\":\"2026-11-09T10:00:00.500Z\",\"pick\":\"Take Executioner's Blacklist\",\"rounds\":1600,\"ev\":9.14,\"best_ev\":9.14,\"sd\":2.0{extra}}}"
+            )
+        };
+        let expected = |text: &str| super::games("t", text).first().and_then(|g| g.expected);
+        assert_eq!(expected(&row(",\"ev_raw\":8.0,\"best_ev_raw\":8.0,\"tool_bias\":1.14")), Some((8.0, 2.0)));
+        assert_eq!(expected(&row("")), Some((9.14, 2.0)));
+    }
 }

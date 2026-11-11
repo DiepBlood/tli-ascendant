@@ -230,13 +230,17 @@ pub fn to_model(scene: &Scene, panels: &Panels, held_tools: &[Tool], under: Opti
 /// The least confidence among the cell reads that `to_model` flags (a
 /// door's lock, an incident marker, the glow behind a door, a portrait's
 /// beast and rarity), 1 when none is in doubt; tooltip-covered cells are not
-/// read.
+/// read. A cell the door-opening flash washes out or a rarity effect hides is 0,
+/// so the session reads the board again once the face shows.
 pub fn least_sure(scene: &Scene) -> f32 {
     CELLS
         .into_iter()
         .map(|c| scene.cell(c))
-        .filter(|r| !r.covered)
+        .filter(|r| !r.covered || r.flash || r.shield)
         .map(|r| {
+            if r.flash || r.shield {
+                return 0.0;
+            }
             let mut least = r.locked_conf;
             if r.event {
                 least = least.min(r.event_conf);
@@ -260,6 +264,8 @@ pub fn least_sure(scene: &Scene) -> f32 {
 /// held, so a Lion may mark any same-rarity inmate as prey.
 fn read_board(scene: &Scene, under: Option<&Model>, m: &mut Model, warn: &mut Vec<Warning>, hunt: bool, crown: bool) {
     let mut kept = Vec::new();
+    let mut opening = Vec::new();
+    let mut shielded = Vec::new();
     let mut unlit = Vec::new();
     for c in CELLS {
         let r = scene.cell(c);
@@ -268,7 +274,26 @@ fn read_board(scene: &Scene, under: Option<&Model>, m: &mut Model, warn: &mut Ve
         if r.covered {
             if let Some(board) = under {
                 m.cells[n] = board.cells[n].clone();
-                kept.push(n);
+                if r.flash {
+                    opening.push(n);
+                } else if r.shield {
+                    shielded.push(n);
+                } else {
+                    kept.push(n);
+                }
+                continue;
+            }
+            if r.flash {
+                // No board to keep the cell from: a door is the safer guess than an empty cell, which the
+                // solver would plan around.
+                warn.push(Warning::cell(n, trf!("Check cell {}: the door is still opening, so it is read again.", at)));
+                m.cells[n] = CellModel::Sealed { event: r.event.then_some(EventMark::Unknown) };
+                continue;
+            }
+            if r.shield {
+                // As for the flash: the face is not read yet, and a door is the safer guess.
+                warn.push(Warning::cell(n, trf!("Check cell {}: a rarity effect covers the portrait, so it is read again.", at)));
+                m.cells[n] = CellModel::Sealed { event: r.event.then_some(EventMark::Unknown) };
                 continue;
             }
             warn.push(Warning::cell(n, trf!("Check cell {}: a tooltip covers it.", at)));
@@ -329,6 +354,12 @@ fn read_board(scene: &Scene, under: Option<&Model>, m: &mut Model, warn: &mut Ve
     if !kept.is_empty() {
         let it = tr(if kept.len() == 1 { "it is" } else { "they are" });
         warn.push(Warning::note(trf!("A tooltip covers {}: {} kept from the last board read.", cell_list(&kept), it)));
+    }
+    if !opening.is_empty() {
+        warn.push(Warning::note(trf!("The door of {} is still opening: kept from the last board read until the portrait shows.", cell_list(&opening))));
+    }
+    if !shielded.is_empty() {
+        warn.push(Warning::note(trf!("A rarity effect covers the portrait in {}: kept from the last board read until the face shows.", cell_list(&shielded))));
     }
     if !unlit.is_empty() {
         warn.push(Warning::note(trf!(

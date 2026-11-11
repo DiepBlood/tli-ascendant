@@ -9,12 +9,24 @@
 //! - The re-solving runs in its own small rayon pool: a quarter of the cores, below normal priority, so the game and
 //!   the live advice carry on as usual; [`ROLLOUTS`] rollouts per option, same as the audit default: at 400
 //!   rollouts the line between noise and loss falls elsewhere (the step on day 8 of 2026-11-04 14-49-39 was judged a
-//!   loss of 0.34 at 400 rollouts, but fell inside the noise at 1600).
+//!   loss of 0.34 at 400 rollouts, but fell inside the noise at 1600). The racing drops a trailing move early and
+//!   freezes its values where its gap is already past the racing's threshold, so a move made that was dropped always
+//!   read as a loss of that checkpoint's noise; after the re-solve, every such move is re-solved once more together
+//!   with the best one to the full round count ([`audit::top_up`], 2026-11-10).
+//! - The verdict (Tartarus, 2026-11-09): the opening expectation is a floor (the playouts follow the plain strategy,
+//!   the player the advice), so the actual came out above it in almost every run and "mostly luck" showed nearly
+//!   always. The audit's drift correction (the run's [`audit::Game::drift_at_start`], by the version of the playouts
+//!   that solved it, and [`audit::SPREAD_AT_START`]) is taken out first.
+//!   A decision loss of [`LOSS_SHARE`] of the widened spread or more is the decisions, whatever the result: luck that
+//!   made up for it must not hide the costliest step (2026-11-08 10:39, a loss of 6.26 within one standard deviation).
+//!   Otherwise, within [`WITHIN_Z`] drift-corrected standard deviations the run is within the expected range; beyond
+//!   it, a loss not less than the drift-corrected luck is the decisions, else luck ran high or low.
 //! - Language: `audit` temporarily switches the global language when it matches advice labels (`audit::advised`),
 //!   and switching language from a background thread would flash the window into the other language; so the run's
 //!   advice language must match the current UI language to be settled, otherwise nothing is settled and the reason
 //!   is given.
 
+use super::gamelog::RiotEnd;
 use crate::audit::{self, Decision, Game, Verdict};
 use crate::lang::{Lang, tr};
 use std::path::{Path, PathBuf};
@@ -48,10 +60,32 @@ pub struct Reach {
 /// Where the run's gap mostly comes from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Cause {
-    /// |luck| is greater than the decision loss.
-    Luck,
-    /// The decision loss is not less than |luck|.
+    /// Tartarus: the result is within [`WITHIN_Z`] drift-corrected standard deviations of the expectation.
+    Within,
+    /// Luck ran above (`high`) or below the expectation, more than the decisions lost.
+    Luck { high: bool },
+    /// The decisions lost noticeably (see `cause`).
     Decisions,
+}
+
+/// A Tartarus run within this many drift-corrected standard deviations ([`audit::Game::z_net`]) is within the expected
+/// range.
+pub const WITHIN_Z: f64 = 1.0;
+
+/// A decision loss of this share of the widened spread ([`audit::Game::spread_net`]) or more is noticeable.
+pub const LOSS_SHARE: f64 = 0.5;
+
+/// The verdict of a run from its decision loss, its luck and, for Tartarus, the drift-corrected (z, luck, spread):
+/// see the module notes. Without the drift correction (Vorax, or the share of days to come unknown) the rule before
+/// it: |luck| greater than the loss is luck.
+pub(crate) fn cause(loss: f64, luck: Option<f64>, net: Option<(f64, f64, f64)>) -> Option<Cause> {
+    match net {
+        Some((_, _, spread)) if loss >= LOSS_SHARE * spread => Some(Cause::Decisions),
+        Some((z_net, _, _)) if z_net.abs() < WITHIN_Z => Some(Cause::Within),
+        Some((_, luck_net, _)) if loss >= luck_net.abs() => Some(Cause::Decisions),
+        Some((_, luck_net, _)) => Some(Cause::Luck { high: luck_net > 0.0 }),
+        None => luck.map(|l| if l.abs() > loss { Cause::Luck { high: l > 0.0 } } else { Cause::Decisions }),
+    }
 }
 
 /// The costliest step.
@@ -94,6 +128,10 @@ pub struct Settled {
     pub luck: Option<f64>,
     /// How many standard deviations the actual result is off the expectation.
     pub z: Option<f64>,
+    /// Tartarus: the expectation plus the usual drift ([`audit::Game::drift`]), and how many widened standard
+    /// deviations the actual is off it ([`audit::Game::z_net`]); None for Vorax or when the drift is unknown.
+    pub expected_net: Option<f64>,
+    pub z_net: Option<f64>,
     pub cause: Option<Cause>,
     pub worst: Option<Step>,
     /// How many steps were re-solved, and how many of them could not tell what was actually picked.
@@ -104,6 +142,10 @@ pub struct Settled {
     pub kind: RunKind,
     /// Vorax only: reaching the target, see [`Reach`]; None for Tartarus.
     pub reach: Option<Reach>,
+    /// Tartarus only: how the riot battle after the run went (the log's `riot` row, see [`riot_of`]); None until it
+    /// is over (it ends about a minute after the settlement starts, and the run review then puts it in, see
+    /// `RunReview::riot_done`), for a run logged before the row existed, and for Vorax.
+    pub riot: Option<RiotEnd>,
 }
 
 /// The result of settling, or the reason nothing was settled.
@@ -158,7 +200,8 @@ fn gap(d: &Decision) -> Option<(f64, f64, bool)> {
 pub(crate) fn summarize(g: &Game, rollouts: usize) -> Settled {
     let loss = g.loss();
     let luck = g.luck();
-    let cause = luck.map(|l| if l.abs() > loss { Cause::Luck } else { Cause::Decisions });
+    let net = g.z_net().zip(g.luck_net()).zip(g.spread_net()).map(|((z, l), s)| (z, l, s));
+    let cause = cause(loss, luck, net);
     let worst = g
         .decisions
         .iter()
@@ -185,6 +228,8 @@ pub(crate) fn summarize(g: &Game, rollouts: usize) -> Settled {
         noise: g.noise(),
         luck,
         z: g.z(),
+        expected_net: g.expected.zip(g.drift()).map(|((e, _), d)| e + d),
+        z_net: g.z_net(),
         cause,
         worst,
         scored: g.decisions.iter().filter(|d| !d.ranking.is_empty()).count(),
@@ -192,7 +237,17 @@ pub(crate) fn summarize(g: &Game, rollouts: usize) -> Settled {
         rollouts,
         kind: RunKind::Tartarus,
         reach: None,
+        riot: None,
     }
+}
+
+/// The riot row (`riot`, written by `Session::log_riot_end`) after the last run_end of a run log's `text`, if any.
+pub fn riot_of(text: &str) -> Option<RiotEnd> {
+    let after = text.rfind("\"kind\":\"run_end\"").map_or(text, |k| &text[k..]);
+    let row: serde_json::Value = after.lines().filter(|l| l.contains("\"kind\":\"riot\"")).filter_map(|l| serde_json::from_str(l).ok()).next_back()?;
+    let flag = |k: &str| row[k].as_bool().unwrap_or(false);
+    let count = |k: &str| row[k].as_u64().and_then(|n| u32::try_from(n).ok()).unwrap_or(0);
+    Some(RiotEnd { fought: flag("fought"), boss: flag("boss"), boss_killed: flag("boss_killed"), red: count("red"), color: count("color"), medium: count("medium") })
 }
 
 /// Settles the log `text` of the folder `folder`: `ui` is the current UI language and must equal the global language
@@ -213,8 +268,8 @@ pub fn settle(folder: &str, text: &str, ui: Lang, rollouts: usize) -> Outcome {
     if game.decisions.is_empty() {
         return Outcome::Empty;
     }
-    audit::score(std::slice::from_mut(&mut game), rollouts);
-    Outcome::Settled(Box::new(summarize(&game, rollouts)))
+    audit::score_topped(std::slice::from_mut(&mut game), rollouts);
+    Outcome::Settled(Box::new(Settled { riot: riot_of(text), ..summarize(&game, rollouts) }))
 }
 
 /// Settles the folder `dir` (reads its log.jsonl); no log file means no advice to settle.
@@ -254,6 +309,25 @@ pub fn spawn(dir: PathBuf, written: Option<Receiver<()>>, notify: impl Fn() + Se
         notify();
     });
     rx
+}
+
+#[cfg(test)]
+mod riot_tests {
+    use super::*;
+
+    /// The riot row after the run's run_end is taken (the last when there are two); one before it, or none, is not.
+    #[test]
+    fn the_riot_row_after_the_run_end() {
+        let end = r#"{"at":"2026-11-09T20:16:20.405Z","kind":"run_end","vaulted":6}"#;
+        let riot = |red: u32, fought: bool| format!(r#"{{"at":"2026-11-09T20:16:54.200Z","kind":"riot","fought":{fought},"boss":false,"boss_killed":false,"red":{red},"color":3,"medium":7}}"#);
+        let fought = RiotEnd { fought: true, red: 1, color: 3, medium: 7, ..RiotEnd::default() };
+        assert_eq!(riot_of(&format!("{end}\n{}\n", riot(1, true))), Some(fought));
+        assert_eq!(riot_of(&format!("{end}\n{}\n{}\n", riot(9, true), riot(1, true))), Some(fought));
+        assert_eq!(riot_of(&format!("{}\n{end}\n", riot(1, true))), None);
+        assert_eq!(riot_of(end), None);
+        let abandoned = RiotEnd { red: 0, color: 3, medium: 7, ..RiotEnd::default() };
+        assert_eq!(riot_of(&format!("{end}\n{}\n", riot(0, false))), Some(abandoned));
+    }
 }
 
 #[cfg(test)]
@@ -342,7 +416,10 @@ mod tests {
         // Luck = actual - expected + loss; |-5 + loss| is far greater than this step's loss: mostly luck.
         let luck = s.luck.unwrap();
         assert!((luck - (1.0 - 6.0 + s.loss)).abs() < 1e-9, "{luck}");
-        assert_eq!(s.cause, Some(Cause::Luck));
+        // Day 2 of 20: 0.9 of the days to come; a log without the playouts' version takes the old playouts' drift.
+        assert!((s.expected_net.unwrap() - (6.0 + audit::DRIFT_AT_START_V1 * 0.9)).abs() < 1e-9);
+        assert!(s.z_net.unwrap() < -1.0, "{:?}", s.z_net);
+        assert!(matches!(s.cause, Some(Cause::Luck { high: false } | Cause::Decisions)), "{:?}", s.cause);
         assert_eq!((s.scored, s.unknown, s.rollouts), (1, 0, 40));
         assert!(s.folder.starts_with("ascendant-settle-"));
     }
@@ -357,7 +434,8 @@ mod tests {
         let s = summarize(&g, 400);
         assert!((s.loss - 1.0).abs() < 1e-9);
         assert!((s.luck.unwrap() - (1.0 - 6.0 + 1.0)).abs() < 1e-9);
-        assert_eq!(s.cause, Some(Cause::Luck));
+        // A loss of 1 is less than half the widened spread (sqrt(2^2 + (2.16 x 0.9)^2) = 2.79) and than |luck| net.
+        assert_eq!(s.cause, Some(Cause::Luck { high: false }));
         let w = s.worst.clone().unwrap();
         assert_eq!((w.day, w.screen, w.noise), (2, "Patrol", false));
         assert!((w.loss - 1.0).abs() < 1e-9 && (w.gap_se - 0.1).abs() < 1e-9);
@@ -371,12 +449,72 @@ mod tests {
         assert_eq!(s.loss, 0.0);
         assert_eq!(s.noise.1, 1);
         assert!(s.worst.unwrap().noise);
-        // Loss greater than |luck|: mostly decisions.
+        // A loss of 5, beyond half the spread: decisions.
         g.decisions[0].ranking[1].gap_se = 0.1;
         g.decisions[0].ranking[0].mean = 10.0;
-        g.expected = Some((2.0, 2.0));
         let s = summarize(&g, 400);
         assert_eq!(s.cause, Some(Cause::Decisions));
+    }
+
+    /// The three verdicts with the drift taken out: within one widened sd, decisions, and luck high or low.
+    #[test]
+    fn the_verdict_takes_the_usual_drift_out() {
+        let text = patrol_log("Go to cell 04 (a locked door)", true);
+        let mut g = audit::games("r", &text).remove(0);
+        assert_eq!(g.start_left, Some(0.9));
+        let drift = g.drift_at_start() * 0.9;
+        // 04 taken and best: no loss.
+        g.decisions[0].ranking = vec![option(Action::Patrol { cell: 3 }, 6.0, 0.0), option(Action::Patrol { cell: 5 }, 5.9, 0.5)];
+        // The actual 1 a little above the expectation plus the drift: the old rule called it luck (|luck| > 0).
+        g.expected = Some((1.0 - drift - 0.5, 2.0));
+        let s = summarize(&g, 400);
+        assert!(s.z_net.unwrap().abs() < WITHIN_Z && s.luck.unwrap() > 0.0, "{s:?}");
+        assert_eq!(s.cause, Some(Cause::Within));
+        // Far above the expectation with no loss: luck ran high.
+        g.expected = Some((-6.0, 2.0));
+        assert_eq!(summarize(&g, 400).cause, Some(Cause::Luck { high: true }));
+        // Far below with no loss: luck ran low.
+        g.expected = Some((6.0, 2.0));
+        assert_eq!(summarize(&g, 400).cause, Some(Cause::Luck { high: false }));
+        // Far below with 04 costing 3 (beyond the noise, more than half the spread of 2.79): the decisions.
+        g.decisions[0].ranking = vec![option(Action::Patrol { cell: 5 }, 9.0, 0.0), option(Action::Patrol { cell: 3 }, 6.0, 0.1)];
+        let s = summarize(&g, 400);
+        assert!((s.loss - 3.0).abs() < 1e-9, "{s:?}");
+        assert_eq!(s.cause, Some(Cause::Decisions));
+        // A loss of 3 with luck that made up for it, the actual within one sd of the expectation plus the drift: the
+        // decisions all the same (2026-11-08 10:39 lost 6.26 within the range).
+        g.expected = Some((1.0 - drift + 3.0 - 0.5, 2.0));
+        let s = summarize(&g, 400);
+        assert!(s.z_net.unwrap().abs() < WITHIN_Z, "{s:?}");
+        assert_eq!(s.cause, Some(Cause::Decisions));
+        // A loss under half the spread within the range: within.
+        g.decisions[0].ranking[0].mean = 7.0;
+        let s = summarize(&g, 400);
+        assert!((s.loss - 1.0).abs() < 1e-9 && s.z_net.unwrap().abs() < WITHIN_Z, "{s:?}");
+        assert_eq!(s.cause, Some(Cause::Within));
+        // Unknown drift (no read for the advice row): the rule before it, |luck| against the loss.
+        g.start_left = None;
+        let s = summarize(&g, 400);
+        assert_eq!((s.z_net, s.expected_net), (None, None));
+        assert_eq!(s.cause, cause(s.loss, s.luck, None));
+    }
+
+    /// The settle page takes the drift of the playouts that solved the run: the same run with its advice rows naming
+    /// version 2 expects DRIFT_AT_START over the expectation, without the field DRIFT_AT_START_V1.
+    #[test]
+    fn the_drift_follows_the_logged_playouts_version() {
+        let old = patrol_log("Go to cell 04 (a locked door)", true);
+        let new = old.replace("\"rounds\":100", "\"playout\":2,\"rounds\":100");
+        assert_ne!(old, new, "the advice rows name the version");
+        let expected_net = |name: &str, text: &str| {
+            let dir = temp_run(name, text);
+            let out = settle_dir(&dir, Lang::En, 40);
+            let _ = std::fs::remove_dir_all(&dir);
+            let Outcome::Settled(s) = out else { panic!("{out:?}") };
+            s.expected_net.unwrap()
+        };
+        assert!((expected_net("playout-old", &old) - (6.0 + audit::DRIFT_AT_START_V1 * 0.9)).abs() < 1e-9);
+        assert!((expected_net("playout-new", &new) - (6.0 + audit::DRIFT_AT_START * 0.9)).abs() < 1e-9);
     }
 
     #[test]

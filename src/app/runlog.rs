@@ -22,6 +22,95 @@ const KEEP_GAMES: usize = 10;
 /// again when the switch is turned.
 static KEEP_ALL: AtomicBool = AtomicBool::new(true);
 
+/// How often a `load` row goes in ([`load_note`]): the computer's CPU use and the app's own over the span before it.
+/// High load was told only from the reads' times before (the 2026-11-08 10:39 run: reads 300 to 850 ms, solves up
+/// to 4.4 s); a row every 30 s is about 3 KB an hour.
+const LOAD_EVERY: Duration = Duration::from_secs(30);
+
+/// The CPU times last sampled for [`load_note`]: when, the computer's idle, kernel (idle included) and user time,
+/// and this process's kernel and user time, all in 100 ns ticks.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct CpuTimes {
+    at: Instant,
+    idle: u64,
+    kernel: u64,
+    user: u64,
+    app: u64,
+}
+
+/// The `load` row's fields for the span between two samples: `cpu` the computer's busy share, `app` this app's share
+/// of all its logical processors (both percent, one decimal), `cores` and `span_s`; None for a span too short to tell.
+fn load_fields(before: &CpuTimes, now: &CpuTimes, cores: usize) -> Option<Value> {
+    let total = (now.kernel + now.user).checked_sub(before.kernel + before.user)?;
+    let idle = now.idle.checked_sub(before.idle)?;
+    let app = now.app.checked_sub(before.app)?;
+    let span = now.at.duration_since(before.at);
+    if total == 0 || span.is_zero() {
+        return None;
+    }
+    let round = |x: f64| (x * 10.0).round() / 10.0;
+    let busy = 100.0 * (1.0 - idle as f64 / total as f64);
+    // the app's CPU time over the wall time of every logical processor (100 ns ticks)
+    let app_share = 100.0 * app as f64 / (span.as_secs_f64() * 1e7 * cores.max(1) as f64);
+    Some(serde_json::json!({ "cpu": round(busy.clamp(0.0, 100.0)), "app": round(app_share.clamp(0.0, 100.0)), "cores": cores, "span_s": round(span.as_secs_f64()) }))
+}
+
+/// This moment's [`CpuTimes`]; None where they cannot be read.
+#[cfg(windows)]
+fn cpu_times() -> Option<CpuTimes> {
+    use windows::Win32::Foundation::FILETIME;
+    use windows::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes, GetSystemTimes};
+    let ticks = |f: FILETIME| (u64::from(f.dwHighDateTime) << 32) | u64::from(f.dwLowDateTime);
+    let (mut idle, mut kernel, mut user) = (FILETIME::default(), FILETIME::default(), FILETIME::default());
+    let (mut created, mut exited, mut pk, mut pu) = (FILETIME::default(), FILETIME::default(), FILETIME::default(), FILETIME::default());
+    // SAFETY: plain out-parameters of this process and the system, nothing kept.
+    unsafe {
+        GetSystemTimes(Some(&mut idle), Some(&mut kernel), Some(&mut user)).ok()?;
+        GetProcessTimes(GetCurrentProcess(), &mut created, &mut exited, &mut pk, &mut pu).ok()?;
+    }
+    Some(CpuTimes { at: Instant::now(), idle: ticks(idle), kernel: ticks(kernel), user: ticks(user), app: ticks(pk) + ticks(pu) })
+}
+
+#[cfg(not(windows))]
+fn cpu_times() -> Option<CpuTimes> {
+    None
+}
+
+/// A `load` row when [`LOAD_EVERY`] has passed since the last sample (taken by whichever log writes next, as the
+/// capture's rows): the first call only samples.
+fn load_note() -> Option<(SystemTime, &'static str, Value)> {
+    // tests count the rows they write: no sample comes in among them
+    if cfg!(test) {
+        return None;
+    }
+    static LAST: std::sync::Mutex<Option<CpuTimes>> = std::sync::Mutex::new(None);
+    let mut last = LAST.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if last.is_some_and(|l| l.at.elapsed() < LOAD_EVERY) {
+        return None;
+    }
+    let now = cpu_times()?;
+    let before = last.replace(now)?;
+    let cores = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+    load_fields(&before, &now, cores).map(|f| (SystemTime::now(), "load", f))
+}
+
+/// The settings summary the logs write (`Settings::log_summary`) and how many times it changed, see [`set_settings`].
+static SETTINGS: std::sync::Mutex<(Option<Value>, u64)> = std::sync::Mutex::new((None, 0));
+
+/// Sets the settings summary each run's window line carries; a change since the last call also goes into each log
+/// as one `settings` row before its next line (the app calls it at start and on every save).
+pub fn set_settings(summary: Value) {
+    let mut s = SETTINGS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if s.0.as_ref() != Some(&summary) {
+        *s = (Some(summary), s.1 + 1);
+    }
+}
+
+/// The settings summary and its change count.
+fn settings_now() -> (Option<Value>, u64) {
+    SETTINGS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
+}
+
 /// Sets whether every run log is kept (true) or only the newest [`KEEP_GAMES`] finished games per log root.
 pub fn set_keep_all(keep: bool) {
     KEEP_ALL.store(keep, Ordering::Relaxed);
@@ -67,6 +156,8 @@ enum Item {
     Held(String),
     /// File name, frame and JPEG quality.
     Jpeg(String, Rgba, u8),
+    /// File name and a frame or crop to keep lossless (the affix samples' panel).
+    Png(String, Rgba),
     /// An observe mode frame, a JPEG already.
     Observed(String, Vec<u8>),
 }
@@ -92,6 +183,11 @@ pub struct RunLog {
     geometry: fn(Value) -> Value,
     tx: Option<Sender<Job>>,
     writer: Option<JoinHandle<()>>,
+    /// The settings change count ([`set_settings`]) this log last wrote, in its window line or a `settings` row.
+    settings_seen: std::sync::atomic::AtomicU64,
+    /// Whether this log writes the settings (always, but in tests only where a test asks: the summary is global, and
+    /// tests running side by side count their rows).
+    settings_rows: bool,
 }
 
 impl RunLog {
@@ -147,12 +243,13 @@ impl RunLog {
                 let _ = match item {
                     Item::Line(line) | Item::Held(line) => append(&dir.join("log.jsonl"), &line),
                     Item::Jpeg(name, frame, quality) => save_jpeg(&dir.join(name), &frame, quality),
+                    Item::Png(name, frame) => crate::reader::save_png(&dir.join(name), &frame),
                     Item::Observed(name, jpeg) => save_observed(&dir.join("observe"), &name, &jpeg),
                 };
             }
         });
         let dir = root.join(folder_name(SystemTime::now()));
-        RunLog { root, dir, frames: 0, last: None, window: None, geometry: super::capture::with_geometry, tx: Some(tx), writer: Some(writer) }
+        RunLog { root, dir, frames: 0, last: None, window: None, geometry: super::capture::with_geometry, tx: Some(tx), writer: Some(writer), settings_seen: std::sync::atomic::AtomicU64::new(0), settings_rows: !cfg!(test) }
     }
 
     /// A log under runs in [`super::settings::app_dir`]; None when APPDATA is not set.
@@ -174,6 +271,12 @@ impl RunLog {
         if let Some(map) = fields.as_object_mut() {
             map.entry("app").or_insert_with(|| Value::from(env!("CARGO_PKG_VERSION")));
             map.entry("exe").or_insert_with(|| exe_stamp().clone());
+            map.entry("features").or_insert_with(|| features().into());
+            let (settings, seen) = settings_now();
+            if let Some(settings) = settings.filter(|_| self.settings_rows) {
+                map.insert("settings".into(), settings);
+                self.settings_seen.store(seen, Ordering::Relaxed);
+            }
         }
         // The capture's latest measured geometry (numbers only) goes in as `capture`, see capture::with_geometry; it
         // is taken again for each later folder's window line, so that one carries the geometry of its own time.
@@ -226,7 +329,14 @@ impl RunLog {
 
     /// Writes one line: `at`, `kind`, then `fields` (a JSON object).
     pub fn event(&self, kind: &str, at: SystemTime, fields: Value) {
-        self.event_with(kind, at, fields, super::capture::take_notes);
+        self.event_with(kind, at, fields, || super::capture::take_notes().into_iter().chain(load_note()).chain(self.settings_note()).collect());
+    }
+
+    /// A `settings` row when the settings changed since this log last wrote them ([`set_settings`]).
+    fn settings_note(&self) -> Option<(SystemTime, &'static str, Value)> {
+        let (settings, seen) = settings_now();
+        let settings = settings.filter(|_| self.settings_rows)?;
+        (self.settings_seen.swap(seen, Ordering::Relaxed) != seen).then(|| (SystemTime::now(), "settings", settings))
     }
 
     /// [`RunLog::event`] with the capture's queued rows (capture_geometry, capture_trim, capture_warning) from
@@ -250,8 +360,9 @@ impl RunLog {
         self.send(Job::Append(dir.to_path_buf(), line_text(kind, at, fields)));
     }
 
-    /// Writes one line as [`RunLog::event`] does, without taking the capture's rows.
-    fn line(&self, kind: &str, at: SystemTime, fields: Value) {
+    /// Writes one line as [`RunLog::event`] does, without taking the capture's rows (the affix samples' own log uses it,
+    /// so those rows stay with the run logs).
+    pub(crate) fn line(&self, kind: &str, at: SystemTime, fields: Value) {
         let line = line_text(kind, at, fields);
         let item = if kind == "window" || kind == "view" { Item::Held(line) } else { Item::Line(line) };
         self.send(Job::Write(self.dir.clone(), item));
@@ -292,6 +403,11 @@ impl RunLog {
     /// Saves `frame` as `name` in this run's folder (quality `quality`), without a number.
     pub fn jpeg_as(&self, name: &str, frame: Rgba, quality: u8) {
         self.send(Job::Write(self.dir.clone(), Item::Jpeg(name.to_string(), frame, quality)));
+    }
+
+    /// Saves `frame` as the lossless PNG `name` in this run's folder, without a number (on the writer thread).
+    pub fn png_as(&self, name: &str, frame: Rgba) {
+        self.send(Job::Write(self.dir.clone(), Item::Png(name.to_string(), frame)));
     }
 
     /// Saves `jpeg`, observe mode's frame of the game as captured at `at`,
@@ -410,17 +526,31 @@ pub(super) fn folder_name(t: SystemTime) -> String {
 }
 
 /// A line's time, UTC: "2026-10-18T01:23:45.678Z".
-/// This exe's modification time and size (`{"modified": …, "size": …}`, never its path), read once; null when the
-/// exe cannot be read.
-fn exe_stamp() -> &'static Value {
+/// This exe's modification time, size and SHA-256 (`{"modified": …, "size": …, "sha256": …}`, never its path), read
+/// once; null when the exe cannot be read. The hash tells a build apart for sure, a private test build from another
+/// of the same version and a public one by its release's SHA256SUMS (the user's ask of 2026-11-09: the time and size
+/// alone could not prove which build played); a build of the same tree and features hashes the same.
+pub(crate) fn exe_stamp() -> &'static Value {
     static STAMP: std::sync::OnceLock<Value> = std::sync::OnceLock::new();
     STAMP.get_or_init(|| {
-        let meta = std::env::current_exe().ok().and_then(|p| std::fs::metadata(p).ok());
-        match meta {
-            Some(m) => serde_json::json!({ "modified": m.modified().ok().map(timestamp), "size": m.len() }),
-            None => Value::Null,
-        }
+        use sha2::{Digest, Sha256};
+        let Some(path) = std::env::current_exe().ok() else { return Value::Null };
+        let Ok(meta) = std::fs::metadata(&path) else { return Value::Null };
+        let sha256 = std::fs::read(&path).ok().map(|b| Sha256::digest(&b).iter().map(|x| format!("{x:02x}")).collect::<String>());
+        serde_json::json!({ "modified": meta.modified().ok().map(timestamp), "size": meta.len(), "sha256": sha256 })
     })
+}
+
+/// The cargo features this build was made with (`dev-samples` marks a private build), in the window line.
+fn features() -> Vec<&'static str> {
+    let mut out = Vec::new();
+    if cfg!(feature = "dev-samples") {
+        out.push("dev-samples");
+    }
+    if cfg!(feature = "en-vorax") {
+        out.push("en-vorax");
+    }
+    out
 }
 
 pub fn timestamp(t: SystemTime) -> String {
@@ -474,9 +604,11 @@ fn made_run_folder(name: &str) -> bool {
 /// The run folders under `root` that hold a finished game ([`finished`]), and all its run folders, both by name
 /// (oldest first). Only names RunLog gives count ([`made_run_folder`]), and only up to a day after `now`: a folder
 /// named later (the clock was set wrong when it was made) is neither a game nor ever deleted. Which rows mark a
-/// finished game follows the root's name: `vorax` for Vorax, else Tartarus.
+/// finished game follows the root's name: `vorax` for Vorax, `affix` for the map page samples of private builds (a
+/// whole visit, [`visit_over`]), else Tartarus.
 fn finished_games(root: &Path, now: SystemTime) -> (Vec<PathBuf>, Vec<PathBuf>) {
     let vorax = root.file_name().is_some_and(|n| n == "vorax");
+    let affix = root.file_name().is_some_and(|n| n == "affix");
     let latest = folder_name(now + Duration::from_secs(86_400));
     let ours = |name: &str| made_run_folder(name) && name[..19] <= *latest;
     let mut runs: Vec<PathBuf> = std::fs::read_dir(root)
@@ -489,8 +621,17 @@ fn finished_games(root: &Path, now: SystemTime) -> (Vec<PathBuf>, Vec<PathBuf>) 
         })
         .unwrap_or_default();
     runs.sort();
-    let games = runs.iter().filter(|d| finished(d, vorax)).cloned().collect();
+    let games = runs.iter().filter(|d| if affix { visit_over(d) } else { finished(d, vorax) }).cloned().collect();
     (games, runs)
+}
+
+/// Whether a map page sample folder (`affix_samples.rs`, private builds) holds a whole visit: its log has the row a
+/// visit ends with, `affix_level` (the map entered) or `affix_visit_end` (no level). These count as the games
+/// [`prune`] keeps the newest of, so the samples are kept as Tartarus and Vorax logs are: the newest [`KEEP_GAMES`]
+/// visits, older folders deleted, unless "Keep all run logs" (review 2026-11-08: the folder only grew before).
+fn visit_over(dir: &Path) -> bool {
+    std::fs::read_to_string(dir.join("log.jsonl"))
+        .is_ok_and(|text| text.lines().any(|l| l.contains("\"kind\":\"affix_level\"") || l.contains("\"kind\":\"affix_visit_end\"")))
 }
 
 /// Whether a run folder holds nothing but window and view lines, so it can go whatever "Keep all run logs" says: its
@@ -699,6 +840,32 @@ mod tests {
         prune(&root, false, KEEP_GAMES, &day(11, 2), now());
         assert_eq!(tree(&root), before);
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// The map page samples (private builds, root `affix`): a visit ended with its level or without one counts as a
+    /// game, so the newest ten visits are kept whole and older folders go (a visit cut short, with neither row, counts
+    /// as none); "Keep all run logs" keeps every one.
+    #[test]
+    fn the_newest_ten_affix_visits_are_kept() {
+        let root = temp("affix").join("affix");
+        let visit = |k: usize| root.join(format!("2026-10-{:02}_00-00-00", k + 1));
+        for k in 0..12 {
+            let end = if k % 2 == 0 { r#"{"kind":"affix_level","ids":[5121004]}"# } else { r#"{"kind":"affix_visit_end","why":"cancelled"}"# };
+            fill(&visit(k), &[r#"{"kind":"affix_page","state":"shown"}"#, r#"{"kind":"affix_sample"}"#, end]);
+        }
+        // a visit cut short (Ascendant closed on the page): no end row, not a game
+        let cut = root.join("2026-10-20_00-00-00");
+        fill(&cut, &[r#"{"kind":"affix_page","state":"shown"}"#]);
+        let before = tree(&root);
+        prune(&root, true, KEEP_GAMES, &root.join("none"), now());
+        assert_eq!(tree(&root), before, "keep all: every visit stays");
+        prune(&root, false, KEEP_GAMES, &root.join("none"), now());
+        for k in 0..12 {
+            assert_eq!(visit(k).is_dir(), k >= 2, "visit {k}");
+        }
+        assert!(visit(2).join("observe").join("obs-000000000.jpg").is_file(), "the tenth newest visit stays whole");
+        assert!(cut.is_dir(), "newer than the visits kept");
+        std::fs::remove_dir_all(root.parent().unwrap()).unwrap();
     }
 
     /// The folder being written is never deleted, even when it is older than the games kept.
@@ -971,6 +1138,63 @@ mod tests {
 
     /// Switching the window language mid-run writes the window line again with the new OCR language, and the next
     /// run's folder starts with it (on 2026-11-07 both folders of an English run still said "zh-Hant-TW").
+    #[test]
+    fn load_shares_from_cpu_times() {
+        let t0 = Instant::now();
+        let at = |s: u64| t0 + Duration::from_secs(s);
+        // 30 s on 4 processors: 120 s of processor time in 100 ns ticks; 90 s idle, so 25% busy; the app 6 s, 5%
+        let before = CpuTimes { at: at(0), idle: 0, kernel: 0, user: 0, app: 0 };
+        let now = CpuTimes { at: at(30), idle: 900_000_000, kernel: 1_000_000_000, user: 200_000_000, app: 60_000_000 };
+        let f = load_fields(&before, &now, 4).unwrap();
+        assert_eq!((f["cpu"].as_f64(), f["app"].as_f64(), f["cores"].as_u64(), f["span_s"].as_f64()), (Some(25.0), Some(5.0), Some(4), Some(30.0)));
+        // no time between, or counters gone back: nothing
+        assert!(load_fields(&before, &before, 4).is_none());
+        assert!(load_fields(&now, &before, 4).is_none());
+    }
+
+    /// The window line names the build: the version, the exe's time, size and SHA-256, and the features.
+    #[test]
+    fn the_window_line_names_the_build() {
+        let root = temp("build");
+        let mut log = RunLog::new(root.clone());
+        log.geometry = stand_in_geometry;
+        log.window(serde_json::json!({ "window": "w", "ocr": "zh-Hant-TW" }));
+        log.event_with("read", SystemTime::now(), serde_json::json!({}), Vec::new);
+        log.wait();
+        let text = std::fs::read_to_string(log.dir().join("log.jsonl")).unwrap();
+        let w: Value = text.lines().map(|l| serde_json::from_str::<Value>(l).unwrap()).find(|l| l["kind"] == "window").unwrap();
+        assert_eq!(w["app"], env!("CARGO_PKG_VERSION"));
+        assert!(w["exe"]["sha256"].as_str().is_some_and(|h| h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit())), "{}", w["exe"]);
+        assert_eq!(w["features"].as_array().unwrap().iter().any(|f| f == "dev-samples"), cfg!(feature = "dev-samples"));
+        drop(log);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The window line carries the settings summary; a change writes one `settings` row before the next line, and
+    /// the same settings again write none.
+    #[test]
+    fn settings_go_in_the_window_line_and_a_row_on_a_change() {
+        let root = temp("settings");
+        let mut log = RunLog::new(root.clone());
+        log.geometry = stand_in_geometry;
+        log.settings_rows = true;
+        set_settings(serde_json::json!({ "rollouts": 1600, "test": "settings-rows" }));
+        log.window(serde_json::json!({ "window": "w", "ocr": "zh-Hant-TW" }));
+        log.event_with("read", SystemTime::now(), serde_json::json!({}), || log.settings_note().into_iter().collect());
+        set_settings(serde_json::json!({ "rollouts": 3200, "test": "settings-rows" }));
+        log.event_with("read", SystemTime::now(), serde_json::json!({}), || log.settings_note().into_iter().collect());
+        set_settings(serde_json::json!({ "rollouts": 3200, "test": "settings-rows" }));
+        log.event_with("read", SystemTime::now(), serde_json::json!({}), || log.settings_note().into_iter().collect());
+        log.wait();
+        let rows: Vec<Value> = std::fs::read_to_string(log.dir().join("log.jsonl")).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+        let kinds: Vec<&str> = rows.iter().map(|r| r["kind"].as_str().unwrap()).collect();
+        assert_eq!(kinds, ["window", "read", "settings", "read", "read"]);
+        assert_eq!(rows[0]["settings"]["rollouts"], 1600);
+        assert_eq!(rows[2]["rollouts"], 3200);
+        drop(log);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn a_language_switch_rewrites_the_window_line() {
         let root = temp("language-switch");

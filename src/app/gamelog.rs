@@ -82,6 +82,269 @@ pub enum Signal {
     /// The riot battle after a run (level [`RIOT_LEVEL`]) had its special boss or the boss's chest; sent once the
     /// game leaves that level, see [`Riot`]. Only written to the run log: nothing is shown, read or advised on it.
     RiotBoss(RiotBoss),
+    /// How the riot battle after a run went (fought or abandoned, the special boss, the chests opened), see
+    /// [`RiotOutcome`]: sent once the game leaves the battle's level, or when the riot is abandoned. For the run log
+    /// and the run review only: nothing is read or advised on it.
+    RiotEnd(RiotEnd),
+    /// A Netherrealm map's detail page ([`MapPage`]) shown, covered by another page or closed ([`PageState`]), see
+    /// [`map_page`]. For the map affixes only (the affix frames): Tartarus and Vorax never get it.
+    MapPage { page: MapPage, state: PageState },
+    /// An affix button clicked on a map page: Add (`revert` false) or Revert. The game names them only `AddBtn` and
+    /// `RevertBtn`, so they mean something only while a map page is open.
+    AffixButton { revert: bool },
+    /// The panel affixes of the level just entered, from the game log's AffixInfos block, see [`AffixBlock`].
+    MapAffixes(MapAffixes),
+}
+
+/// Which Netherrealm map detail page: a normal map (its affix panel lists the affixes added with Netherrealm
+/// Resonance), a boss map or a gold map (special reward maps, which the user says carry no affixes).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MapPage {
+    Normal,
+    Boss,
+    Gold,
+}
+
+/// A map page's `PageRunState`: `Run` (shown), `Hide` (another page opened over it; it may show again) or `Destory`
+/// (closed: the game enters the map 0.5 to 1.7 s later, or the visit was cancelled).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PageState {
+    Shown,
+    Hidden,
+    Closed,
+}
+
+impl PageState {
+    /// Its name in the affix samples' rows.
+    pub fn name(self) -> &'static str {
+        match self {
+            PageState::Shown => "shown",
+            PageState::Hidden => "hidden",
+            PageState::Closed => "closed",
+        }
+    }
+}
+
+impl MapPage {
+    /// Its name in the affix samples' rows.
+    pub fn name(self) -> &'static str {
+        match self {
+            MapPage::Normal => "normal",
+            MapPage::Boss => "boss",
+            MapPage::Gold => "gold",
+        }
+    }
+}
+
+/// A map page opening or closing: `TipMsgShowMgr@DispatchPageRunChange PageName = MysteryMapDetail , PageRunState =
+/// Run` (or `Hide`, `Destory`); `MysteryBossDetail` and `MysteryGoldMapDetail` are the boss and gold maps. The page
+/// stack lines that also name the page (`PageStack@ ... PageName = MysteryMapDetail, PageType = ...`) are not taken.
+pub fn map_page(line: &str) -> Option<Signal> {
+    let rest = line.split_once("DispatchPageRunChange PageName = ")?.1;
+    let (name, state) = rest.split_once(" , PageRunState = ")?;
+    let page = match name {
+        "MysteryMapDetail" => MapPage::Normal,
+        "MysteryBossDetail" => MapPage::Boss,
+        "MysteryGoldMapDetail" => MapPage::Gold,
+        _ => return None,
+    };
+    let state = match state.trim() {
+        "Run" => PageState::Shown,
+        "Hide" => PageState::Hidden,
+        "Destory" => PageState::Closed,
+        _ => return None,
+    };
+    Some(Signal::MapPage { page, state })
+}
+
+/// An affix button click: `UIButton@ normal-click AddBtn` or `UIButton@ normal-click RevertBtn` (the whole name, so
+/// `AddBtnX` is not taken).
+fn affix_button(line: &str) -> Option<Signal> {
+    match line.trim_end().rsplit_once("UIButton@ normal-click ")?.1 {
+        "AddBtn" => Some(Signal::AffixButton { revert: false }),
+        "RevertBtn" => Some(Signal::AffixButton { revert: true }),
+        _ => None,
+    }
+}
+
+/// Panel affix ids kept per level ([`MapAffixes`]): a panel shows six at most.
+pub const MAP_AFFIX_MAX: usize = 16;
+
+/// The levels of the hideout: entering one leaves the map (the logs of 2026-11-08 and 11-10 go map, 110, map, 110:
+/// 163 map entries, one into another level without the hideout between, 235501, whose block names no panel affix).
+/// Its block names no panel affix, or the last map's or another map's six (the map device's), never the hideout's own.
+pub const HIDEOUT_LEVELS: &[u32] = &[110];
+
+/// Whether an affix id is one the map page's affix panel shows (Netherrealm Resonance): 51xxxxx to 56xxxxx and
+/// 35003xx, the ranges of every id the lab matched to panel text (91 ids, 2026-11-08). The AffixInfos block lists
+/// about 50 to 110 other ids too (compass, vigil, season and the map's own modifiers).
+pub fn is_panel_affix(id: u32) -> bool {
+    (5_100_000..=5_699_999).contains(&id) || (3_500_300..=3_500_399).contains(&id)
+}
+
+/// The affixes of a level entered ([`Signal::MapAffixes`]): the panel's ids ([`is_panel_affix`], in the block's
+/// order, at most [`MAP_AFFIX_MAX`]) and how many other ids the block listed. No other log text is kept.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MapAffixes {
+    /// The level entered just before the block (`UGameMgr::EnterLevel(5308)`), when one was seen.
+    pub level: Option<u32>,
+    ids: [u32; MAP_AFFIX_MAX],
+    n: u8,
+    /// Ids of the block that are not panel affixes (and panel ids past [`MAP_AFFIX_MAX`]).
+    pub others: u16,
+}
+
+impl MapAffixes {
+    /// The panel affix ids.
+    pub fn ids(&self) -> &[u32] {
+        &self.ids[..self.n as usize]
+    }
+
+    /// The affixes of `level` with these ids (tests of the modules that take the signal).
+    #[cfg(test)]
+    pub fn of(level: Option<u32>, ids: &[u32]) -> Self {
+        let mut a = MapAffixes { level, ..MapAffixes::default() };
+        ids.iter().for_each(|&id| a.push(id));
+        a
+    }
+
+    fn push(&mut self, id: u32) {
+        if is_panel_affix(id) && (self.n as usize) < MAP_AFFIX_MAX {
+            self.ids[self.n as usize] = id;
+            self.n += 1;
+        } else {
+            self.others = self.others.saturating_add(1);
+        }
+    }
+}
+
+/// Follows the game log for the AffixInfos block the game writes on entering a level (after `UGameMgr::EnterLevel`):
+/// a `[Game] AffixInfos` line, then untimed lines listing up to 30 affixes (`+1+Id [216000]` and the entry's
+/// `+FId`, `+Tier`, `+DangerNumbers`, `+Description` lines, then `+31+...` when there are more), then every affix
+/// again on its own: untimed `+Id [216000]` lines with the same fields, each closed by a timed `[Game] 216000` line. The block ends at the first timed line that is neither empty after `[Game]` nor a number.
+/// The ids come from the closing number lines when there are any (the full list), else from the list's `+Id` lines.
+/// A block with no ids gives nothing, except after a level entered: the hideout's (`110`) often has none, and the
+/// affix page drops the map it shows on entering it (`affix_live`).
+///
+/// Each panel affix's text is kept too (its `+Description [...]` line, in the client's language, values
+/// filled in) for the affix list to learn from ([`take_affix_texts`]); the signal itself stays ids only. The fields of
+/// an affix come in no fixed order; the logs of 2026-11-08 hold three, one per game session: `+Id +FId +Tier
+/// +DangerNumbers +Description`, `+FId +Id +Description +Tier +DangerNumbers` and `+Description +Id +DangerNumbers +FId
+/// +Tier` (reading the text as the last `+Id`'s gave every text to the affix before it in the last one). So a text is taken
+/// only from a reprinted entry, whose bounds the timed lines give whatever the order: the entry from its empty timed
+/// line to the timed line naming its id holds that one `+Id` and one readable text, or nothing is learned from it.
+#[derive(Default)]
+pub struct AffixBlock {
+    level: Option<u32>,
+    open: bool,
+    listed: Vec<u32>,
+    repeated: Vec<u32>,
+    /// The reprinted entry being read (since its empty timed line), and the texts found so far (first text per id).
+    entry: Option<EntryLines>,
+    texts: Vec<(u32, String)>,
+}
+
+/// The untimed lines of one reprinted affix, between its empty timed line and the timed line naming its id: what its
+/// `+Id` lines name (`None` for one that does not read) and its readable texts.
+#[derive(Default)]
+struct EntryLines {
+    ids: Vec<Option<u32>>,
+    texts: Vec<String>,
+}
+
+/// Panel affix texts the game log gave on entering levels, waiting to be taken ([`take_affix_texts`]).
+static AFFIX_TEXTS: std::sync::Mutex<Vec<(u32, String)>> = std::sync::Mutex::new(Vec::new());
+
+/// The panel affix ids and texts ([`AffixBlock`]) found since the last call: each id with its `+Description` text as the
+/// log wrote it (tags and values in, see `affix::learned::template`).
+pub fn take_affix_texts() -> Vec<(u32, String)> {
+    std::mem::take(&mut *AFFIX_TEXTS.lock().unwrap_or_else(std::sync::PoisonError::into_inner))
+}
+
+impl AffixBlock {
+    /// The [`Signal::MapAffixes`] of the block this line ends, if any.
+    pub fn line(&mut self, line: &str) -> Option<Signal> {
+        let mut done = None;
+        if self.open {
+            if !line.starts_with('[') {
+                if line.contains("+Id [") {
+                    let id = number_after(line, "+Id [");
+                    if let Some(id) = id {
+                        self.listed.push(id);
+                    }
+                    if let Some(entry) = &mut self.entry {
+                        entry.ids.push(id);
+                    }
+                } else if let (Some(entry), Some((_, rest))) = (&mut self.entry, line.split_once("+Description [")) {
+                    // the text runs to the line's closing ']' (it may hold brackets of its own); a line without one
+                    // (cut short) and an untranslated key are not texts
+                    if let Some(text) = rest.trim_end().strip_suffix(']')
+                        && readable(text)
+                    {
+                        entry.texts.push(text.to_string());
+                    }
+                }
+                return None;
+            }
+            match line.split_once("[Game]").map(|(_, rest)| rest.trim()) {
+                // an empty timed line starts a reprinted entry (the first one also comes before the list)
+                Some("") => {
+                    self.entry = Some(EntryLines::default());
+                    return None;
+                }
+                Some(rest) if rest.bytes().all(|b| b.is_ascii_digit()) => {
+                    if let Ok(id) = rest.parse::<u32>() {
+                        self.repeated.push(id);
+                        // The entry's text is this id's when the entry names this id alone and holds one text; any
+                        // other entry (the list before the first entry, an id that does not read or another id, two
+                        // texts) teaches nothing: a text is never guessed onto an id.
+                        if let Some(entry) = self.entry.take()
+                            && entry.ids == [Some(id)]
+                            && let [text] = entry.texts.as_slice()
+                            && !self.texts.iter().any(|(known, _)| *known == id)
+                        {
+                            self.texts.push((id, text.clone()));
+                        }
+                    }
+                    self.entry = None;
+                    return None;
+                }
+                _ => done = self.close(),
+            }
+        }
+        if let Some(level) = level_entered(line) {
+            self.level = Some(level);
+        } else if line.trim_end().ends_with("[Game] AffixInfos") {
+            self.open = true;
+        }
+        done
+    }
+
+    /// The log ended: a block still open is closed, so the texts it holds count (as a later line would close it).
+    pub fn finish(&mut self) {
+        if self.open {
+            let _ = self.close();
+        }
+    }
+
+    fn close(&mut self) -> Option<Signal> {
+        self.open = false;
+        let ids = if self.repeated.is_empty() { std::mem::take(&mut self.listed) } else { std::mem::take(&mut self.repeated) };
+        self.listed.clear();
+        self.repeated.clear();
+        self.entry = None;
+        let texts = std::mem::take(&mut self.texts);
+        let panel: Vec<(u32, String)> = texts.into_iter().filter(|(id, _)| is_panel_affix(*id) && ids.contains(id)).collect();
+        if !panel.is_empty() {
+            AFFIX_TEXTS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).extend(panel);
+        }
+        if ids.is_empty() && self.level.is_none() {
+            return None;
+        }
+        let mut affixes = MapAffixes { level: self.level, ..MapAffixes::default() };
+        ids.into_iter().for_each(|id| affixes.push(id));
+        Some(Signal::MapAffixes(affixes))
+    }
 }
 
 /// The riot battle's level: the run's checkout (`S16GamePlayCheckOut`) starts it with
@@ -179,11 +442,202 @@ impl Riot {
     }
 }
 
+/// The kind of chest a riot battle's drop carrier is (`drop carrier triggered cfgId 1090NN`, one line per chest, all of
+/// them at the battle's end): two sets of six, 109001-109006 and 109021-109026, by the rarity of the inmate it is for.
+/// Checked on the 18 riots of 2026-11-08 and 11-09 against the run's last board: 109006 and 109026 are the colour
+/// chests (at least the vaulted count in every run, as the player sees it), 109005 and 109025 the red ones (the
+/// board's Ultimates, correlation 0.98), 109001-109004 and 109021-109024 the medium ones (every lower rarity, 0.94).
+/// Each kind is at least its inmates in every run (one run's last read came before a last bite) and about 15 to 21 %
+/// more in all: a Pact Spirit may open a warden's hoard once more (up to 16 %, the player says). The second set is
+/// not that re-opening: the first set alone falls 8 to 16 % short of the inmates.
+/// Not counted: the board task's chest (109041, 109042, 109051 or 109052, alone as the battle starts, one in every
+/// run and two in 4 of 18, the player says a red or a colour one; which id is which is not known), and the special
+/// boss's chest ([`RIOT_BOSS_CHEST`], 97 drops on 2026-11-07, which the player also calls a colour chest).
+/// The chest sounds (`UI_S16_Red_Chest` and the like) agree but come fewer (9 for 19 chests in one run), so they are
+/// not counted.
+fn chest_kind(cfg: u32) -> Option<Chest> {
+    match cfg {
+        109_006 | 109_026 => Some(Chest::Color),
+        109_005 | 109_025 => Some(Chest::Red),
+        109_001..=109_004 | 109_021..=109_024 => Some(Chest::Medium),
+        _ => None,
+    }
+}
+
+/// The three chest kinds of a riot battle, see [`chest_kind`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Chest {
+    Red,
+    Color,
+    Medium,
+}
+
+/// How one run's riot battle went, see [`Signal::RiotEnd`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RiotEnd {
+    /// The player started the riot battle (`CheckOut_StartChallenge`); false: abandoned on the run's checkout.
+    pub fought: bool,
+    /// The special boss ([`RIOT_BOSS_NPC`]) came, or its chest opened.
+    pub boss: bool,
+    /// Its death shout played or its chest opened.
+    pub boss_killed: bool,
+    /// Chests opened by kind, counted by their drop carriers (see [`chest_kind`]).
+    pub red: u32,
+    pub color: u32,
+    pub medium: u32,
+}
+
+/// Where a run's riot stands for [`RiotOutcome`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum RiotStage {
+    /// No run under way that the log showed, or its riot already told.
+    #[default]
+    Idle,
+    /// A run is under way: its checkout comes next.
+    Run,
+    /// The run's checkout opened: the player starts the riot battle or abandons it.
+    Offered,
+    /// The riot battle was started; `entered` once the game is in its level.
+    Fighting { entered: bool },
+}
+
+/// Follows the game log for how each run's riot went ([`Signal::RiotEnd`]). The checkout page also opens again when
+/// the player comes back to the prison after the battle, and they close it with its Abandon button (every one of the
+/// 18 runs of 2026-11-08 and 11-09): only the checkout right after a run's board counts, so a run must have been seen
+/// under way first (its Start, or a day's decision cards if the log was followed from mid-run; the board page is no
+/// sign, it opens behind that second checkout too). Followed from mid-checkout or mid-battle, that run's riot is not
+/// told.
+#[derive(Default)]
+pub struct RiotOutcome {
+    stage: RiotStage,
+    end: RiotEnd,
+}
+
+impl RiotOutcome {
+    /// The run's [`Signal::RiotEnd`], on the line the game left the riot battle's level or the riot was abandoned.
+    pub fn line(&mut self, line: &str) -> Option<Signal> {
+        if line.contains("normal-click Btn_S16GamePlay_Start") || line.contains("AudioEnum  == UI_S16_Card_Up") {
+            if !matches!(self.stage, RiotStage::Fighting { .. }) {
+                (self.stage, self.end) = (RiotStage::Run, RiotEnd::default());
+            }
+            return None;
+        }
+        match self.stage {
+            RiotStage::Idle => None,
+            RiotStage::Run => {
+                if line.contains("PageName = S16GamePlayCheckOut , PageRunState = Run") {
+                    self.stage = RiotStage::Offered;
+                }
+                None
+            }
+            RiotStage::Offered => {
+                if line.contains("normal-click Btn_S16GamePlay_CheckOut_StartChallenge") {
+                    self.stage = RiotStage::Fighting { entered: false };
+                    self.end = RiotEnd { fought: true, ..RiotEnd::default() };
+                } else if line.contains("normal-click Btn_S16GamePlay_CheckOut_AbandonChallenge") {
+                    self.stage = RiotStage::Idle;
+                    return Some(Signal::RiotEnd(RiotEnd::default()));
+                }
+                None
+            }
+            RiotStage::Fighting { entered } => {
+                if let Some(level) = level_entered(line) {
+                    if level == RIOT_LEVEL {
+                        self.stage = RiotStage::Fighting { entered: true };
+                    } else if entered {
+                        self.stage = RiotStage::Idle;
+                        return Some(Signal::RiotEnd(std::mem::take(&mut self.end)));
+                    }
+                    return None;
+                }
+                if !entered {
+                    return None;
+                }
+                let e = &mut self.end;
+                match carrier(line) {
+                    Some(RIOT_BOSS_CHEST) => (e.boss, e.boss_killed) = (true, true),
+                    Some(cfg) => match chest_kind(cfg) {
+                        Some(Chest::Red) => e.red += 1,
+                        Some(Chest::Color) => e.color += 1,
+                        Some(Chest::Medium) => e.medium += 1,
+                        None => {}
+                    },
+                    None if monster(line) == Some(RIOT_BOSS_NPC) => e.boss = true,
+                    None if line.contains(RIOT_BOSS_DIES) => (e.boss, e.boss_killed) = (true, true),
+                    None => {}
+                }
+                None
+            }
+        }
+    }
+}
+
 /// The number right after `key` in `line`, up to the first character that is not a digit.
 fn number_after(line: &str, key: &str) -> Option<u32> {
     let rest = line.split_once(key)?.1;
     let end = rest.find(|c: char| !c.is_ascii_digit()).unwrap_or(rest.len());
     rest[..end].parse().ok()
+}
+
+/// Whether an affix text of the log is worth keeping for the affix list (`affix::learned::template` makes something
+/// of it).
+fn readable(text: &str) -> bool {
+    crate::affix::learned::template(text).is_some()
+}
+
+/// The piece of a log [`look_back_affixes`] reads at a time.
+const LOOK_BACK_PIECE: usize = 8 << 20;
+
+/// The affixes the game's logs named before Ascendant started, for the affix list to
+/// learn from as from the levels entered later ([`take_affix_texts`]): every `UE_game*.log` beside `log` (the log the
+/// game writes now and its backups of the earlier ones; it keeps two), oldest first, read a piece at a time
+/// ([`LOOK_BACK_PIECE`]) into an [`AffixBlock`]. Only the panel affixes' ids and texts are kept; no other part of the
+/// logs (player names and ids among them) is held past its piece or written anywhere. A piece outside any block that
+/// does not name one is not turned into text. Stops between pieces when `stopped`. Returns how many logs were read to
+/// the end.
+pub fn look_back_affixes(log: &Path, stopped: &AtomicBool) -> usize {
+    let Some(read) = log.parent().and_then(|dir| std::fs::read_dir(dir).ok()) else { return 0 };
+    let mut logs: Vec<PathBuf> = read
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with("UE_game") && n.ends_with(".log")))
+        .collect();
+    // UE_game-backup-<date and time>.log sorts before UE_game.log, the backups by date
+    logs.sort();
+    logs.iter().filter(|p| !stopped.load(Ordering::Relaxed) && affixes_in(p, stopped)).count()
+}
+
+/// Reads one log for [`look_back_affixes`]; true when read to its end.
+fn affixes_in(path: &Path, stopped: &AtomicBool) -> bool {
+    const NEEDLE: &[u8] = b"AffixInfos";
+    let Ok(mut file) = std::fs::File::open(path) else { return false };
+    let mut block = AffixBlock::default();
+    let mut piece = vec![0u8; LOOK_BACK_PIECE];
+    let mut carried: Vec<u8> = Vec::new();
+    loop {
+        if stopped.load(Ordering::Relaxed) {
+            return false;
+        }
+        let n = match file.read(&mut piece) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(_) => return false,
+        };
+        carried.extend_from_slice(&piece[..n]);
+        // whole lines only: the last one may go on in the next piece
+        let complete = carried.iter().rposition(|&b| b == b'\n').map_or(0, |k| k + 1);
+        let lines = &carried[..complete];
+        if block.open || lines.windows(NEEDLE.len()).any(|w| w == NEEDLE) {
+            for line in String::from_utf8_lossy(lines).lines() {
+                let _ = block.line(line);
+            }
+        }
+        carried.drain(..complete);
+    }
+    for line in String::from_utf8_lossy(&carried).lines() {
+        let _ = block.line(line);
+    }
+    block.finish();
+    true
 }
 
 /// The level a `LevelMgr:_EnterLevelSuccess() 235501` or `UGameMgr::EnterLevel(235501) mode=2 reload=0.` line enters.
@@ -412,6 +866,10 @@ pub fn signal(line: &str) -> Option<Signal> {
     if line.contains("[S16LastDay] check ") {
         let number = |key: &str| line.split(key).nth(1)?.split(|c: char| !c.is_ascii_digit()).next()?.parse().ok();
         return Some(Signal::Day { cur: number("cur=")?, max: number("max=")? });
+    }
+    // The map pages close as well as open (Hide, Destory), so they come before the filter below.
+    if let Some(signal) = map_page(line).or_else(|| affix_button(line)) {
+        return Some(signal);
     }
     if !line.contains("PageRunState = Run") {
         return None;
@@ -711,6 +1169,8 @@ pub fn follow(path: &Path, stopped: &AtomicBool, mut on: impl FnMut(Signal, Opti
     let mut partial = String::new();
     let mut cards = Cards::default();
     let mut riot = Riot::default();
+    let mut outcome = RiotOutcome::default();
+    let mut affixes = AffixBlock::default();
     let mut missing_since: Option<std::time::Instant> = None;
     let mut last_new = std::time::Instant::now();
     while !stopped.load(Ordering::Relaxed) {
@@ -730,6 +1190,8 @@ pub fn follow(path: &Path, stopped: &AtomicBool, mut on: impl FnMut(Signal, Opti
             (at, partial) = (0, String::new());
             // A new log (the game restarted, maybe mid-battle): a battle the old log left open ended with it.
             riot = Riot::default();
+            outcome = RiotOutcome::default();
+            affixes = AffixBlock::default();
         }
         if len == at {
             continue;
@@ -737,6 +1199,9 @@ pub fn follow(path: &Path, stopped: &AtomicBool, mut on: impl FnMut(Signal, Opti
         last_new = std::time::Instant::now();
         if len - at > MAX_READ {
             (at, partial) = (len - MAX_READ, String::new());
+            // An AffixInfos block cut by the jump: the lines after it are not its, and a text would be kept under the
+            // id read before the jump, for good (the learned list keeps the first text; review 2026-11-08).
+            affixes = AffixBlock::default();
         }
         let mut buf = Vec::new();
         if file.seek(SeekFrom::Start(at)).is_err() || file.take(len - at).read_to_end(&mut buf).is_err() {
@@ -749,6 +1214,12 @@ pub fn follow(path: &Path, stopped: &AtomicBool, mut on: impl FnMut(Signal, Opti
         for line in partial[..complete].lines() {
             if let Some(boss) = riot.line(line) {
                 on(boss, game_millis(line));
+            }
+            if let Some(end) = outcome.line(line) {
+                on(end, game_millis(line));
+            }
+            if let Some(level) = affixes.line(line) {
+                on(level, game_millis(line));
             }
             if let Some(signal) = cards.signal(line) {
                 on(signal, game_millis(line));
@@ -763,6 +1234,17 @@ mod tests {
     use super::*;
 
     /// The riot boss signals of a game log's lines, as [`follow`] sends them.
+    /// A riot battle's lines kept in tests/fixtures; None (and a note) when it is missing, as in the public repository,
+    /// which has no tests folder.
+    fn riot_fixture(name: &str) -> Option<String> {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures").join(name);
+        if !path.is_file() {
+            println!("skipped: {} is missing", path.display());
+            return None;
+        }
+        Some(std::fs::read_to_string(&path).unwrap())
+    }
+
     fn riot_of(text: &str) -> Vec<Signal> {
         let mut riot = Riot::default();
         text.lines().filter_map(|line| riot.line(line)).collect()
@@ -774,7 +1256,7 @@ mod tests {
     /// town, once.
     #[test]
     fn the_riot_boss_of_a_real_battle() {
-        let text = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/riot-boss-C.log")).unwrap();
+        let Some(text) = riot_fixture("riot-boss-C.log") else { return };
         let ms = |stamp: &str| game_millis(&format!("[2026.11.07-{stamp}][1]")).unwrap();
         let boss = RiotBoss {
             spawned: 1,
@@ -797,9 +1279,120 @@ mod tests {
     /// though its other monsters and carriers drop as the boss's would.
     #[test]
     fn no_riot_boss_in_a_battle_without_one() {
-        let text = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/riot-boss-A.log")).unwrap();
+        let Some(text) = riot_fixture("riot-boss-A.log") else { return };
         assert!(text.contains("Monster Created: npc id ") && text.contains("UDropInstanceMgr@ AddInstance!"));
         assert_eq!(riot_of(&text), []);
+    }
+
+    /// The riot outcome signals of a game log's lines, as [`follow`] sends them.
+    fn outcome_of(text: &str) -> Vec<Signal> {
+        let mut outcome = RiotOutcome::default();
+        text.lines().filter_map(|line| outcome.line(line)).collect()
+    }
+
+    fn game_line(at: &str, text: &str) -> String {
+        format!("[2026.11.09-20.{at}][1]TLLua: Display: [Game] {text}\n")
+    }
+
+    /// A run's lines up to its checkout, the riot battle started.
+    fn run_to_riot() -> String {
+        [
+            game_line("14:26:243", "UIButton@ normal-click Btn_S16GamePlay_Start"),
+            game_line("16:20:363", "TipMsgShowMgr@DispatchPageRunChange PageName = S16GamePlayCheckOut , PageRunState = Run"),
+            game_line("16:21:673", "UIButton@ normal-click Btn_S16GamePlay_CheckOut_StartChallenge"),
+            game_line("16:21:866", "LevelMgr:_EnterLevelSuccess() 235501"),
+            game_line("16:22:561", "UGameMgr::EnterLevel(235501) mode=2 reload=0."),
+        ]
+        .concat()
+    }
+
+    /// A riot battle as its lines go (the chests by their drop carriers; the chest sounds, fewer, and the battle's
+    /// other carriers not counted), the checkout opened again after it and closed with Abandon (not an abandoned
+    /// riot), then the next run abandoned.
+    #[test]
+    fn the_riot_outcome_of_a_run() {
+        let carrier = |at: &str, cfg: u32| game_line(at, &format!("drop carrier triggered cfgId {cfg} ety id 5041"));
+        let mut text = run_to_riot();
+        text.push_str(&carrier("16:22:900", 109_041));
+        text.push_str(&game_line("16:25:887", "AudioMgr@PlayAudio  AudioEnum  == UI_S16_Medium_Chest"));
+        text.push_str(&game_line("16:28:094", "AudioMgr@PlayAudio  AudioEnum  == UI_S16_Color_Chest"));
+        text.push_str(&game_line("16:44:132", "AudioMgr@PlayAudio  AudioEnum  == UI_S16_Red_Chest"));
+        for (k, cfg) in [109_002, 109_022, 109_023, 109_003, 109_026, 109_006, 109_006, 109_005, 109_025, 109_004].into_iter().enumerate() {
+            text.push_str(&carrier(&format!("16:46:{:03}", 100 + k * 30), cfg));
+        }
+        let town = game_line("16:54:145", "LevelMgr:_EnterLevelSuccess() 110");
+        text.push_str(&town);
+        text.push_str(&game_line("16:55:509", "UGameMgr::EnterLevel(110) mode=1 reload=0."));
+        text.push_str(&game_line("16:59:367", "TipMsgShowMgr@DispatchPageRunChange PageName = S16GamePlayCheckOut , PageRunState = Run"));
+        text.push_str(&game_line("17:00:400", "UIButton@ normal-click Btn_S16GamePlay_CheckOut_AbandonChallenge"));
+        let fought = RiotEnd { fought: true, boss: false, boss_killed: false, red: 2, color: 3, medium: 5 };
+        assert_eq!(outcome_of(&text), [Signal::RiotEnd(fought)]);
+        // The kinds: every carrier of the two sets, nothing else.
+        let kinds: Vec<Option<Chest>> = [109_001, 109_004, 109_005, 109_006, 109_021, 109_024, 109_025, 109_026, 109_000, 109_007, 109_034, 109_041, 109_051].map(chest_kind).to_vec();
+        let (m, r, c) = (Some(Chest::Medium), Some(Chest::Red), Some(Chest::Color));
+        assert_eq!(kinds, [m, m, r, c, m, m, r, c, None, None, None, None, None]);
+        // Sent on the line the game left the battle.
+        let mut outcome = RiotOutcome::default();
+        let sent: Vec<&str> = text.lines().filter(|line| outcome.line(line).is_some()).collect();
+        assert_eq!(sent, [town.trim_end()]);
+        // The next run abandoned on its checkout.
+        text.push_str(&game_line("17:02:030", "UIButton@ normal-click Btn_S16GamePlay_Start"));
+        text.push_str(&game_line("19:07:100", "TipMsgShowMgr@DispatchPageRunChange PageName = S16GamePlayCheckOut , PageRunState = Run"));
+        text.push_str(&game_line("19:08:000", "UIButton@ normal-click Btn_S16GamePlay_CheckOut_AbandonChallenge"));
+        assert_eq!(outcome_of(&text), [Signal::RiotEnd(fought), Signal::RiotEnd(RiotEnd::default())]);
+    }
+
+    /// The special boss: created, killed, its chest; created and not killed. The boss's lines on another level, or
+    /// a log followed from the checkout on (no run seen under way), tell nothing.
+    #[test]
+    fn the_riot_outcome_boss_and_unseen_runs() {
+        let town = game_line("17:00:000", "LevelMgr:_EnterLevelSuccess() 110");
+        let created = game_line("16:57:000", "Monster Created: npc id 5026001 rarity 4");
+        let dies = game_line("16:58:000", "LogDataTable: Warning: UDataTable::FindRow : 'Play_Boss_Elite_Shout_YuZu_Die' requested row");
+        let chest = game_line("16:59:000", "drop carrier triggered cfgId 109034 ety id 5041");
+        let killed = RiotEnd { fought: true, boss: true, boss_killed: true, ..RiotEnd::default() };
+        assert_eq!(outcome_of(&format!("{}{created}{dies}{town}", run_to_riot())), [Signal::RiotEnd(killed)]);
+        assert_eq!(outcome_of(&format!("{}{chest}{town}", run_to_riot())), [Signal::RiotEnd(killed)]);
+        let alive = RiotEnd { fought: true, boss: true, ..RiotEnd::default() };
+        assert_eq!(outcome_of(&format!("{}{created}{town}", run_to_riot())), [Signal::RiotEnd(alive)]);
+        // Before the battle's level: not counted.
+        let start = game_line("14:26:243", "UIButton@ normal-click Btn_S16GamePlay_Start");
+        let offered = game_line("16:20:363", "TipMsgShowMgr@DispatchPageRunChange PageName = S16GamePlayCheckOut , PageRunState = Run");
+        let go = game_line("16:21:673", "UIButton@ normal-click Btn_S16GamePlay_CheckOut_StartChallenge");
+        let enter = game_line("16:21:866", "LevelMgr:_EnterLevelSuccess() 235501");
+        let fought = RiotEnd { fought: true, ..RiotEnd::default() };
+        assert_eq!(outcome_of(&format!("{start}{offered}{go}{created}{enter}{town}")), [Signal::RiotEnd(fought)]);
+        // A checkout with no run seen under way (the log followed from there): nothing, abandoned or fought.
+        let checkout = game_line("16:20:363", "TipMsgShowMgr@DispatchPageRunChange PageName = S16GamePlayCheckOut , PageRunState = Run");
+        let abandon = game_line("16:21:000", "UIButton@ normal-click Btn_S16GamePlay_CheckOut_AbandonChallenge");
+        assert_eq!(outcome_of(&format!("{checkout}{abandon}")), []);
+        let fight = game_line("16:21:673", "UIButton@ normal-click Btn_S16GamePlay_CheckOut_StartChallenge");
+        let riot = game_line("16:21:866", "LevelMgr:_EnterLevelSuccess() 235501");
+        assert_eq!(outcome_of(&format!("{checkout}{fight}{riot}{created}{town}")), []);
+        // A run seen by a day's decision cards only (followed from mid-run) counts; the board page is no sign.
+        let cards = game_line("15:00:000", "AudioMgr@PlayAudio  AudioEnum  == UI_S16_Card_Up");
+        assert_eq!(outcome_of(&format!("{cards}{checkout}{abandon}")), [Signal::RiotEnd(RiotEnd::default())]);
+        let board = game_line("15:00:000", "TipMsgShowMgr@DispatchPageRunChange PageName = S16BoardMain , PageRunState = Run");
+        assert_eq!(outcome_of(&format!("{board}{checkout}{abandon}")), []);
+    }
+
+    /// The 2026-11-07 14:39 riot battle (tests/fixtures/riot-boss-C.log) after a run's checkout: the boss came and was
+    /// killed. The 14:30 battle (riot-boss-A.log) had none. The chests as the fixtures' carrier lines count them by
+    /// hand: C 109005 x9, 109025 x5, 109006 x10, 109026 x2, 109002, 109003; A 109005 x6, 109025 x6, 109006 x8,
+    /// 109026 x2, 109001 x2, 109021 (their other carriers, the boss's 109034 among them, are no chest of the three).
+    #[test]
+    fn the_riot_outcome_of_real_battles() {
+        let (Some(with), Some(without)) = (riot_fixture("riot-boss-C.log"), riot_fixture("riot-boss-A.log")) else { return };
+        let checkout = [
+            game_line("14:26:243", "UIButton@ normal-click Btn_S16GamePlay_Start"),
+            game_line("16:20:363", "TipMsgShowMgr@DispatchPageRunChange PageName = S16GamePlayCheckOut , PageRunState = Run"),
+            game_line("16:21:673", "UIButton@ normal-click Btn_S16GamePlay_CheckOut_StartChallenge"),
+        ]
+        .concat();
+        let killed = RiotEnd { fought: true, boss: true, boss_killed: true, red: 14, color: 12, medium: 2 };
+        assert_eq!(outcome_of(&format!("{checkout}{with}")), [Signal::RiotEnd(killed)]);
+        let none = RiotEnd { fought: true, boss: false, boss_killed: false, red: 12, color: 10, medium: 3 };
+        assert_eq!(outcome_of(&format!("{checkout}{without}")), [Signal::RiotEnd(none)]);
     }
 
     /// Only the riot level counts, and only the boss's own ids: the same lines on another map, another npc or
@@ -1075,5 +1668,339 @@ mod tests {
         follow(&path, &stopped, |_, _| {}, |_| {});
         remover.join().unwrap();
         assert!(started.elapsed() >= LOG_GONE && started.elapsed() < LOG_GONE + Duration::from_secs(5), "{:?}", started.elapsed());
+    }
+
+    /// The map pages show, hide and close (normal, boss, gold); the page stack lines naming the same page and other
+    /// pages give nothing.
+    #[test]
+    fn map_pages_open_and_close() {
+        let page = |name: &str, state: &str| format!("[2026.11.08-06.26.10:000][600]TLLua: Display: [Game] TipMsgShowMgr@DispatchPageRunChange PageName = {name} , PageRunState = {state} ");
+        assert_eq!(signal(&page("MysteryMapDetail", "Run")), Some(Signal::MapPage { page: MapPage::Normal, state: PageState::Shown }));
+        assert_eq!(signal(&page("MysteryMapDetail", "Destory")), Some(Signal::MapPage { page: MapPage::Normal, state: PageState::Closed }));
+        assert_eq!(signal(&page("MysteryBossDetail", "Hide")), Some(Signal::MapPage { page: MapPage::Boss, state: PageState::Hidden }));
+        assert_eq!(signal(&page("MysteryGoldMapDetail", "Run")), Some(Signal::MapPage { page: MapPage::Gold, state: PageState::Shown }));
+        assert_eq!(signal(&page("Mystery", "Run")), None);
+        let stack = "[2026.11.08-06.26.10:000][600]TLLua: Display: [Game] PageStack@   [3] = PageName = MysteryMapDetail, PageType = FuncPage, PageAction = HideLastFuncPage";
+        assert_eq!(signal(stack), None);
+    }
+
+    /// Add and Revert by their whole button name only.
+    #[test]
+    fn affix_buttons() {
+        let click = |name: &str| format!("[2026.11.08-06.28.50:739][937]TLGame: Display: [Game] UIButton@ normal-click {name}");
+        assert_eq!(signal(&click("AddBtn")), Some(Signal::AffixButton { revert: false }));
+        assert_eq!(signal(&click("RevertBtn ")), Some(Signal::AffixButton { revert: true }));
+        assert_eq!(signal(&click("AddBtnMore")), None);
+    }
+
+    /// The AffixInfos block of a level, made up in the game's format: the level line before it, a list cut after
+    /// two entries ("+3+..."), every entry again closed by its number line, and the block's end at the next timed
+    /// line. The ids come from the number lines: panel ids kept in order, the rest counted.
+    #[test]
+    fn affix_block_of_a_level() {
+        let t = "[2026.11.08-06.26.17:925][636]TLLua: Display: [Game] ";
+        let lines = [
+            "[2026.11.08-06.26.17:872][636]TLGame: Display: [Game] UGameMgr::EnterLevel(5308) mode=2 reload=0.".to_string(),
+            format!("{t}AffixInfos"),
+            t.to_string(),
+            "+BaseAttrInfoList".into(),
+            "+BAffixInfoList+1+Id [216000]".into(),
+            "|              | +FId [1141]".into(),
+            "|              | +Description [<p>+15</p>% additional Compass]".into(),
+            "|              +2+Id [5111007]".into(),
+            "|              | +FId [1141]".into(),
+            "|              +3+...".into(),
+            "+PrefixInfoList".into(),
+            t.to_string(),
+            "+Id [216000]".into(),
+            "+FId [1141]".into(),
+            "+Description [<p>+15</p>% additional Compass]".into(),
+            format!("{t}216000"),
+            t.to_string(),
+            "+Id [5111007]".into(),
+            format!("{t}5111007"),
+            t.to_string(),
+            "+Id [3500303]".into(),
+            format!("{t}3500303"),
+            format!("{t}NetGameMgr:OnEnterAreaEnd()"),
+        ];
+        let mut block = AffixBlock::default();
+        let got: Vec<Signal> = lines.iter().filter_map(|l| block.line(l)).collect();
+        let [Signal::MapAffixes(a)] = got.as_slice() else { panic!("{got:?}") };
+        assert_eq!(a.level, Some(5308));
+        assert_eq!(a.ids(), &[5_111_007, 3_500_303]);
+        assert_eq!(a.others, 1);
+    }
+
+    /// Each panel affix's text is kept (the `+Description` after its `+Id`) for the affix list; ids outside
+    /// the panel's ranges are not kept.
+    /// The tests that take from the shared queue of affix texts ([`take_affix_texts`]) run one at a time.
+    static AFFIX_TEXTS_TURN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn panel_affix_texts_are_kept() {
+        let _turn = AFFIX_TEXTS_TURN.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let t = "[2026.11.08-06.26.17:925][636]TLLua: Display: [Game] ";
+        let lines = [
+            format!("{t}AffixInfos"),
+            t.to_string(),
+            "+Id [216000]".into(),
+            "+Description [<p>+15</p>% additional Compass <e id=507>Drop Quantity</e>]".into(),
+            format!("{t}216000"),
+            t.to_string(),
+            "+Id [5112007]".into(),
+            "+Description [<p>-20</p>% additional Area Damage for you [test]]".into(),
+            "+Tier [0]".into(),
+            format!("{t}5112007"),
+            format!("{t}NetGameMgr:OnEnterAreaEnd()"),
+        ];
+        let _ = take_affix_texts();
+        let mut block = AffixBlock::default();
+        let got: Vec<Signal> = lines.iter().filter_map(|l| block.line(l)).collect();
+        assert_eq!(got.len(), 1);
+        let texts = take_affix_texts();
+        assert!(texts.contains(&(5_112_007, "<p>-20</p>% additional Area Damage for you [test]".to_string())), "{texts:?}");
+        assert!(!texts.iter().any(|(id, _)| *id == 216_000));
+    }
+
+    /// Three real AffixInfos blocks (tests/fixtures/affix, cut from the user's logs: field names in their order, affix
+    /// ids and texts only), one per field order the game wrote: `+Id` first (an English client, 2026-11-08 daytime),
+    /// `+FId` first (an English client, 2026-11-08) and `+Description` first (a Traditional Chinese client after the
+    /// game restarted, 2026-11-08 evening).
+    /// Read when a test runs, not built in: the public repository has no tests folder, and its `cargo test` must still
+    /// build (review of 2026-11-09). None, and the test says skipped, when the file is not there. Kept for the test's
+    /// run (leaked: a test process is short).
+    fn block(name: &str) -> Option<&'static str> {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/affix").join(name);
+        let text = std::fs::read_to_string(path).ok()?;
+        Some(Box::leak(text.into_boxed_str()))
+    }
+
+    /// The three blocks, or None (and a "skipped" line) without the fixtures.
+    fn blocks() -> Option<(&'static str, &'static str, &'static str)> {
+        match (block("block-id-first.txt"), block("block-fid-first.txt"), block("block-description-first.txt")) {
+            (Some(a), Some(b), Some(c)) => Some((a, b, c)),
+            _ => {
+                println!("skipped: no tests/fixtures/affix/block-*.txt");
+                None
+            }
+        }
+    }
+
+    /// The panel affix texts a block's lines teach.
+    fn taught<'a>(lines: impl IntoIterator<Item = &'a str>) -> Vec<(u32, String)> {
+        let _ = take_affix_texts();
+        let mut block = AffixBlock::default();
+        let signals: Vec<Signal> = lines.into_iter().filter_map(|l| block.line(l)).collect();
+        assert_eq!(signals.len(), 1, "one level");
+        let mut texts = take_affix_texts();
+        texts.sort();
+        texts
+    }
+
+    /// Each real block teaches every panel affix's own text whichever order its fields come in: the texts agree with
+    /// the default table's for the same id and language wherever the table has one (the table was made from logs of
+    /// the `+Id` first order), and the `+Description` first block's six are the ones on its map's panel.
+    #[test]
+    fn affix_texts_in_the_three_real_field_orders() {
+        use crate::affix::{Dict, dict::key, learned::template};
+        let _turn = AFFIX_TEXTS_TURN.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some((id_first, fid_first_block, description_first)) = blocks() else { return };
+        let table = Dict::builtin();
+        // the least each block's texts are checked against the table: the table has only one of the `+FId` first
+        // block's six in English, so that block's six are checked by their words below as well
+        for (name, block, want_ids, least) in [
+            ("id first", id_first, [5_121_004, 5_212_006, 5_311_021, 5_422_001, 5_521_026, 5_634_007], 2),
+            ("fid first", fid_first_block, [3_500_303, 5_111_007, 5_212_010, 5_311_003, 5_422_014, 5_521_040], 1),
+            ("description first", description_first, [5_111_007, 5_212_008, 5_311_013, 5_422_033, 5_521_001, 5_634_001], 2),
+        ] {
+            let texts = taught(block.lines());
+            assert_eq!(texts.iter().map(|(id, _)| *id).collect::<Vec<_>>(), want_ids, "{name}: every panel affix's text");
+            let mut checked = 0;
+            for (id, raw) in &texts {
+                let t = template(raw).expect("a readable text");
+                let zh = t.chars().any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c));
+                let Some(s) = table.sentences().iter().find(|s| s.ids.contains(&id.to_string())) else { continue };
+                let known = if zh { &s.zh } else { &s.en };
+                if known.is_empty() {
+                    continue;
+                }
+                assert_eq!(key(&t), key(known), "{name}: {id} as the table has it");
+                checked += 1;
+            }
+            assert!(checked >= least, "{name}: {checked} texts checked against the table");
+        }
+        let zh = taught(description_first.lines());
+        let text = |id: u32| zh.iter().find(|(i, _)| *i == id).map_or("", |(_, t)| t.as_str());
+        for (id, words) in [(5_634_001, "閃現"), (5_521_001, "移動速度"), (5_422_033, "首次受到持續傷害"), (5_311_013, "護甲值"), (5_212_008, "詛咒"), (5_111_007, "腐蝕抗性上限")] {
+            assert!(text(id).contains(words), "{id}: {}", text(id));
+        }
+        let en = taught(fid_first_block.lines());
+        let text = |id: u32| en.iter().find(|(i, _)| *i == id).map_or("", |(_, t)| t.as_str());
+        for (id, words) in [
+            (3_500_303, "Maim"),
+            (5_111_007, "Max Erosion Resistance"),
+            (5_212_010, "Blinded"),
+            (5_311_003, "Low Energy Shield"),
+            (5_422_014, "Damage Avoidance"),
+            (5_521_040, "Focus Blessing"),
+        ] {
+            assert!(text(id).contains(words), "{id}: {}", text(id));
+        }
+    }
+
+    /// The real `+Description` first block with every reprinted entry's fields in another order (reversed; `+Tier`
+    /// first, `+Description` in the middle, `+Id` last; `+FId` first, then `+Id`, `+Description`, `+Tier`) teaches the
+    /// same texts: no order gives a text to the wrong id.
+    #[test]
+    fn affix_texts_with_fields_in_any_order() {
+        let _turn = AFFIX_TEXTS_TURN.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some((_, _, description_first)) = blocks() else { return };
+        let want = taught(description_first.lines());
+        assert_eq!(want.len(), 6, "the six panel affixes");
+        let fid_rank = |l: &str| {
+            let field = l.trim_start_matches(['|', ' ']);
+            if field.contains("+FId") {
+                0
+            } else if field.contains("+Id [") {
+                1
+            } else if field.contains("+Description [") {
+                2
+            } else if field.contains("+Tier") {
+                3
+            } else {
+                4
+            }
+        };
+        let rank = |l: &str| {
+            let field = l.trim_start_matches(['|', ' ']);
+            if field.contains("+Tier") {
+                0
+            } else if field.contains("+FId") {
+                1
+            } else if field.contains("+Description [") {
+                2
+            } else if field.contains("+Id [") {
+                4
+            } else {
+                3
+            }
+        };
+        // every run of untimed lines (an entry's fields) reordered, the timed lines left where they are
+        let reorder = |order: &dyn Fn(&mut Vec<&'static str>)| -> Vec<&'static str> {
+            let mut out = Vec::new();
+            let mut run: Vec<&'static str> = Vec::new();
+            for l in description_first.lines() {
+                if l.starts_with('[') {
+                    order(&mut run);
+                    out.append(&mut run);
+                    out.push(l);
+                } else {
+                    run.push(l);
+                }
+            }
+            order(&mut run);
+            out.append(&mut run);
+            out
+        };
+        let reversed = reorder(&|run: &mut Vec<&'static str>| run.reverse());
+        let shuffled = reorder(&|run: &mut Vec<&'static str>| run.sort_by_key(|l| rank(l)));
+        let fid_first = reorder(&|run: &mut Vec<&'static str>| run.sort_by_key(|l| fid_rank(l)));
+        let original = description_first.lines().collect::<Vec<_>>();
+        assert_ne!(reversed, original, "reversed differs from the file");
+        assert_ne!(shuffled, original, "+Tier first differs from the file");
+        assert_ne!(fid_first, original, "+FId first differs from the file");
+        assert_eq!(taught(reversed), want, "fields reversed");
+        assert_eq!(taught(shuffled), want, "+Tier first, +Description in the middle, +Id last");
+        assert_eq!(taught(fid_first), want, "+FId first, then +Id, +Description, +Tier");
+    }
+
+    /// Only an entry that names its closing id alone and holds one readable text teaches it: not the list before the
+    /// entries, a text after the entry's closing line, an entry with two texts, an id that does not read, an id other
+    /// than the closing one, or no id; a line cut before its `]` and an untranslated key are not texts.
+    #[test]
+    fn affix_entries_that_do_not_pair_teach_nothing() {
+        let _turn = AFFIX_TEXTS_TURN.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let t = "[2026.11.08-06.26.17:925][636]TLLua: Display: [Game] ";
+        let lines = [
+            format!("{t}AffixInfos"),
+            t.to_string(),
+            "+BAffixInfoList+1+Id [5121004]".into(),
+            "|              | +Description [<p>+1</p>% a list text]".into(),
+            "|              +2+Id [5521026]".into(),
+            "|              | +Description [<p>+2</p>% another list text]".into(),
+            t.to_string(),
+            "+Description [<p>+30</p>% additional Lightning Damage for monsters]".into(),
+            "+Id [5121004]".into(),
+            "+Description [<p>+30</p>% cut before its end".into(),
+            "+Description [affix_class|description|5]".into(),
+            format!("{t}5121004"),
+            "+Description [<p>+3</p>% after the closing line]".into(),
+            t.to_string(),
+            "+Id [5521026]".into(),
+            "+Description [<p>+4</p>% one]".into(),
+            "+Description [<p>+5</p>% two]".into(),
+            format!("{t}5521026"),
+            t.to_string(),
+            "+Id [5521027]".into(),
+            "+Id [x]".into(),
+            "+Description [<p>+6</p>% an id that does not read]".into(),
+            format!("{t}5521027"),
+            t.to_string(),
+            "+Id [5521028]".into(),
+            "+Description [<p>+7</p>% named 5521028, closed as 5521029]".into(),
+            format!("{t}5521029"),
+            t.to_string(),
+            "+Description [<p>+8</p>% no id at all]".into(),
+            format!("{t}5521030"),
+            format!("{t}NetGameMgr:OnEnterAreaEnd()"),
+        ];
+        assert_eq!(taught(lines.iter().map(String::as_str)), vec![(5_121_004, "<p>+30</p>% additional Lightning Damage for monsters".to_string())]);
+    }
+
+    /// The look back reads every UE_game*.log of the folder, the backups first, and keeps their panel affixes' texts;
+    /// other files are not read; a block the log ends in counts. (The real check: tests\affix_log_replay.rs on the
+    /// user's logs.)
+    #[test]
+    fn looking_back_reads_every_game_log() {
+        let _turn = AFFIX_TEXTS_TURN.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = std::env::temp_dir().join(format!("affix-look-back-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let t = "[2026.11.08-06.26.17:925][636]TLLua: Display: [Game] ";
+        let block = |id: u32, text: &str, closed: bool| {
+            let mut lines = vec![format!("{t}AffixInfos"), t.to_string(), format!("+Id [{id}]"), "+FId [1141]".into(), format!("+Description [{text}]"), format!("{t}{id}")];
+            if closed {
+                lines.push(format!("{t}NetGameMgr:OnEnterAreaEnd()"));
+            }
+            lines.join("\r\n") + "\r\n"
+        };
+        std::fs::write(dir.join("UE_game.log"), block(5121004, "<p>+30</p>% additional Lightning Damage for monsters", false)).unwrap();
+        std::fs::write(dir.join("UE_game-backup-2026.11.08-06.36.02.log"), block(5311021, "<p>+15</p>% Blur effect for you", true)).unwrap();
+        std::fs::write(dir.join("other.log"), block(5112007, "not a game log", true)).unwrap();
+        let _ = take_affix_texts();
+        assert_eq!(look_back_affixes(&dir.join("UE_game.log"), &AtomicBool::new(false)), 2);
+        let texts = take_affix_texts();
+        assert_eq!(texts.iter().map(|(id, _)| *id).collect::<Vec<_>>(), [5_311_021, 5_121_004], "{texts:?}");
+        assert_eq!(look_back_affixes(&dir.join("UE_game.log"), &AtomicBool::new(true)), 0, "stopped");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A block without ids gives nothing, but after a level entered (the hideout's) its level with no id; a short list
+    /// without number lines gives its own ids.
+    #[test]
+    fn affix_blocks_empty_or_short() {
+        let t = "[2026.11.08-05.13.28:740][ 63]TLLua: Display: [Game] ";
+        let mut block = AffixBlock::default();
+        let empty = [format!("{t}AffixInfos"), t.to_string(), "+BaseAttrInfoList".into(), "+BAffixInfoList".into(), format!("{t}NetGameMgr:OnEnterAreaEnd()")];
+        assert!(empty.iter().all(|l| block.line(l).is_none()));
+        let hideout = "[2026.11.08-05.13.27:100][ 63]GameLog: Display: [Game] UGameMgr::EnterLevel(110)".to_string();
+        let got: Vec<Signal> = std::iter::once(&hideout).chain(empty.iter()).filter_map(|l| block.line(l)).collect();
+        let [Signal::MapAffixes(a)] = got.as_slice() else { panic!("{got:?}") };
+        assert_eq!((a.level, a.ids(), a.others), (Some(110), &[][..], 0), "the hideout: its level, no id");
+        let mut block = AffixBlock::default();
+        let short = [format!("{t}AffixInfos"), "+BAffixInfoList+1+Id [5521040]".into(), "|              | +FId [1141]".into(), format!("{t}NetGameMgr:OnEnterAreaEnd()")];
+        let got: Vec<Signal> = short.iter().filter_map(|l| block.line(l)).collect();
+        let [Signal::MapAffixes(a)] = got.as_slice() else { panic!("{got:?}") };
+        assert_eq!((a.level, a.ids(), a.others), (None, &[5_521_040][..], 0));
     }
 }

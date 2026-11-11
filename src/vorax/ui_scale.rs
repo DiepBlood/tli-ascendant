@@ -96,6 +96,15 @@ const LABEL_HALF: f32 = 110.0;
 /// 570 154, 90, 102 (the digits' last row cut). A knife edge on both sides: a frame at another scale whose
 /// numbers fall back should look here first.
 const LABEL_BOTTOM: f32 = 571.0;
+/// The label's lowest row kept never comes above this frame row ([`label_hidden`]). LABEL_BOTTOM scaled about the
+/// label's row is a frame row of 571.2 at s = 1.0073 (`PageScale` 0.671895, past [`SAME`]), while the 2026-11-09
+/// evening games drew the count row's digits down to frame row 572-573, a row or two lower than the original frames:
+/// their bottom row was painted over, the round-bottomed digits (0, 3, 5, 6, 8, 9) of the three left tanks went
+/// unrecognized on every frame of the English game (`1?7x??4` for 187x204, `247x???` for 247x330), and from round 5
+/// no selection screen could be advised. The candles that LABEL_BOTTOM keeps out stand at frame rows from about 582
+/// (their tips at unscaled rows 571-574 at s = 1.5), so a floor of 575 still hides them, and from s = 1.18 on
+/// (every game LABEL_BOTTOM was chosen on, s 1.26 and over) the scaled row is lower and the floor changes nothing.
+const LABEL_FLOOR: f32 = 575.0;
 /// What a tank label's pixel outside its box ([`label_hidden`]) is painted: the dark of the label's own backing
 /// (about (30, 23, 25) behind the digits). Black, darker than anything around the digits, lowered the digit
 /// threshold (between the region's median and its brightest) so that the dim candle tips under the count row
@@ -174,11 +183,11 @@ pub(crate) fn scaled(a: f32, s: f32, v: f32) -> f32 {
 
 /// A pixel at (x, y) of the frame scaled to the reference (not unscaled) is outside tank i's label box at scale
 /// `s`: beyond [`LABEL_HALF`] of the label's centre, left of the round panel's right edge, or below the label's
-/// lowest row.
+/// lowest row ([`LABEL_BOTTOM`] scaled, never above [`LABEL_FLOOR`]).
 pub(crate) fn label_hidden(i: usize, s: f32, x: f32, y: f32) -> bool {
     let (ax, ay) = Zone::Label(i).anchor().unwrap_or_default();
     let centre = scaled(ax, s, TANK_X[i] as f32);
-    (x - centre).abs() > LABEL_HALF || x < PANEL_RIGHT * s || y > scaled(ay, s, LABEL_BOTTOM)
+    (x - centre).abs() > LABEL_HALF || x < PANEL_RIGHT * s || y > scaled(ay, s, LABEL_BOTTOM).max(LABEL_FLOOR)
 }
 
 /// The share of each source pixel along an axis of `n` pixels that output interval [lo, hi) covers (summing to 1
@@ -483,6 +492,21 @@ pub fn enlarge(original: &Rgba, s: f64, labels: bool) -> Rgba {
 
 #[cfg(test)]
 mod tests {
+    /// A tank label's lowest row kept: LABEL_BOTTOM scaled about the label's row, never above frame row LABEL_FLOOR.
+    /// At s = 1.0073 (the 2026-11-09 evening games) the count row's digits down to frame row 573 are kept and the
+    /// candles from row 582 are not; from s = 1.18 on nothing changes (s = 1.26 and 1.5 hide from rows 576.7 and 582).
+    #[test]
+    fn a_label_keeps_its_count_row_at_a_scale_near_the_original() {
+        let s = from_page_scale(0.671895) as f32;
+        let x = TANK_X[0] as f32;
+        assert!(!label_hidden(0, s, x, 572.5) && !label_hidden(0, s, x, 575.0));
+        assert!(label_hidden(0, s, x, 575.5) && label_hidden(0, s, x, 582.0));
+        for (s, from) in [(1.26f32, 549.0 + 22.0 * 1.26), (1.5, 582.0)] {
+            assert!(!label_hidden(0, s, scaled(x - 37.0, s, x), from - 0.1), "{s}");
+            assert!(label_hidden(0, s, scaled(x - 37.0, s, x), from + 0.1), "{s}");
+        }
+    }
+
     use super::*;
 
     /// The advice boxes at another scale: the potion kit of frame 0044 (round 9, four cards, s = 1.26), seen at
