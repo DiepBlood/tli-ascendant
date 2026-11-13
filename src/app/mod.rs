@@ -1,6 +1,7 @@
 //! The app window beside the game: a hotkey captures the game, the reader
 //! reads the board and the solver ranks the moves.
 
+pub mod fps;
 pub mod health;
 pub mod latency;
 pub mod runlog;
@@ -36,6 +37,9 @@ pub mod theme;
 pub mod through;
 #[cfg(windows)]
 pub mod ui;
+// The window's switch to the page of a game mode that just came up (1.3.0).
+#[cfg(windows)]
+pub mod auto_tab;
 #[cfg(windows)]
 pub mod update;
 #[cfg(windows)]

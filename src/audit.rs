@@ -8,11 +8,14 @@
 //!   read). The Warden's Treasure counts the session adds only matter on a treasure pick, which is not re-solved.
 //! - The move actually made (marked "unknown" when it cannot be told, and then no loss is counted):
 //!   - Patrol: the first Warden position read twice in a row on the same day after `Moved` that differs from the old
-//!     one (skipping screens that cover the board, such as instrument pick, reward pick and cell pick); stale reads
-//!     with no `Moved` after them do not count as a decision.
+//!     one (skipping screens that cover the board, such as instrument pick, reward pick and cell pick); without such a
+//!     pair, the advice's move when the player clicked its mark and the game logged `Moved` within `SAME_CLICK_MS`
+//!     (the view row's `clicked`), else the one position read; stale reads with no `Moved` after them do not count as
+//!     a decision.
 //!   - Manage: after the first `Bite` following `Consume`, the one cell among the consume options whose content
 //!     changed; a lone `Decision` followed by a prey pick is a Hunt (the target is the new prey mark); a Replace that
-//!     `rates` recognizes, or the Replace card read as used up twice in a row, is a Replace; the day number going up by
+//!     `rates` recognizes, or the Replace card read as used up twice in a row, or with the Severed Iron Maiden held an
+//!     `Instrument` signal with the `Decision` and the Warden's cell changed, is a Replace; the day number going up by
 //!     1 (on the last day, `RunEnd` right after) is End.
 //!   - Interrogation: a later read on the same day with 1 more mark is Instigate; a signal that an inmate was vaulted,
 //!     or an unchanged mark count with the tier sum up by 1, is Bestow.
@@ -86,6 +89,11 @@ struct Row {
     /// The playouts' version (`solver::PLAYOUT_VERSION`); rows before the field have none (version 1).
     #[serde(default)]
     playout: Option<u32>,
+    /// A view row's advice on show and why its mark is hidden (`clicked`: the player clicked the mark).
+    #[serde(default)]
+    advice: Option<String>,
+    #[serde(default)]
+    hidden: Option<String>,
 }
 
 /// One advice row.
@@ -302,10 +310,12 @@ pub fn games(folder: &str, text: &str) -> Vec<Game> {
     let run = parse_run(folder, text);
     // Original game signal names (`rates::Signal` folds RunStart, RunEnd and Reroll into Other).
     let mut raws: Vec<(i64, String)> = Vec::new();
+    let mut clicks: Vec<(i64, String)> = Vec::new();
     let mut spans: Vec<Span> = Vec::new();
     let mut closed = true;
     for line in text.lines() {
-        if !line.contains("\"kind\":\"advice\"") && !line.contains("\"kind\":\"game\"") && !line.contains("\"kind\":\"run_end\"") {
+        let click = line.contains("\"hidden\":\"clicked\"");
+        if !click && !line.contains("\"kind\":\"advice\"") && !line.contains("\"kind\":\"game\"") && !line.contains("\"kind\":\"run_end\"") {
             continue;
         }
         let Ok(r) = serde_json::from_str::<Row>(line) else { continue };
@@ -334,6 +344,11 @@ pub fn games(folder: &str, text: &str) -> Vec<Game> {
                 }
                 closed = true;
             }
+            "view" => {
+                if let (Some("clicked"), Some(advice)) = (r.hidden.as_deref(), r.advice) {
+                    clicks.push((log_millis(&r.at).unwrap_or(0), advice));
+                }
+            }
             "advice" => {
                 if closed {
                     spans.push(Span::new(&r.at));
@@ -348,10 +363,10 @@ pub fn games(folder: &str, text: &str) -> Vec<Game> {
         }
     }
     let index: HashMap<&str, usize> = run.events.iter().enumerate().filter_map(|(i, e)| e.read().map(|r| (r.at.as_str(), i))).collect();
-    spans.into_iter().filter(|sp| !sp.advice.is_empty()).map(|sp| game(&run, &raws, &index, sp)).collect()
+    spans.into_iter().filter(|sp| !sp.advice.is_empty()).map(|sp| game(&run, &raws, &clicks, &index, sp)).collect()
 }
 
-fn game(run: &Run, raws: &[(i64, String)], index: &HashMap<&str, usize>, sp: Span) -> Game {
+fn game(run: &Run, raws: &[(i64, String)], clicks: &[(i64, String)], index: &HashMap<&str, usize>, sp: Span) -> Game {
     let ev = &run.events;
     let from = log_millis(&sp.start).unwrap_or(i64::MIN);
     let until = sp.end.as_deref().and_then(log_millis).unwrap_or(i64::MAX);
@@ -391,7 +406,7 @@ fn game(run: &Run, raws: &[(i64, String)], index: &HashMap<&str, usize>, sp: Spa
             skipped += 1;
             continue;
         }
-        decisions.push(decide(run, raws, i, from, until, a));
+        decisions.push(decide(run, raws, clicks, i, from, until, a));
     }
     // End-of-run board: the board value that was the same in the last 2 consecutive reads; if none, take the last read.
     let board_vals: Vec<Option<f64>> = ev.iter().filter_map(Event::read).filter(|r| in_span(r, from, until)).map(|r| Some(board_loot(&r.model))).collect();
@@ -435,7 +450,7 @@ pub fn rebuild(m: &Model, theme: Option<u32>, last_usurped: Option<u32>) -> (Sta
 }
 
 /// The decision for one advice row: board, the action the advice maps to, the move actually made.
-fn decide(run: &Run, raws: &[(i64, String)], i: usize, from: i64, until: i64, a: &Advice) -> Decision {
+fn decide(run: &Run, raws: &[(i64, String)], clicks: &[(i64, String)], i: usize, from: i64, until: i64, a: &Advice) -> Decision {
     let r = run.events[i].read().expect("read");
     let m = &r.model;
     let theme = theme_id(r.theme.as_deref());
@@ -443,11 +458,14 @@ fn decide(run: &Run, raws: &[(i64, String)], i: usize, from: i64, until: i64, a:
     let usurped = usurped_by(raws, from, log_millis(&r.at).unwrap_or(i64::MAX)).max(r.usurped);
     let (st, problems) = rebuild(m, theme, usurped);
     let cands: Vec<Action> = candidates(&st).into_iter().map(|c| c.action).collect();
+    let advised = advised(&st, &a.pick);
+    // When the player clicked this advice's mark, after the read and within the run.
+    let clicked: Vec<i64> = clicks.iter().filter(|(t, pick)| *t >= run.events[i].ms() && *t <= until && *pick == a.pick).map(|(t, _)| *t).collect();
     let actual = if !problems.is_empty() {
         Err(("the board has problems", "盤面有問題"))
     } else {
         match r.screen.as_str() {
-            "Patrol" => patrol(&run.events, raws, i, m),
+            "Patrol" => patrol(&run.events, raws, i, m, advised.clone().filter(|_| !clicked.is_empty()), &clicked),
             "Manage" => manage(run, raws, i, until, m, &cands),
             "Interrogation" => interrogation(&run.events, i, until, m),
             _ => instrument(&run.events, raws, i, until, m, &cands),
@@ -464,7 +482,7 @@ fn decide(run: &Run, raws: &[(i64, String)], i: usize, from: i64, until: i64, a:
         model: m.clone(),
         theme,
         usurped,
-        advised: advised(&st, &a.pick),
+        advised,
         actual,
         labels,
         ranking: Vec::new(),
@@ -553,8 +571,18 @@ fn stale_patrol(ev: &[Event], i: usize) -> bool {
 }
 
 /// Patrol: the first Warden position read twice in a row on the same day after `Moved` that differs from the old one
-/// (skipping screens that cover the board).
-fn patrol(ev: &[Event], raws: &[(i64, String)], i: usize, m: &Model) -> Result<Action, Why> {
+/// (skipping screens that cover the board); without such a pair, the advice's move when the player clicked its mark
+/// (`clicked`, the times of the view rows) and the game logged the move within [`SAME_CLICK_MS`] after; else the one
+/// position read ([`agreed`]).
+///
+/// A mark is hidden as `clicked` on a click on its target or the box around it (`mark::on_mark`), and the game logs
+/// the move it plays 0.02 to 0.12 s after the click. A single read after the move can be wrong: on 2026-11-11
+/// 19:16:57 the player clicked "Go to cell 14 (a Prison Incident marker)", the move completed the objective, the
+/// board was read once mid-animation with the Warden on cell 15 and the instrument pick that followed covered it, so
+/// cell 15 was taken, a false loss of 2.4. The click is not certain either, so a position read twice wins over it:
+/// at 19:16:41 of the same run "Go to cell 08" was clicked, and the Warden was read on cell 06 five times, with the
+/// next advice "Replace the Normal Berserk Lion in 06" (a click on the box's edge over the next cell).
+fn patrol(ev: &[Event], raws: &[(i64, String)], i: usize, m: &Model, advised: Option<Action>, clicked: &[i64]) -> Result<Action, Why> {
     let k = next_signal(ev, i).ok_or(("no move after the advice", "建議之後沒有動作"))?;
     let k = match ev[k].signal() {
         Some(Signal::Moved) => k,
@@ -573,6 +601,12 @@ fn patrol(ev: &[Event], raws: &[(i64, String)], i: usize, m: &Model) -> Result<A
         .filter(|r| !matches!(r.screen.as_str(), "InstrumentPick" | "TreasurePick" | "CellPick"))
         .map(|r| (r.model.day == m.day && r.model.warden != m.warden).then_some(r.model.warden))
         .collect();
+    if first_stable(&vals).is_none()
+        && let Some(go @ Action::Patrol { .. }) = advised
+        && clicked.iter().any(|&c| c <= t0 && t0 - c <= SAME_CLICK_MS)
+    {
+        return Ok(go);
+    }
     let w = agreed(&vals).ok_or(("the warden's new cell was not read, or read differently", "典獄長的新位置沒有讀到，或讀到的不一致"))?;
     usize::try_from(w).map(|cell| Action::Patrol { cell }).map_err(|_| ("bad warden cell", "典獄長位置不合理"))
 }
@@ -596,7 +630,7 @@ fn manage(run: &Run, raws: &[(i64, String)], i: usize, until: i64, m: &Model, ca
     if let Some(hunt) = hunt(ev, k, until, m, cands) {
         return hunt;
     }
-    if replace_at(run, k).is_some() || card_used(ev, k, until, m) {
+    if replace_at(run, k).is_some() || card_used(ev, k, until, m) || maiden_replace(ev, raws, k, until, m) {
         return Ok(Action::Swap);
     }
     if day_ended(ev, raws, k, until, m) {
@@ -617,6 +651,26 @@ fn card_used(ev: &[Event], k: usize, until: i64, m: &Model) -> bool {
         return false;
     }
     let vals: Vec<Option<bool>> = reads.iter().filter(|r| r.screen == "Manage" && r.model.day == m.day && r.model.warden == m.warden).map(|r| Some(r.model.swap_used)).collect();
+    last_stable(&vals).is_some_and(|(v, _)| v)
+}
+
+/// A Replace with the Severed Iron Maiden held: the game logs `Instrument` with the `Decision` (the Maiden raising the
+/// new inmate), which ends [`replace_at`]'s look at the reads, and the Replace card is not read as used, so the day
+/// going up made it End (2026-11-11 17:53:29 and 17:57:10, a false loss of 0.38 and 0.46 each, both clicked on the
+/// "Replace" advice). It counts when the Warden's cell, on the same day and screen as Manage or a passing one, is read
+/// changed twice in a row before the next action; an End with an instrument triggering leaves the cell as it was.
+fn maiden_replace(ev: &[Event], raws: &[(i64, String)], k: usize, until: i64, m: &Model) -> bool {
+    let t = ev[k].ms();
+    if m.swap_used || !m.tools.contains(&Tool::Maiden) || !raw_between(raws, "Instrument", t, t + SAME_CLICK_MS) {
+        return false;
+    }
+    let Ok(w) = usize::try_from(m.warden) else { return false };
+    let reads = window(ev, k, until, |s| s != Signal::Other);
+    let vals: Vec<Option<bool>> = reads
+        .iter()
+        .filter(|r| matches!(r.screen.as_str(), "Manage" | "Unknown") && r.model.day == m.day && r.model.warden == m.warden)
+        .map(|r| r.model.cells.get(w).map(|c| Some(c) != m.cells.get(w)))
+        .collect();
     last_stable(&vals).is_some_and(|(v, _)| v)
 }
 
@@ -1108,6 +1162,88 @@ mod tests {
         let d = g.remove(0).decisions.remove(0);
         assert_eq!(d.actual, Ok(Action::Patrol { cell: 3 }));
         d
+    }
+
+    /// A hand-made run: a read row (day, screen, Warden, tools, the inmate in cell 04 as JSON or a sealed cell), with
+    /// the other rows given as is.
+    fn hand_run(rows: &[String]) -> Vec<Decision> {
+        super::games("t", &rows.join("\n")).remove(0).decisions
+    }
+
+    fn hand_read(at: &str, screen: &str, day: i64, warden: i64, tools: &str, cell4: &str) -> String {
+        let step = if screen == "Manage" { "manage" } else { "patrol" };
+        let rest = ",{\"kind\":\"sealed\",\"event\":null}".repeat(11);
+        format!(
+            "{{\"at\":\"2026-11-03T10:{at}Z\",\"kind\":\"read\",\"screen\":\"{screen}\",\"theme\":null,\"model\":{{\"v\":1,\"day\":{day},\"maxDays\":20,\"step\":\"{step}\",\"warden\":{warden},\"dest\":[3,5],\"devourUsed\":true,\"swapUsed\":false,\"huntUsed\":true,\"eventKind\":\"chain\",\"choice\":{{\"kind\":\"tool\",\"options\":[]}},\"chainArmed\":false,\"tools\":[{tools}],\"vault\":[],\"cells\":[{{\"kind\":\"office\"}},{{\"kind\":\"sealed\",\"event\":null}},{{\"kind\":\"sealed\",\"event\":null}},{cell4},{{\"kind\":\"sealed\",\"event\":null}}{rest}]}}}}"
+        )
+    }
+
+    fn hand_row(at: &str, rest: &str) -> String {
+        format!("{{\"at\":\"2026-11-03T10:{at}Z\",{rest}}}")
+    }
+
+    /// A clicked Patrol advice is the move made when the board read the new cell only once (2026-11-11 19:16:57: the
+    /// move to an incident marker completed the objective, the Warden was read once on the next cell mid-animation and
+    /// the instrument pick covered the board). Without the click, with the click on other advice, or with the new cell
+    /// read twice in a row, the board decides.
+    #[test]
+    fn a_clicked_move_is_the_advice() {
+        let sealed = "{\"kind\":\"sealed\",\"event\":null}";
+        let run = |click: Option<&str>, reads: usize| {
+            let mut rows = vec![
+                hand_row("00:00.500", "\"kind\":\"game\",\"signal\":\"RunStart\""),
+                hand_read("00:01.000", "Patrol", 2, 0, "", sealed),
+                hand_row("00:01.100", "\"kind\":\"advice\",\"pick\":\"Go to cell 04 (a locked door)\",\"read_at\":\"2026-11-03T10:00:01.000Z\",\"rounds\":100,\"ev\":6.0,\"best_ev\":6.0,\"sd\":2.0"),
+            ];
+            if let Some(advice) = click {
+                rows.push(hand_row("00:01.950", &format!("\"kind\":\"view\",\"advice\":\"{advice}\",\"hidden\":\"clicked\"")));
+            }
+            rows.extend([
+                hand_row("00:02.000", "\"kind\":\"game\",\"signal\":\"Moved\""),
+                hand_row("00:02.100", "\"kind\":\"game\",\"signal\":\"ObjectiveDone\""),
+                hand_read("00:02.500", "Unknown", 2, 5, "", sealed),
+                hand_read("00:02.550", "InstrumentPick", 2, 5, "", sealed),
+            ]);
+            if reads == 2 {
+                rows.push(hand_read("00:02.600", "Unknown", 2, 5, "", sealed));
+            }
+            rows.push(hand_row("00:05.000", "\"kind\":\"run_end\",\"vaulted\":1"));
+            hand_run(&rows).remove(0).actual
+        };
+        assert_eq!(run(Some("Go to cell 04 (a locked door)"), 1), Ok(Action::Patrol { cell: 3 }));
+        assert_eq!(run(None, 1), Ok(Action::Patrol { cell: 5 }));
+        // The new cell read twice in a row wins over the click (19:16:41 of the same run).
+        assert_eq!(run(Some("Go to cell 04 (a locked door)"), 2), Ok(Action::Patrol { cell: 5 }));
+        assert_eq!(run(Some("Go to cell 06 (a locked door)"), 1), Ok(Action::Patrol { cell: 5 }));
+    }
+
+    /// With the Severed Iron Maiden held, a `Decision` with `Instrument` and the Warden's cell read changed is a
+    /// Replace, though the day goes up after it (2026-11-11 17:53:29 and 17:57:10 were taken as End). The same signals
+    /// with the cell unchanged, or without the Maiden, stay End.
+    #[test]
+    fn a_replace_with_the_maiden_is_a_replace() {
+        let wolf = "{\"beast\":\"wolf\",\"event\":null,\"ivory\":false,\"kind\":\"inmate\",\"prey\":null,\"tier\":1}";
+        let lion = "{\"beast\":\"lion\",\"event\":null,\"ivory\":false,\"kind\":\"inmate\",\"prey\":null,\"tier\":4}";
+        let run = |tools: &str, after: &str| {
+            let rows = [
+                hand_row("00:00.500", "\"kind\":\"game\",\"signal\":\"RunStart\""),
+                hand_read("00:01.000", "Manage", 2, 3, tools, wolf),
+                hand_read("00:01.050", "Manage", 2, 3, tools, wolf),
+                hand_row("00:01.100", "\"kind\":\"advice\",\"pick\":\"x\",\"read_at\":\"2026-11-03T10:00:01.050Z\",\"rounds\":100,\"ev\":6.0,\"best_ev\":6.0,\"sd\":2.0"),
+                hand_row("00:02.000", "\"kind\":\"game\",\"signal\":\"Decision\""),
+                hand_row("00:02.050", "\"kind\":\"game\",\"signal\":\"Instrument\""),
+                hand_read("00:02.200", "Manage", 2, 3, tools, wolf),
+                hand_read("00:02.500", "Unknown", 2, 3, tools, after),
+                hand_read("00:02.900", "Unknown", 2, 3, tools, after),
+                hand_read("00:03.300", "Patrol", 3, 3, tools, after),
+                hand_read("00:03.400", "Patrol", 3, 3, tools, after),
+                hand_row("00:05.000", "\"kind\":\"run_end\",\"vaulted\":1"),
+            ];
+            hand_run(&rows).remove(0).actual
+        };
+        assert_eq!(run("\"maiden\"", lion), Ok(Action::Swap));
+        assert_eq!(run("\"maiden\"", wolf), Ok(Action::End));
+        assert_eq!(run("", lion), Ok(Action::End));
     }
 
     /// The top-up is for a move made that is not the best and was dropped by the racing (fewer rounds than asked):

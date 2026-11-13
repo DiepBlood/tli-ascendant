@@ -264,8 +264,63 @@ pub fn rarity_name(r: Rarity) -> &'static str {
     }
 }
 
+/// The surgical instruments' one-line notes (data/vorax-instrument-notes.json, written in our own words from the card
+/// text of real games and the simulation): the panel shows them when the mouse rests on an instrument, so the player
+/// can match it against the game's icon. Kept apart from the name table, which the reader matches text against.
+const NOTES: &str = include_str!("../../data/vorax-instrument-notes.json");
+
+/// The notes by solver id: (Traditional Chinese, English).
+fn notes() -> &'static std::collections::HashMap<u8, (String, String)> {
+    static NOTES_BY_ID: OnceLock<std::collections::HashMap<u8, (String, String)>> = OnceLock::new();
+    NOTES_BY_ID.get_or_init(|| {
+        let v: Value = serde_json::from_str(NOTES).expect("vorax-instrument-notes.json");
+        v["instruments"]
+            .as_object()
+            .expect("instruments")
+            .iter()
+            .map(|(id, n)| {
+                let text = |k: &str| n[k].as_str().unwrap_or_default().to_string();
+                (id.parse().expect("instrument id"), (text("zh"), text("en")))
+            })
+            .collect()
+    })
+}
+
+/// Instrument `id`'s note in the window language; None when it has none.
+pub fn instrument_note(id: u8) -> Option<&'static str> {
+    notes().get(&id).map(|(zh, en)| if lang::zh() { zh.as_str() } else { en.as_str() }).filter(|t| !t.is_empty())
+}
+
+/// The solver id of the instrument named `name`: the solver's English name, the English client's or the Traditional
+/// Chinese one (the panel's held instruments are shown by name).
+pub fn instrument_id(name: &str) -> Option<u8> {
+    names()
+        .cards
+        .iter()
+        .find(|c| c.category == Category::Instrument && (c.en == name || c.client_en.as_deref() == Some(name) || c.zh.as_deref() == Some(name)))
+        .and_then(|c| c.id)
+}
+
 #[cfg(test)]
 mod tests {
+    /// Every instrument of the game data has a note in both languages, and no note is for an instrument it lacks.
+    #[test]
+    fn every_instrument_has_its_notes() {
+        let ids: Vec<u8> = vorax::data().instruments.iter().map(|d| d.id).collect();
+        assert_eq!(ids.len(), 25);
+        for &id in &ids {
+            let (zh, en) = notes().get(&id).unwrap_or_else(|| panic!("no note for instrument {id}"));
+            assert!(!zh.is_empty() && !en.is_empty(), "instrument {id}");
+            let chinese = |t: &str| t.chars().any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c));
+            assert!(chinese(zh) && !chinese(en), "instrument {id}: {zh} / {en}");
+        }
+        assert!(notes().keys().all(|id| ids.contains(id)));
+        // By name as the panel shows it.
+        let claws = names().cards.iter().find(|c| c.category == Category::Instrument && c.id == Some(6)).unwrap();
+        assert_eq!(instrument_id(&claws.en), Some(6));
+        assert_eq!(claws.zh.as_deref().and_then(instrument_id), Some(6));
+    }
+
     use super::*;
 
     /// Every potion and instrument with an id matches the solver; Traditional Chinese names are not duplicated.

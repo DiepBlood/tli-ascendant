@@ -365,14 +365,40 @@ const TARGET_MIN: f32 = 0.04;
 
 /// Whether the big jaws surround a cell's portrait: see [`TARGET_MIN`].
 fn has_target_jaws(img: &Rgba, cell: u8) -> bool {
+    target_jaws_with(img, cell, JAW_UNDER)
+}
+
+/// The rows of the band under the portrait, from its centre: the lower jaw's whole height.
+const JAW_UNDER: (i32, i32) = (50, 80);
+
+/// The rows of the lower jaw's fang tips just above the eater's label (see [`label_over`]), from the portrait's
+/// centre. On 2026-11-11 day 4 (17:53:42 UTC) the label over a Magic Lion in cell 07 covered the under band of the
+/// Magic Wolf it could eat in cell 06: the band scored 0.037, its sides 0.144, the chain read as over, and the chain's
+/// target screen had no advice for 3.7 s until the player cancelled it. These rows scored 0.239 there; the targets
+/// right above an eater on every other saved chain frame (24) score at least 0.17 on them.
+const JAW_TIPS: (i32, i32) = (44, 56);
+
+/// `has_target_jaws` with the band under the portrait taken at `under` (rows from its centre).
+fn target_jaws_with(img: &Rgba, cell: u8, (top, bottom): (i32, i32)) -> bool {
     let (cx, cy) = portrait(cell);
     let red = |r: i32, g: i32, b: i32| r > 150 && g * 2 < r && b * 2 < r;
     let bands = [
-        ((cx - 40, cx + 40), (cy + 50, cy + 80)),
+        ((cx - 40, cx + 40), (cy + top, cy + bottom)),
         ((cx - 58, cx - 38), (cy - 30, cy + 50)),
         ((cx + 38, cx + 58), (cy - 30, cy + 50)),
     ];
     bands.into_iter().all(|(xs, ys)| colour_share(img, xs, ys, red) >= TARGET_MIN)
+}
+
+/// The cell whose band under the portrait the eater's "Chain" label covers, the eater in cell `warden`: after a bite
+/// the game draws the label over the eater's portrait, and in the two side columns that is the bottom of the cell
+/// right above it (cell 1, above 16, is the Interrogation Room). Elsewhere the label falls between the rows.
+fn label_over(warden: u8) -> Option<u8> {
+    match warden {
+        7..=9 => Some(warden - 1),
+        14 | 15 => Some(warden + 1),
+        _ => None,
+    }
 }
 
 /// Whether a Consume target pick is on screen: a cell in its big jaws (see
@@ -995,6 +1021,34 @@ fn glow_tier(img: &Rgba, cell: u8, lantern: bool, t: &Templates) -> (u8, f32, f3
     (tier, conf, g[3].min(top))
 }
 
+/// The warm light the game draws over a locked cell on a walk's path as it fades, taken for a weak Legendary glow.
+/// A path's cells light amber, the floor of the whole cell and the wall beside it alike: the wall lifts over the far
+/// stone with much more red than blue, and the middle of the cell, where a "?" portrait sits on a scratched door, is
+/// lit floor of the same amber, not the portrait's dark card. The glow measured against that light is weak.
+/// 2026-11-11_10-05-51 day 10 (10:08:49 UTC), 0.35 s after "Go to 11": cell 09 read as a Legendary Scratch on the patrol
+/// board, strength 0.139, the wall 47/35/19 over the far stone, the middle 106/86/56. Over the 483 saved frames read
+/// with a Scratch door (at most 6 a run) these four together, weak (under [`PATH_LIGHT_MAX`]), lit, a warm wall lift and a
+/// mid-bright amber middle, picked 25 cells, all Legendary at 0.111-0.139 and all a moment between screens (22 read on a
+/// screen in between or a cell pick, 3 a single patrol read); no Scratch door that stayed on the board.
+const PATH_LIGHT_MAX: f32 = 0.16;
+
+/// Whether the glow of `strength` on locked `cell` is the fading path light ([`PATH_LIGHT_MAX`]), not a Scratch door.
+fn path_light(img: &Rgba, cell: u8, strength: f32) -> bool {
+    if strength >= PATH_LIGHT_MAX {
+        return false;
+    }
+    let (cx, cy) = portrait(cell);
+    let side = |d0: i32, d1: i32, s: i32| -> Vec<(i32, i32)> { (cy - 20..cy + 40).flat_map(|y| (d0..d1).map(move |d| (cx + s * d, y))).collect() };
+    let wall = median_rgb(img, side(54, 64, -1).into_iter().chain(side(54, 64, 1)));
+    let far = median_rgb(img, side(70, 90, -1).into_iter().chain(side(70, 90, 1)));
+    let d = [0, 1, 2].map(|k| wall[k] - far[k]);
+    let lit = d.iter().copied().fold(f32::MAX, f32::min) > LIT_LIFT;
+    let warm_wall = d[0] - d[2] >= 15.0 && d[0] - d[2] >= 0.35 * d[0];
+    let m = mean_rgb(img, (cy - 15..cy + 15).flat_map(|y| (cx - 15..cx + 15).map(move |x| (x, y))));
+    let amber_floor = (75.0..=130.0).contains(&m[0]) && m[0] - m[2] >= 30.0 && m[0] >= m[1] && m[1] >= m[2];
+    lit && warm_wall && amber_floor
+}
+
 /// Glow strength that marks a "?" portrait with a rarity glow on a locked
 /// cell. Measured on locked cells of both recordings: plain padlocks and
 /// unglowing "?" stay at or below 0.07, glowing "?" measure 0.12
@@ -1039,6 +1093,14 @@ pub fn read_scene_with(img: &Rgba, t: &Templates) -> Scene {
             // Casket just opened they cover a face that reads as no beast,
             // and that target went unseen (2026-10-28).
             r.target = has_target_jaws(img, c);
+            // Right above the eater, its label hides the lower jaw's bottom: the fang tips above the label count
+            // instead, on a face that reads as a beast and is not washed out. A bite's red glow, which also fills
+            // the side bands, mostly washes the face out, and was never seen right above an eater: of the 50 cells
+            // over the saved chain frames whose sides passed and whose full band did not, 49 were bite glows or a
+            // rising eater's glow, none of them right above the eater.
+            if !r.target && warden.and_then(label_over) == Some(c) && !r.locked && !r.flash && CLASSES[k].is_some() {
+                r.target = target_jaws_with(img, c, JAW_TIPS);
+            }
             // Not on a target: its red jaws stay on screen for the whole pick and tint the face, which still reads.
             r.shield = !r.locked
                 && !r.flash
@@ -1058,7 +1120,7 @@ pub fn read_scene_with(img: &Rgba, t: &Templates) -> Scene {
             } else if r.locked {
                 r.beast_conf = r.locked_conf;
                 let (tier, conf, strength) = glow_tier(img, c, false, t);
-                if strength >= GLOW_MIN {
+                if strength >= GLOW_MIN && !path_light(img, c, strength) {
                     r.glow = Some(tier);
                     r.glow_conf = conf * ((strength - GLOW_MIN) / 0.02).min(1.0);
                 }
@@ -1071,6 +1133,40 @@ pub fn read_scene_with(img: &Rgba, t: &Templates) -> Scene {
 
 #[cfg(test)]
 mod tests {
+    /// The fading path light over a locked cell is no Scratch door; a real one in a lit cell still is. Fixtures: cell 09
+    /// of 2026-11-11_10-05-51 frame-0094 (0.35 s after "Go to 11", read as a Legendary Scratch) and cell 13 of
+    /// 2026-11-07_18-43-44 frame-0073 (a Legendary Scratch door on a lit cell, on the board for 3.5 s), each a 240x220 box
+    /// of the reference layout at (1296, 460) and (566, 460).
+    #[test]
+    fn a_path_light_is_no_scratch_door() {
+        let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        // the public repository has no tests folder
+        if !fixtures.join("path-light-09.png").is_file() {
+            println!("skipped: {} is missing", fixtures.display());
+            return;
+        }
+        let board = |crop: &str, x: usize| {
+            let crop = crate::reader::decode_png_raw(&std::fs::read(fixtures.join(crop)).unwrap()).unwrap();
+            let mut img = Rgba { w: crate::reader::REF_W, h: crate::reader::REF_H, data: vec![0; crate::reader::REF_W * crate::reader::REF_H * 4] };
+            for y in 0..crop.h {
+                let at = ((460 + y) * img.w + x) * 4;
+                img.data[at..at + crop.w * 4].copy_from_slice(&crop.data[y * crop.w * 4..(y + 1) * crop.w * 4]);
+            }
+            img
+        };
+        let t = Templates::embedded();
+        let light = board("path-light-09.png", 1296);
+        let (tier, _, strength) = glow_tier(&light, 9, false, t);
+        assert!(strength >= GLOW_MIN && tier == 3 && path_light(&light, 9, strength), "{tier} {strength}");
+        let cell = read_scene(&light).cell(9).clone();
+        assert!(cell.locked && cell.glow.is_none(), "{cell:?}");
+        let door = board("scratch-lit-13.png", 566);
+        let (_, _, strength) = glow_tier(&door, 13, false, t);
+        assert!(!path_light(&door, 13, strength));
+        let cell = read_scene(&door).cell(13).clone();
+        assert!(cell.locked && cell.glow == Some(3), "{cell:?}");
+    }
+
     /// The left column's "!" sits higher than the other cells': on cell 16
     /// lit as a door it went unseen at the usual spot (2026-10-30).
     #[test]
@@ -1106,6 +1202,33 @@ mod tests {
                 img.data[i..i + 3].copy_from_slice(&rgb);
             }
         }
+    }
+
+    /// Right above the eater, the "Chain" label the game draws over it after a bite covers the bottom of the target's
+    /// lower jaw (2026-11-11 day 4: the Magic Wolf in cell 06 over the Magic Lion eating in cell 07): the full band
+    /// under the portrait misses the target, the fang tips above the label find it. The fixture is that frame's box
+    /// of cells 06 and 07 and the warden's arrow, in the reference layout.
+    #[test]
+    fn a_target_right_above_the_eater_reads_under_its_label() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/chain-label-06.png");
+        // the public repository has no tests folder
+        if !path.is_file() {
+            println!("skipped: {} is missing", path.display());
+            return;
+        }
+        let crop = crate::reader::decode_png_raw(&std::fs::read(&path).unwrap()).unwrap();
+        let mut img = Rgba { w: REF_W, h: REF_H, data: vec![0; REF_W * REF_H * 4] };
+        for y in 0..crop.h {
+            let at = ((50 + y) * img.w + 1240) * 4;
+            img.data[at..at + crop.w * 4].copy_from_slice(&crop.data[y * crop.w * 4..(y + 1) * crop.w * 4]);
+        }
+        assert!(!has_target_jaws(&img, 6) && target_jaws_with(&img, 6, JAW_TIPS));
+        let scene = read_scene(&img);
+        assert_eq!(scene.warden, Some(7));
+        assert!(scene.cell(6).target && !scene.cell(7).target);
+        // The label covers a cell only in the side columns.
+        assert_eq!([7, 8, 9, 14, 15].map(label_over), [Some(6), Some(7), Some(8), Some(15), Some(16)]);
+        assert!([2, 6, 10, 13, 16].into_iter().all(|w| label_over(w).is_none()));
     }
 
     /// A portrait washed out by the door-opening flash is covered, not a beast; a dark face is read as usual. The

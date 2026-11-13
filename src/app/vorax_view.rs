@@ -16,11 +16,12 @@ use super::session::Session;
 use super::settings::Settings;
 use super::theme::{self, ACCENT, DIVIDER, MUTED, Verdict};
 use super::vorax_settle::{self, Arrival};
-use super::vorax_session::{self, BoardFrom, BoxStyle, Config, Cue, GameSummary, ModeChange, Page, PageState, Status, View, VoraxSession};
+use crate::vorax::HELD_SLOTS;
+use super::vorax_session::{self, BoardFrom, BoxStyle, Config, Cue, GameSummary, Manual, Missing, ModeChange, Page, PageState, Status, View, VoraxSession};
 use crate::lang::{tr, trf};
 use crate::reader::Rgba;
 use crate::vorax::AdviceRow;
-use crate::vorax::names::rarity_name;
+use crate::vorax::names::{instrument_note, rarity_name};
 use crate::vorax::read::{self, Kind};
 use ::vorax::Rarity;
 use eframe::egui::{self, Align, Align2, Color32, FontId, Layout, RichText, Sense, Stroke, StrokeKind, Vec2};
@@ -72,6 +73,495 @@ pub struct VoraxView {
     /// top of the game, and the box on the Give Up button; made when first needed.
     give_up_notice: Option<Notice>,
     give_up_mark: Option<Mark>,
+    /// The line on the game while the panel asks for fields to fill in ([`fill_line`]); made when first needed.
+    fill_notice: Option<Notice>,
+    /// What the player is filling in for an unreadable screen ([`manual_editor`]).
+    draft: Draft,
+}
+
+/// The panel's entries for an unreadable selection screen ([`View::missing`]), kept between frames: started again
+/// whenever the screen's gaps change.
+#[derive(Default)]
+struct Draft {
+    /// The gaps the entries were started for.
+    made_for: Option<Missing>,
+    /// Held instruments left to right: the id chosen and the pick round typed.
+    held: Vec<(Option<u8>, String)>,
+    /// What the screen showed in each slot of `held` ([`Missing::seen`]), kept slot by slot as slots are removed or
+    /// added, so a slot's line stays its own.
+    seen: Vec<Option<Option<u8>>>,
+    /// Card index and the English name chosen.
+    cards: Vec<(usize, Option<String>)>,
+    /// Tank index, archetype, rarity, and the activity and quantity typed.
+    tanks: Vec<TankDraft>,
+}
+
+/// A tank entered on the panel: its index, archetype, rarity, and the activity and quantity typed.
+type TankDraft = (usize, Option<::vorax::Archetype>, Option<Rarity>, String, String);
+
+impl Draft {
+    /// Starts the entries again for `m`, from what the session knows (the tracked instruments and their rounds).
+    fn start(m: &Missing) -> Draft {
+        // What each slot showed, lined up on the right (a slot left of what was offered showed nothing).
+        let shift = m.held.len().saturating_sub(m.seen.len());
+        // At most the game's slots ([`HELD_SLOTS`]): an offer longer than that (never seen) keeps its rightmost.
+        let from = m.held.len().saturating_sub(HELD_SLOTS);
+        Draft {
+            made_for: Some(m.clone()),
+            held: m.held[from..].iter().map(|&(id, round)| (id, round.map(|r| r.to_string()).unwrap_or_default())).collect(),
+            seen: (from..m.held.len()).map(|k| k.checked_sub(shift).and_then(|i| m.seen.get(i).copied().flatten())).collect(),
+            cards: m.cards.iter().map(|&i| (i, None)).collect(),
+            tanks: m.tanks.iter().map(|&i| (i, None, None, String::new(), String::new())).collect(),
+        }
+    }
+
+    /// The entries for gaps `m` that changed: started again ([`Draft::start`]), keeping what was chosen or typed for a
+    /// card or tank of the same index still offered, and the held slots when the same ones are offered. Using one
+    /// entry (a card's `套用`) changes the gaps, and every other field typed was lost. A card's name is kept only for
+    /// the same hand (round, kind of card and [`Missing::hand`]): after a reroll the card of that index is another
+    /// card, and its drop-down came up with the old name chosen and its button lit.
+    fn carried(self, m: &Missing) -> Draft {
+        let mut d = Draft::start(m);
+        let old = self.made_for.as_ref();
+        if old.is_some_and(|old| old.held == m.held && old.seen == m.seen) {
+            (d.held, d.seen) = (self.held, self.seen);
+        }
+        let same_hand = old.is_some_and(|old| (old.round, old.category, old.hand) == (m.round, m.category, m.hand));
+        for c in d.cards.iter_mut().filter(|_| same_hand) {
+            if let Some(old) = self.cards.iter().find(|o| o.0 == c.0) {
+                c.1.clone_from(&old.1);
+            }
+        }
+        for t in &mut d.tanks {
+            if let Some(old) = self.tanks.iter().find(|o| o.0 == t.0) {
+                t.clone_from(old);
+            }
+        }
+        d
+    }
+
+    /// Removes held slot `k` with what the screen showed there.
+    fn remove_slot(&mut self, k: usize) {
+        if k < self.held.len() {
+            self.held.remove(k);
+        }
+        if k < self.seen.len() {
+            self.seen.remove(k);
+        }
+    }
+
+    /// Adds a blank held slot on the left: the screen showed nothing there. None past the game's slots
+    /// ([`Draft::can_add`]).
+    fn add_left(&mut self) {
+        if self.can_add() {
+            self.held.insert(0, (None, String::new()));
+            self.seen.insert(0, None);
+        }
+    }
+
+    /// Whether another held slot can be added: the game shows at most [`HELD_SLOTS`] instruments at the top right
+    /// (2026-11-12, the player asked whether more could be entered: the button had no limit, and the solver drops
+    /// those past its own 8 unsaid).
+    fn can_add(&self) -> bool {
+        self.held.len() < HELD_SLOTS
+    }
+
+    /// What the screen showed in held slot `k` (None: nothing read there).
+    fn seen_at(&self, k: usize) -> Option<Option<u8>> {
+        self.seen.get(k).copied().flatten()
+    }
+}
+
+/// Text in the window language, for the lines of [`manual_editor`] (zh-TW or English).
+fn zt(zh: &'static str, en: &'static str) -> &'static str {
+    if crate::lang::zh() { zh } else { en }
+}
+
+/// A card or instrument's name in the window language.
+fn card_name(c: &crate::vorax::names::CardName) -> String {
+    if crate::lang::zh() { c.zh.clone().unwrap_or_else(|| c.en.clone()) } else { c.client_en.clone().unwrap_or_else(|| c.en.clone()) }
+}
+
+/// Whether instrument `id` acts every N rounds: its pick round sets the rounds it acts on, so the round must be given.
+/// Another instrument's round only orders it among those acting at the same time, which the slots' order already does
+/// (`ScreenState::instruments` in the solver: left to right is the pick order).
+fn acts_periodically(id: u8) -> bool {
+    ::vorax::data().instrument(id).is_some_and(|d| matches!(d.timing, ::vorax::data::Timing::Periodic(_)))
+}
+
+/// A held slot's round field: a round of this game (1 to `last`), blank, or typed but not such a round.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum RoundField {
+    Given(i32),
+    Blank,
+    Bad,
+}
+
+fn round_field(text: &str, last: i32) -> RoundField {
+    match text.trim() {
+        "" => RoundField::Blank,
+        t => t.parse::<i32>().ok().filter(|r| (1..=last).contains(r)).map_or(RoundField::Bad, RoundField::Given),
+    }
+}
+
+/// What a held slot still needs before it can be used: its instrument chosen, its round (only one acting every N
+/// rounds, see [`acts_periodically`]), or a round that is one of this game's.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum SlotNeed {
+    Instrument,
+    Round,
+    BadRound,
+}
+
+fn slot_need(id: Option<u8>, field: RoundField) -> Option<SlotNeed> {
+    match (id, field) {
+        (None, _) => Some(SlotNeed::Instrument),
+        (_, RoundField::Bad) => Some(SlotNeed::BadRound),
+        (Some(id), RoundField::Blank) if acts_periodically(id) => Some(SlotNeed::Round),
+        _ => None,
+    }
+}
+
+/// The rounds of the held slots, left to right, with a blank one taken from the order: the round of the nearest slot
+/// on its left (1 for the first), but no later than the nearest round given on its right.
+fn resolve_rounds(given: &[Option<i32>]) -> Vec<i32> {
+    let mut out: Vec<i32> = Vec::with_capacity(given.len());
+    for (k, g) in given.iter().enumerate() {
+        let round = g.unwrap_or_else(|| {
+            let left = out.last().copied().unwrap_or(1);
+            given[k + 1..].iter().flatten().next().map_or(left, |&right| left.min(right)).max(1)
+        });
+        out.push(round);
+    }
+    out
+}
+
+/// The held instruments the slots stand for, once every slot has what it needs ([`slot_need`]) and the rounds,
+/// blanks taken from the order ([`resolve_rounds`]), do not go down from left to right; None until then.
+fn held_ready(d: &Draft, last: i32) -> Option<Vec<(u8, i32)>> {
+    let fields: Vec<RoundField> = d.held.iter().map(|(_, r)| round_field(r, last)).collect();
+    if d.held.is_empty() || d.held.iter().zip(&fields).any(|((id, _), f)| slot_need(*id, *f).is_some()) {
+        return None;
+    }
+    let rounds = resolve_rounds(&fields.iter().map(|f| if let RoundField::Given(r) = f { Some(*r) } else { None }).collect::<Vec<_>>());
+    rounds.windows(2).all(|w| w[0] <= w[1]).then(|| d.held.iter().zip(rounds).map(|((id, _), r)| (id.expect("chosen"), r)).collect())
+}
+
+/// An instrument's name in the window language, from the name table.
+fn instrument_label(id: u8) -> String {
+    use crate::vorax::names::{Category, names};
+    names().cards.iter().find(|c| c.category == Category::Instrument && c.id == Some(id)).map_or_else(|| id.to_string(), card_name)
+}
+
+/// The lines under the fill-in card's title: one saying what was not read, then one for each thing the fields still
+/// need, as their `← 請填` (fill in) marks say; none of those once everything is given.
+fn fill_reasons(m: &Missing, d: &Draft) -> Vec<String> {
+    let last = m.round.unwrap_or(13);
+    let mut out = Vec::new();
+    if !d.held.is_empty() || !m.held.is_empty() {
+        out.push(zt("右上角的手術用具沒讀全或和這場記到的對不上。", "The held instruments at the top right weren't all read or don't match this game's.").to_string());
+    }
+    if !d.cards.is_empty() {
+        out.push(zt("有卡片的名稱認不出。", "A card's name wasn't read.").to_string());
+    }
+    if !d.tanks.is_empty() {
+        out.push(zt("有水箱沒讀全。", "A tank wasn't read whole.").to_string());
+    }
+    let mut needs = 0;
+    for (k, (id, round)) in d.held.iter().enumerate() {
+        let line = match slot_need(*id, round_field(round, last)) {
+            Some(SlotNeed::Instrument) => format!("{} {} {}", zt("第", "Slot"), k + 1, zt("格：圖示認不出，請選用具", ": icon not recognized, choose the instrument")),
+            Some(SlotNeed::Round) => format!("{}{}", instrument_label(id.expect("chosen")), zt("：不知道是第幾回合拿的", ": the round it was picked isn't known")),
+            Some(SlotNeed::BadRound) => format!("{}{}{last}", instrument_label(id.expect("chosen")), zt("：回合要在 1～", ": the round must be 1 to ")) + zt(" 之間", ""),
+            None => continue,
+        };
+        needs += 1;
+        out.push(line);
+    }
+    if needs == 0 && !d.held.is_empty() && held_ready(d, last).is_none() {
+        out.push(zt("回合要由左到右不遞減。", "The rounds must not go down from left to right.").to_string());
+    }
+    for (i, chosen) in &d.cards {
+        if chosen.is_none() {
+            out.push(format!("{} {} {}", zt("第", "Card"), i + 1, zt("張卡：認不出，請選卡名", ": not recognized, choose its name")));
+        }
+    }
+    for (i, archetype, rarity, activity, quantity) in &d.tanks {
+        let positive = |t: &str| t.trim().parse::<i64>().ok().filter(|v| *v > 0);
+        if archetype.is_none() || rarity.is_none() || positive(activity).is_none() || positive(quantity).is_none() {
+            out.push(format!("{} {}{}", zt("水箱", "Tank"), i + 1, zt("：種族、稀有度或數字沒讀全，請補上", ": archetype, rarity or numbers not read, fill them in")));
+        }
+    }
+    out
+}
+
+/// Shows an instrument's note (or several, a line each) while `response` is hovered, wrapped at [`NOTE_WIDTH`], just
+/// under the widget on the top layer: egui's own tooltip of an entry in the drop-down's list was drawn under the list,
+/// which covered it.
+fn note_tip(response: egui::Response, text: &str) {
+    if !response.hovered() {
+        return;
+    }
+    egui::Area::new(response.id.with("vorax-note"))
+        .order(egui::Order::Debug)
+        .fixed_pos(response.rect.left_bottom() + Vec2::new(8.0, 2.0))
+        .constrain(true)
+        .interactable(false)
+        .show(&response.ctx, |ui| {
+            egui::Frame::popup(ui.style()).show(ui, |ui| {
+                ui.set_max_width(NOTE_WIDTH);
+                ui.add(egui::Label::new(RichText::new(text).small()).wrap());
+            });
+        });
+}
+
+/// The widest an instrument's note tooltip gets.
+const NOTE_WIDTH: f32 = 240.0;
+
+/// The line under a held slot whose instrument differs from what the screen showed there ([`Missing::seen`]):
+/// `畫面上讀到：X` (read on screen: X) for another instrument or an icon not recognized, `畫面上這格讀不到` (no icon
+/// read here) for a slot left of every icon read; None when the screen showed the slot's instrument.
+fn seen_line(chosen: Option<u8>, seen: Option<Option<u8>>) -> Option<String> {
+    match seen {
+        Some(Some(read)) if Some(read) == chosen => None,
+        Some(Some(read)) => Some(format!("{}{}", zt("畫面上讀到：", "Read on screen: "), instrument_label(read))),
+        Some(None) => Some(format!("{}{}", zt("畫面上讀到：", "Read on screen: "), zt("認不出的圖示", "an icon not recognized"))),
+        None => Some(zt("畫面上這格讀不到", "Nothing read on screen in this slot").to_string()),
+    }
+}
+
+/// The fields to fill in what was not read on an unreadable selection screen ([`View::missing`], the player asked
+/// for them on 2026-11-12), drawn inside the advice card ([`fill_card`]): one row a held instrument (a drop-down of
+/// the instruments and its pick round, the tracked list and rounds as the default), one a card (a drop-down of the
+/// names of its kind) and one a tank (archetype, rarity, activity and quantity). A field still blank that must be
+/// filled has the warning colour and `← 請填` (fill in) beside it; a button that can be pressed has the warning colour.
+/// What they return goes to [`VoraxSession::enter`].
+fn manual_fields(ui: &mut egui::Ui, m: &Missing, d: &mut Draft) -> Vec<Manual> {
+    use crate::vorax::names::{Category, archetype_name, names};
+    let mut out = Vec::new();
+    let small = |s: &str| RichText::new(s.to_string()).small();
+    let fill_in = |ui: &mut egui::Ui| ui.add(egui::Label::new(RichText::new(zt("\u{2190} 請填", "\u{2190} fill in")).small().color(theme::WARN)).extend());
+    // What was not read, then each thing still needed (the same tests as the marks below).
+    for (k, line) in fill_reasons(m, d).into_iter().enumerate() {
+        ui.label(RichText::new(line).small().color(if k == 0 { theme::TEXT } else { theme::WARN }));
+    }
+    ui.add_space(2.0);
+    if !m.held.is_empty() || !d.held.is_empty() {
+        let instruments: Vec<&crate::vorax::names::CardName> = names().cards.iter().filter(|c| c.category == Category::Instrument && c.id.is_some()).collect();
+        let last = m.round.unwrap_or(13);
+        let mut remove = None;
+        // What the screen showed in each slot, kept with the slot ([`Draft::seen`]).
+        let seen: Vec<Option<Option<u8>>> = (0..d.held.len()).map(|k| d.seen_at(k)).collect();
+        for (k, (id, round)) in d.held.iter_mut().enumerate() {
+            ui.horizontal_wrapped(|ui| {
+                let chosen = id.and_then(|i| instruments.iter().find(|c| c.id == Some(i))).map_or_else(|| "?".to_string(), |c| card_name(c));
+                // The drop-down takes what the round label and field (wider when optional, for its hint) leave, at most
+                // 104 px, so the row and its mark stay on one line down to a 296 px panel; it truncates a long name
+                // rather than widen the row.
+                let combo_w = (ui.available_width() - 114.0).clamp(60.0, 104.0);
+                warn_when(ui, id.is_none(), |ui| {
+                    let room = Vec2::new(combo_w, ui.spacing().interact_size.y);
+                    ui.allocate_ui_with_layout(room, Layout::left_to_right(Align::Center), |ui| {
+                        let combo = egui::ComboBox::from_id_salt(("vorax-manual-held", k)).width(combo_w).truncate().selected_text(small(&chosen)).show_ui(ui, |ui| {
+                            for c in &instruments {
+                                // Each entry's note on hover, to match it against the game's icon.
+                                let entry = ui.selectable_value(id, c.id, card_name(c));
+                                if let Some(note) = c.id.and_then(instrument_note) {
+                                    note_tip(entry, note);
+                                }
+                            }
+                            // Removing the slot is the list's last entry (a read of an icon that is not held).
+                            ui.separator();
+                            if ui.selectable_label(false, zt("（拿掉這一格）", "(remove this one)")).clicked() {
+                                remove = Some(k);
+                            }
+                        });
+                        if let Some(note) = id.and_then(instrument_note) {
+                            note_tip(combo.response, &format!("{chosen}\n{note}"));
+                        }
+                    });
+                });
+                ui.label(small(zt("回合", "Round")));
+                // Only an instrument acting every N rounds needs its round; another may be left blank (taken from the
+                // order, see `resolve_rounds`), which its hint says.
+                let need = slot_need(*id, round_field(round, last));
+                let optional = id.is_some_and(|i| !acts_periodically(i));
+                warn_when(ui, matches!(need, Some(SlotNeed::Round | SlotNeed::BadRound)), |ui| {
+                    let field = egui::TextEdit::singleline(round).desired_width(if optional { 64.0 } else { 28.0 });
+                    ui.add(if optional { field.hint_text(small(zt("可留空", "optional"))) } else { field })
+                });
+                if need.is_some() {
+                    fill_in(ui);
+                }
+            });
+            if let Some(line) = seen_line(*id, seen[k]) {
+                ui.label(RichText::new(line).small().color(MUTED));
+            }
+        }
+        if let Some(k) = remove {
+            d.remove_slot(k);
+        }
+        ui.horizontal_wrapped(|ui| {
+            let more = d.can_add();
+            let add = ui.add_enabled(more, egui::Button::new(zt("＋ 左邊再加一個", "+ One more on the left")).small());
+            if add.clicked() {
+                d.add_left();
+            }
+            if !more {
+                add.on_disabled_hover_text(format!("{}{HELD_SLOTS}{}", zt("遊戲右上角最多 ", "The game shows at most "), zt(" 格", " instruments at the top right")));
+            }
+            let list = held_ready(d, last);
+            let ready = list.is_some();
+            if ui.add_enabled(ready, ready_button(zt("用這些用具求解", "Solve with these instruments"), ready)).clicked()
+                && let Some(list) = list
+            {
+                out.push(Manual::Held(list));
+            }
+        });
+    }
+    if !d.cards.is_empty() {
+        let category = m.category.unwrap_or(Category::Potion);
+        let options: Vec<&crate::vorax::names::CardName> = names().cards.iter().filter(|c| c.category == category).collect();
+        for (i, chosen) in &mut d.cards {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(small(&format!("{} {}", zt("卡", "Card"), *i + 1)));
+                let text = chosen.as_ref().and_then(|en| options.iter().find(|c| &c.en == en)).map_or_else(|| "?".to_string(), |c| card_name(c));
+                warn_when(ui, chosen.is_none(), |ui| {
+                    egui::ComboBox::from_id_salt(("vorax-manual-card", *i)).width(130.0).truncate().selected_text(small(&text)).show_ui(ui, |ui| {
+                        for c in &options {
+                            ui.selectable_value(chosen, Some(c.en.clone()), card_name(c));
+                        }
+                    });
+                });
+                let ready = chosen.is_some();
+                if ui.add_enabled(ready, ready_button(zt("套用", "Use"), ready)).clicked()
+                    && let Some(en) = chosen.clone()
+                {
+                    out.push(Manual::Card(*i, en));
+                }
+                if !ready {
+                    fill_in(ui);
+                }
+            });
+        }
+    }
+    for (i, archetype, rarity, activity, quantity) in &mut d.tanks {
+        ui.horizontal_wrapped(|ui| {
+            ui.label(small(&format!("{} {}", zt("水箱", "Tank"), *i + 1)));
+            warn_when(ui, archetype.is_none(), |ui| {
+                egui::ComboBox::from_id_salt(("vorax-manual-arch", *i)).width(64.0).selected_text(small(archetype.map_or("?", archetype_name))).show_ui(ui, |ui| {
+                    for a in ::vorax::ARCHETYPES {
+                        ui.selectable_value(archetype, Some(a), archetype_name(a));
+                    }
+                });
+            });
+            warn_when(ui, rarity.is_none(), |ui| {
+                egui::ComboBox::from_id_salt(("vorax-manual-rarity", *i)).width(48.0).selected_text(small(rarity.map_or("?", rarity_name))).show_ui(ui, |ui| {
+                    for r in ::vorax::RARITIES {
+                        ui.selectable_value(rarity, Some(r), rarity_name(r));
+                    }
+                });
+            });
+            let positive = |t: &str| t.trim().parse::<i64>().ok().filter(|v| *v > 0);
+            warn_when(ui, positive(activity).is_none(), |ui| ui.add(egui::TextEdit::singleline(activity).desired_width(40.0).hint_text(zt("活性", "act."))));
+            ui.label(small("\u{d7}"));
+            warn_when(ui, positive(quantity).is_none(), |ui| ui.add(egui::TextEdit::singleline(quantity).desired_width(28.0).hint_text(zt("數量", "qty"))));
+            let numbers = positive(activity).zip(positive(quantity));
+            let ready = archetype.is_some() && rarity.is_some() && numbers.is_some();
+            if ui.add_enabled(ready, ready_button(zt("套用", "Use"), ready)).clicked()
+                && let (Some(a), Some(r), Some((act, qty))) = (*archetype, *rarity, numbers)
+            {
+                out.push(Manual::Tank(*i, a, r, act, qty));
+            }
+            if !ready {
+                fill_in(ui);
+            }
+        });
+    }
+    out
+}
+
+/// Draws `add` with its frame in the warning colour when `blank` (a field still to fill in).
+fn warn_when<R>(ui: &mut egui::Ui, blank: bool, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    ui.scope(|ui| {
+        if blank {
+            let w = &mut ui.visuals_mut().widgets;
+            for state in [&mut w.inactive, &mut w.hovered, &mut w.active] {
+                state.bg_stroke = Stroke::new(1.5, theme::WARN);
+            }
+        }
+        add(ui)
+    })
+    .inner
+}
+
+/// A button of the fill-in fields: on the warning colour, in dark text, once it can be pressed.
+fn ready_button(text: &str, ready: bool) -> egui::Button<'static> {
+    let label = RichText::new(text.to_string()).small();
+    if ready { egui::Button::new(label.color(WARN_INK)).fill(theme::WARN) } else { egui::Button::new(label) }
+}
+
+/// The dark ink on the warning colour (the button's text, the mark in the warning sign).
+const WARN_INK: Color32 = Color32::from_rgb(0x2a, 0x22, 0x10);
+
+/// How opaque the tanks and options under the card are while it asks for fields ([`fill_card`]).
+const FILL_DIM: f32 = 0.4;
+
+/// Whether the advice card asks for fields: the screen is unreadable and the session offers gaps to fill in.
+fn fill_shows(v: &View) -> bool {
+    v.status == Status::Unreadable && v.missing.is_some()
+}
+
+/// The line on the game while the advice card asks for fields ([`fill_shows`]): what was not read (the held
+/// instruments, a card, a tank), to fill in on the panel; None otherwise.
+pub fn fill_line(v: &View) -> Option<String> {
+    let m = v.missing.as_ref().filter(|_| fill_shows(v))?;
+    let mut what = Vec::new();
+    if !m.held.is_empty() {
+        what.push(zt("手術用具", "held instruments"));
+    }
+    if !m.cards.is_empty() {
+        what.push(zt("卡片", "cards"));
+    }
+    if !m.tanks.is_empty() {
+        what.push(zt("水箱", "tanks"));
+    }
+    let what = what.join(zt("、", " and "));
+    Some(if crate::lang::zh() { format!("Ascendant 讀不到{what}，請在面板上補上") } else { format!("Ascendant can't read the {what}: fill them in on the panel") })
+}
+
+/// The warning sign before the card's title, drawn (a triangle with an exclamation mark) rather than a glyph: `h`
+/// high.
+fn warn_sign(ui: &mut egui::Ui, h: f32) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(h * 1.1, h), Sense::hover());
+    let p = ui.painter();
+    let (x, top, bottom) = (rect.center().x, rect.top() + 1.0, rect.bottom() - 1.0);
+    let half = h * 0.55;
+    p.add(egui::Shape::convex_polygon(vec![egui::pos2(x, top), egui::pos2(x + half, bottom), egui::pos2(x - half, bottom)], theme::WARN, Stroke::NONE));
+    p.line_segment([egui::pos2(x, top + h * 0.34), egui::pos2(x, top + h * 0.64)], Stroke::new((h * 0.12).max(1.5), WARN_INK));
+    p.circle_filled(egui::pos2(x, top + h * 0.79), (h * 0.07).max(1.0), WARN_INK);
+}
+
+/// The advice card while the screen is unreadable and fields can be filled in ([`fill_shows`]; layout A the player
+/// picked on 2026-11-12, the fields having been far down the panel): a warning-coloured frame, the drawn warning sign
+/// and `讀不到，需要你補` (can't read it: fill it in), then the fields (`fields`), which write what was not read and
+/// what they still need ([`fill_reasons`]). Returns the card's rectangle.
+fn fill_card(ui: &mut egui::Ui, fields: &mut dyn FnMut(&mut egui::Ui)) -> egui::Rect {
+    theme::card_frame()
+        .fill(theme::CARD)
+        .stroke(Stroke::new(1.5, theme::WARN))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.spacing_mut().item_spacing.y = 3.0;
+            let size = theme::ADVICE_TEXT * 0.8;
+            ui.horizontal(|ui| {
+                warn_sign(ui, size);
+                ui.label(RichText::new(zt("讀不到，需要你補", "Can't read it: fill it in")).size(size).strong().color(theme::WARN));
+            });
+            fields(ui);
+        })
+        .response
+        .rect
 }
 
 /// The content written to the `vorax_view` row, matching the fields written: the boxes drawn (what and `Mark::at()`),
@@ -90,7 +580,7 @@ impl VoraxView {
     pub fn new(settings: &Settings, ctx: egui::Context) -> VoraxView {
         let mut session = VoraxSession::new(Config::from_settings(settings));
         session.on_progress(move || ctx.request_repaint());
-        let mut view = VoraxView { session, marks: Vec::new(), value: None, window: None, last_view: None, hidden: None, preview: false, preview_battle: None, preview_result: None, dismissed: None, latest_window: None, preview_view: None, give_up_notice: None, give_up_mark: None };
+        let mut view = VoraxView { session, marks: Vec::new(), value: None, window: None, last_view: None, hidden: None, preview: false, preview_battle: None, preview_result: None, dismissed: None, latest_window: None, preview_view: None, give_up_notice: None, give_up_mark: None, fill_notice: None, draft: Draft::default() };
         // ASCENDANT_PREVIEW_VORAX_PANEL=advice, none or blank: the panel draws a made-up board (see preview_view).
         if let Ok(which) = std::env::var("ASCENDANT_PREVIEW_VORAX_PANEL") {
             view.preview_panel(&which);
@@ -119,6 +609,24 @@ impl VoraxView {
         self.session.note_cue(Cue::Page(Page::Main, PageState::Run), Some(now));
         self.session.read(frame.clone(), now, "preview");
         self.session.read(frame, now + 100, "preview");
+    }
+
+    /// Test only (offline screenshots of the panel): what the player would enter on the panel for the screen on show
+    /// ([`VoraxSession::enter`]).
+    pub fn preview_enter(&mut self, m: Manual) {
+        self.session.enter(m, vorax_session::now_ms());
+    }
+
+    /// Test only (offline screenshots of the panel): a game log cue, such as the interface scale of the game a saved
+    /// frame was taken in, before [`VoraxView::preview_read`].
+    pub fn preview_cue(&mut self, cue: Cue) {
+        self.session.note_cue(cue, Some(vorax_session::now_ms()));
+    }
+
+    /// Test only (offline screenshots of the panel): the held instruments the game tracked so far
+    /// ([`VoraxSession::preview_track`]), after [`VoraxView::preview_read`].
+    pub fn preview_track(&mut self, held: Vec<(u8, i32)>) {
+        self.session.preview_track(held, vorax_session::now_ms());
     }
 
     /// Test only (ASCENDANT_PREVIEW_BATTLE=2 or full): the panel draws a fake endgame battle (wave 2/3, or all
@@ -331,6 +839,7 @@ impl VoraxView {
             v.hide();
         }
         self.hide_give_up();
+        self.hide_fill();
         // This is taking the boxes down on leaving Vorax mode, not hidden by show_marks.
         self.hidden = None;
         self.log_marks(vorax_session::now_ms());
@@ -377,7 +886,33 @@ impl VoraxView {
         }
         self.show_marks(ctx, settings);
         self.show_give_up(ctx, settings);
+        self.show_fill(settings);
         self.log_marks(now);
+    }
+
+    fn hide_fill(&mut self) {
+        if let Some(n) = &mut self.fill_notice {
+            n.hide();
+        }
+    }
+
+    /// The line on the game while the panel asks for fields to fill in ([`fill_line`]), with the game in front: the
+    /// same notice as the give-up hint, at the same place (centred at the top of the game), and no button boxed. It
+    /// goes once the advice comes, the screen reads, or Vorax is left (`hide_all`). No setting: it always shows.
+    fn show_fill(&mut self, settings: &Settings) {
+        let title = &settings.window_title;
+        let line = if self.session.active() { fill_line(self.session.view()) } else { None };
+        let rect = line.as_ref().filter(|_| game_in_front(title)).and_then(|_| game_rect(title).ok());
+        let (Some(line), Some([left, top, width, height])) = (line, rect) else {
+            self.hide_fill();
+            return;
+        };
+        if self.fill_notice.is_none() {
+            self.fill_notice = Notice::new();
+        }
+        if let Some(n) = &mut self.fill_notice {
+            n.show(&line, left as f32 + width as f32 / 2.0, top as f32 + height as f32 * 8.0 / 1080.0, height as f32 / 1080.0, width as f32 * 0.6);
+        }
     }
 
     /// The give-up hint is on the game.
@@ -544,33 +1079,68 @@ impl VoraxView {
     /// ui.rs's status line (merged into it, see [`VoraxView::compact_head`]).
     /// At the bottom, the switch of the endgame battle's give-up hint (`give_up`, settings `vorax_give_up_hint`; the
     /// player asked for it on this panel, 2026-11-09): true when it was switched, for ui.rs to save.
-    pub fn panel(&self, ui: &mut egui::Ui, compact: bool, give_up: &mut bool) -> bool {
-        self.panel_body(ui, compact);
+    pub fn panel(&mut self, ui: &mut egui::Ui, compact: bool, give_up: &mut bool) -> bool {
+        for entry in self.panel_body(ui, compact) {
+            self.session.enter(entry, vorax_session::now_ms());
+        }
+        self.manual_note(ui);
         ui.add_space(6.0);
         let hover = tr("Vorax endgame battle: once the score reaches its cap (1.12M, every reward tier taken), a line on the game says giving up settles at once, and the Give Up button is boxed. More battle adds nothing then");
         ui.add(theme::Switch::new(give_up, tr("Vorax: hint to give up at the score cap"))).on_hover_text(hover).changed()
     }
 
-    fn panel_body(&self, ui: &mut egui::Ui, compact: bool) {
+    /// The panel's body; the fields filled in for an unreadable screen ([`manual_fields`], drawn in the advice card)
+    /// come back to be entered.
+    fn panel_body(&mut self, ui: &mut egui::Ui, compact: bool) -> Vec<Manual> {
         if !self.active()
             && let Some(g) = self.last_game()
         {
             result_panel(g, ui, compact);
-            return;
+            return Vec::new();
         }
+        let always = self.always_take();
+        let missing = {
+            let v = self.view();
+            v.missing.clone().filter(|_| v.status == Status::Unreadable && self.session.active())
+        };
+        match &missing {
+            Some(m) if self.draft.made_for.as_ref() != Some(m) => self.draft = std::mem::take(&mut self.draft).carried(m),
+            Some(_) => {}
+            None => self.draft = Draft::default(),
+        }
+        let base = self.preview_view.as_ref().unwrap_or_else(|| self.session.view());
         let injected;
         let v = match &self.preview_battle {
             Some(b) => {
-                injected = with_battle(self.view(), b);
+                injected = with_battle(base, b);
                 &injected
             }
-            None => self.view(),
+            None => base,
         };
-        let always = self.always_take();
-        if compact {
-            compact_body(v, ui, always);
-        } else {
-            draw_panel(v, ui, always);
+        let mut out = Vec::new();
+        let draft = &mut self.draft;
+        {
+            let mut fill = |ui: &mut egui::Ui| {
+                if let Some(m) = &missing {
+                    out.extend(manual_fields(ui, m, draft));
+                }
+            };
+            let fields: Option<&mut dyn FnMut(&mut egui::Ui)> = if missing.is_some() { Some(&mut fill) } else { None };
+            if compact {
+                compact_body(v, ui, always, fields);
+            } else {
+                draw_panel_with(v, ui, always, fields);
+            }
+        }
+        out
+    }
+
+    /// The line on what was entered by hand ([`View::manual_note`]), under the panel.
+    fn manual_note(&self, ui: &mut egui::Ui) {
+        if self.session.active()
+            && let Some(note) = &self.session.view().manual_note
+        {
+            ui.label(RichText::new(note.clone()).small().color(ACCENT));
         }
     }
 
@@ -608,6 +1178,13 @@ impl VoraxView {
 /// The column widths of the top three are computed once at the start from the panel width ([`Cols`]), shared by the
 /// header and every row, so they align at window width 200 too.
 pub fn draw_panel(v: &View, ui: &mut egui::Ui, always: bool) {
+    draw_panel_with(v, ui, always, None);
+}
+
+/// [`draw_panel`] with the fields to fill in for an unreadable screen (`fields`, see [`fill_card`]): when the view
+/// asks for them, the advice card holds them and the tanks and options below are dimmed until the advice comes.
+/// Returns the card's rectangle when it holds them.
+pub fn draw_panel_with(v: &View, ui: &mut egui::Ui, always: bool, fields: Option<&mut dyn FnMut(&mut egui::Ui)>) -> Option<egui::Rect> {
     // Column spacing 4 (narrower than the default), so the name column gets a bit more room at window width 200.
     let cols = Cols::new(ui.available_width(), 4.0);
     let head = match v.round {
@@ -629,16 +1206,27 @@ pub fn draw_panel(v: &View, ui: &mut egui::Ui, always: bool) {
     }
     rerolls(ui, v);
     ui.add_space(4.0);
-    advice_card(ui, v);
+    let card = match fields {
+        Some(fields) if fill_shows(v) => Some(fill_card(ui, fields)),
+        _ => {
+            advice_card(ui, v);
+            None
+        }
+    };
     let rows = advice_rows(v);
-    // The six tanks in a row as in the game, the ones the advised card acts on marked (2026-11-08 layout), above the
-    // ranking whose tanks column draws them small.
-    ui.add_space(2.0);
-    tank_strip(ui, &v.tanks, advised_targets(rows), v.stale, false);
-    ui.add_space(2.0);
-    ranking_rows(ui, &cols, rows, v.stale, always, Some(&v.tanks));
-    rest_line(ui, rows);
-    held(ui, &v.held);
+    ui.scope(|ui| {
+        if card.is_some() {
+            ui.multiply_opacity(FILL_DIM);
+        }
+        // The six tanks in a row as in the game, the ones the advised card acts on marked (2026-11-08 layout), above
+        // the ranking whose tanks column draws them small.
+        ui.add_space(2.0);
+        tank_strip(ui, &v.tanks, advised_targets(rows), v.stale, false);
+        ui.add_space(2.0);
+        ranking_rows(ui, &cols, rows, v.stale, always, Some(&v.tanks));
+        rest_line(ui, rows);
+        held(ui, &v.held);
+    });
     theme::notes(ui, egui::Id::unique("vorax-notes"), &now_items(v), &note_items(v));
     // The two blocks the user expands themselves: the header is always there (`—` when there is no content), so the
     // credit line does not jump up and down.
@@ -653,6 +1241,7 @@ pub fn draw_panel(v: &View, ui: &mut egui::Ui, always: bool) {
         Some(board) => ui.label(RichText::new(board).small().monospace()),
         None => ui.label(RichText::new("\u{2014}").small().color(MUTED)),
     });
+    card
 }
 
 /// The compact Vorax panel (when the window is small; the layout diagram the user confirmed, target 421x351,
@@ -673,7 +1262,7 @@ pub fn draw_panel_compact(v: &View, ui: &mut egui::Ui, always: bool) {
         ui.allocate_ui_with_layout(Vec2::new(w * 0.45, h), Layout::left_to_right(Align::Center), |ui| theme::line(ui, &head, MUTED));
         theme::line_aligned(ui, &rerolls, MUTED, true);
     });
-    compact_body(v, ui, always);
+    compact_body(v, ui, always, None);
 }
 
 /// The Vorax header `渴血 · 第 R 回合 / 13` (Vorax, round R of 13).
@@ -698,7 +1287,7 @@ fn rerolls_text(v: &View) -> String {
 /// Below line 1 of the compact version: the activity progress bar, the advice card (only the large text and the
 /// label) and one small line right under the card (reason first, then the solve note), the six tanks in a row, the
 /// top three with the tanks column, ranks 4-6, the held instruments, the warning area, and the two expand links.
-fn compact_body(v: &View, ui: &mut egui::Ui, always: bool) {
+fn compact_body(v: &View, ui: &mut egui::Ui, always: bool, fields: Option<&mut dyn FnMut(&mut egui::Ui)>) {
     let target = ::vorax::value::TARGET;
     match v.ultimate {
         Some(ultimate) => {
@@ -710,6 +1299,29 @@ fn compact_body(v: &View, ui: &mut egui::Ui, always: bool) {
             progress(ui, tr("Activity"), 0.0, format!("\u{2014} / {}", short_k(target)), theme::TRACK);
         }
     }
+    // The card holds the fields to fill in for an unreadable screen (see `draw_panel_with`), the block below dimmed.
+    let filling = match fields {
+        Some(fields) if fill_shows(v) => {
+            fill_card(ui, fields);
+            true
+        }
+        _ => false,
+    };
+    if !filling {
+        compact_card(ui, v);
+    }
+    let rows = advice_rows(v);
+    ui.scope(|ui| {
+        if filling {
+            ui.multiply_opacity(FILL_DIM);
+        }
+        compact_middle(ui, v, rows, always);
+    });
+    compact_links(ui, v, rows);
+}
+
+/// The compact panel's advice card and its small line (see [`compact_body`]).
+fn compact_card(ui: &mut egui::Ui, v: &View) {
     let (big, small) = card_text(v);
     let brief = card_brief(v);
     let colour = match &v.advice {
@@ -739,7 +1351,10 @@ fn compact_body(v: &View, ui: &mut egui::Ui, always: bool) {
     // Right under the card: fixed one line (reason first, solve note only up to the first `；`), the full text in the
     // tooltip. One line rather than the two of before 2026-11-08: the row of six tanks needs the room at 421x351.
     card_small(ui, v, &brief, &small, 1);
-    let rows = advice_rows(v);
+}
+
+/// The compact panel's tanks, top three, ranks 4-6 and held instruments (see [`compact_body`]).
+fn compact_middle(ui: &mut egui::Ui, v: &View, rows: &[AdviceRow], always: bool) {
     // The same order as the full panel (2026-11-08 layout): the six tanks in a row as in the game, the advised card's
     // tanks marked (short cells, see [`tank_strip`]), then the top three across the whole width with the tanks column.
     tank_strip(ui, &v.tanks, advised_targets(rows), v.stale, true);
@@ -755,6 +1370,10 @@ fn compact_body(v: &View, ui: &mut egui::Ui, always: bool) {
     rest_line(ui, rows);
     // Held instruments on the left, remaining rerolls on the right.
     held_row(ui, &v.held, &rerolls_text(v));
+}
+
+/// The compact panel's warning area and its two expand links (see [`compact_body`]).
+fn compact_links(ui: &mut egui::Ui, v: &View, rows: &[AdviceRow]) {
     theme::notes(ui, egui::Id::unique("vorax-notes"), &now_items(v), &note_items(v));
     // Two links; clicking expands below (the state is kept in egui's temp storage, so switching layout does not
     // affect the full version's collapsed state).
@@ -1000,7 +1619,15 @@ fn held(ui: &mut egui::Ui, held: &[(String, bool)]) {
         }
     });
     if !held.is_empty() {
-        response.on_hover_text(held.iter().map(|(name, _)| name.as_str()).collect::<Vec<_>>().join(tr(", ")));
+        // Each held instrument with its note, to match against the game's icons.
+        let lines: Vec<String> = held
+            .iter()
+            .map(|(name, _)| match crate::vorax::names::instrument_id(name).and_then(instrument_note) {
+                Some(note) => format!("{name}\u{ff1a}{note}"),
+                None => name.clone(),
+            })
+            .collect();
+        note_tip(response, &lines.join("\n"));
     }
 }
 
@@ -1032,7 +1659,8 @@ impl Cols {
 /// The verdict of the advice against the runner-up (plan section 3): no label when there are fewer than two ranking
 /// rows or the advice is stale (grey). Compare the advised row with the first row that is not it: if the 840k chance
 /// differs by less than 1 percentage point, or the expected score differs by less than 1% of the advice's, it counts
-/// as "either is fine" (`都可以`); otherwise "clearly better" (`明顯較好`).
+/// as "either is fine" (`都可以`); otherwise "clearly better" (`明顯較好`). The expected scores compared are the
+/// solver's ([`AdviceRow::raw`]), not the ones shown with the early-round correction capped at 840k.
 fn verdict(rows: &[AdviceRow], stale: bool) -> Option<Verdict> {
     if rows.len() < 2 || stale {
         return None;
@@ -1041,7 +1669,7 @@ fn verdict(rows: &[AdviceRow], stale: bool) -> Option<Verdict> {
     let rival = rows.iter().enumerate().find(|&(k, _)| k != b).map(|(_, r)| r)?;
     let best = &rows[b];
     let close_reach = matches!((best.reached, rival.reached), (Some(x), Some(y)) if (x - y).abs() <= 0.01);
-    let close_mean = best.mean - rival.mean <= NEAR * best.mean.abs();
+    let close_mean = best.raw - rival.raw <= NEAR * best.raw.abs();
     Some(if close_reach || close_mean { Verdict::Either } else { Verdict::Clear })
 }
 
@@ -1268,7 +1896,7 @@ fn preview_view(which: &str) -> View {
         let ts: Vec<String> = targets.iter().map(|k| (k + 1).to_string()).collect();
         format!("{name} \u{2192} {} {}", zh_en("水箱", "tank"), ts.join(zh_en("\u{3001}", ",")))
     };
-    let row = |name: &str, targets: &[u8], mean: f64, reached: f64, refresh: bool, best: bool| AdviceRow { label: label(name, targets), name: name.to_string(), targets: targets.to_vec(), mean, reached: Some(reached), refresh, best };
+    let row = |name: &str, targets: &[u8], mean: f64, reached: f64, refresh: bool, best: bool| AdviceRow { label: label(name, targets), name: name.to_string(), targets: targets.to_vec(), mean, raw: mean, reached: Some(reached), refresh, best };
     let rows = vec![
         row(&potion(0), &[1, 4], 812_400.0, 0.62, false, true),
         row(zh_en("重擲", "Reroll"), &[], 790_100.0, 0.55, true, false),
@@ -1277,7 +1905,7 @@ fn preview_view(which: &str) -> View {
         row(&potion(3), &[], 650_900.0, 0.33, false, false),
     ];
     let headline = format!("{}{}{}", zh_en("建議", "Pick"), zh_en("\u{ff1a}", ": "), rows[0].label);
-    let method = zh_en("藥劑：每個選項模擬到終局；期望分數是終局最終活性的平均（上限 840k）。", "Potions: each option played to the end; mean is the final Ultimate Activity, capped at 840k.");
+    let method = zh_en("藥劑：每個選項模擬到終局；期望分數是終局最終活性的平均（上限 840k），第 10 回合前每剩一回合加 8k（實戰校正）。", "Potions: each option played to the end; mean is the final Ultimate Activity, capped at 840k, plus 8k per round left before round 10 (calibrated on real games).");
     let stale = which == "stale";
     View {
         mode: vorax_session::Mode::Board,
@@ -1918,7 +2546,7 @@ mod tests {
     /// game and a dash in the panel.
     #[test]
     fn the_value_on_the_game_is_the_panels_number() {
-        let row = |mean: f64, best: bool| AdviceRow { name: String::new(), targets: vec![], label: String::new(), mean, reached: Some(0.4), refresh: false, best };
+        let row = |mean: f64, best: bool| AdviceRow { name: String::new(), targets: vec![], label: String::new(), mean, raw: mean, reached: Some(0.4), refresh: false, best };
         let rows = vec![row(812_400.0, false), row(694_600.0, true), row(600_000.0, false)];
         let mut view = View {
             advice: Some(crate::vorax::AdviceRows { headline: String::new(), note: None, rows: rows.clone(), method: String::new(), unknown: vec![] }),
@@ -1937,7 +2565,7 @@ mod tests {
         assert_eq!(advised_k(&View::default(), false), None, "no advice");
         // A card always taken is advised without a playout (no chance, mean 0): "Always take" on the game and in the
         // panel's cell for it.
-        let taken = AdviceRow { name: String::new(), targets: vec![], label: String::new(), mean: 0.0, reached: None, refresh: false, best: true };
+        let taken = AdviceRow { name: String::new(), targets: vec![], label: String::new(), mean: 0.0, raw: 0.0, reached: None, refresh: false, best: true };
         view.boxes = vec![vorax_session::MarkBox { what: "card 1".into(), at: (1205.0, 1140.0, 110.0, 185.0), style: BoxStyle::Plain }];
         view.advice = Some(crate::vorax::AdviceRows { headline: String::new(), note: None, rows: vec![taken.clone()], method: String::new(), unknown: vec![] });
         assert_eq!(advised_k(&view, true).as_deref(), Some(tr("Always take")));
@@ -1946,7 +2574,7 @@ mod tests {
         assert_eq!(advised_k(&view, false), None);
         assert_eq!(row_mean(&taken, false), "\u{2014}");
         // A value worked out as 0 is a value, not the rule.
-        let zero = AdviceRow { name: String::new(), targets: vec![], label: String::new(), mean: 0.0, reached: Some(0.0), refresh: false, best: true };
+        let zero = AdviceRow { name: String::new(), targets: vec![], label: String::new(), mean: 0.0, raw: 0.0, reached: Some(0.0), refresh: false, best: true };
         assert_eq!(row_mean(&zero, false), "0");
     }
 
@@ -2015,7 +2643,7 @@ mod tests {
     /// it is in the third row, and this line writes 3, 4, 6.
     #[test]
     fn rest_line_lists_the_options_below_the_bars() {
-        let row = |label: &str, best: bool| AdviceRow { name: String::new(), targets: vec![], label: label.into(), mean: 812_000.0, reached: Some(0.5), refresh: false, best };
+        let row = |label: &str, best: bool| AdviceRow { name: String::new(), targets: vec![], label: label.into(), mean: 812_000.0, raw: 812_000.0, reached: Some(0.5), refresh: false, best };
         let five: Vec<AdviceRow> = ["甲", "乙", "丙", "丁", "戊"].iter().map(|l| row(l, *l == "甲")).collect();
         assert_eq!(rest_text(&five), "4 丁 50% 812k \u{b7} 5 戊 50% 812k");
         let three: Vec<AdviceRow> = five[..3].to_vec();
@@ -2092,7 +2720,7 @@ mod tests {
     /// midway").
     #[test]
     fn kit_is_recognised_in_both_languages() {
-        let row = |label: &str, refresh: bool, best: bool| AdviceRow { name: String::new(), targets: vec![], label: label.into(), mean: 800_000.0, reached: Some(0.5), refresh, best };
+        let row = |label: &str, refresh: bool, best: bool| AdviceRow { name: String::new(), targets: vec![], label: label.into(), mean: 800_000.0, raw: 800_000.0, reached: Some(0.5), refresh, best };
         assert!(is_kit("藥劑箱（大）") && is_kit("稀有藥劑箱（小）") && is_kit("Potion Kit (Large)") && is_kit("Rare Potion Kit (Small)"));
         assert!(!is_kit("迷魂酊劑 \u{2192} 水箱 1") && !is_kit("Reroll"));
         assert_eq!(advice_reason(&[row("Reroll", true, false), row("Potion Kit (Small)", false, true)]), Some(tr("Potion kit first, no reroll")));
@@ -2103,7 +2731,7 @@ mod tests {
     /// reroll dropped midway.
     #[test]
     fn reason_follows_the_best_row() {
-        let row = |label: &str, reached: f64, refresh: bool, best: bool| AdviceRow { name: String::new(), targets: vec![], label: label.into(), mean: 800_000.0, reached: Some(reached), refresh, best };
+        let row = |label: &str, reached: f64, refresh: bool, best: bool| AdviceRow { name: String::new(), targets: vec![], label: label.into(), mean: 800_000.0, raw: 800_000.0, reached: Some(reached), refresh, best };
         // a: row 0 is a reroll, the advice is a potion kit.
         assert_eq!(advice_reason(&[row("重擲", 0.5, true, false), row("藥劑箱（小）", 0.4, false, true)]), Some(tr("Potion kit first, no reroll")));
         // b: the advice is row 0, but row 1 has a higher 840k chance.
@@ -2118,7 +2746,7 @@ mod tests {
 
     #[test]
     fn verdict_compares_the_advice_with_the_runner_up() {
-        let row = |mean: f64, reached: Option<f64>, best: bool| AdviceRow { name: String::new(), targets: vec![], label: String::new(), mean, reached, refresh: false, best };
+        let row = |mean: f64, reached: Option<f64>, best: bool| AdviceRow { name: String::new(), targets: vec![], label: String::new(), mean, raw: mean, reached, refresh: false, best };
         // 5 percentage points of chance difference, 5% expected score difference: clearly better.
         assert_eq!(verdict(&[row(800_000.0, Some(0.60), true), row(760_000.0, Some(0.55), false)], false), Some(Verdict::Clear));
         // Chance differs by less than 1 percentage point: either is fine.
@@ -2221,6 +2849,205 @@ mod tests {
         (out, strokes)
     }
 
+    /// The card's reasons say what its fields still need, as their marks do (the player, 2026-11-12: the third
+    /// instrument was the one not known, and the card named the statue). frame-0036's case: 攣縮指爪 (6) at round 1 and
+    /// 疫區聖母像 (19, acting every N rounds) at round 5 tracked, 蛻生腦皮層 (10) with no round: only the line on what
+    /// was not read, and the blank round of 10 is taken from the order (5), so the instruments can be used.
+    /// The verdict is judged on the solver's expected scores (review of 1.3.0): in round 1 the shown ones, 8k a round
+    /// added and capped at 840k, made 800k against 780k look equal.
+    #[test]
+    fn the_verdict_uses_the_solvers_scores() {
+        let row = |raw: f64, reached: f64, best: bool| AdviceRow { name: String::new(), targets: vec![], label: String::new(), mean: crate::vorax::shown_mean(raw, Some(1)), raw, reached: Some(reached), refresh: false, best };
+        let rows = [row(800_000.0, 0.6, true), row(780_000.0, 0.4, false)];
+        assert_eq!((rows[0].mean, rows[1].mean), (840_000.0, 840_000.0));
+        assert_eq!(verdict(&rows, false), Some(Verdict::Clear));
+        assert_eq!(verdict(&[row(800_000.0, 0.6, true), row(796_000.0, 0.4, false)], false), Some(Verdict::Either));
+    }
+
+    /// The held slots stop at the game's 4 (review of 1.3.0, the player asked): adding past them does nothing and the
+    /// button is off; an offer longer than that keeps its rightmost.
+    #[test]
+    fn the_held_slots_stop_at_four() {
+        let m = Missing { held: vec![(Some(19), Some(5)), (Some(10), Some(6))], seen: vec![Some(Some(19)), Some(Some(10))], round: Some(6), ..Missing::default() };
+        let mut d = Draft::start(&m);
+        for _ in 0..5 {
+            d.add_left();
+        }
+        assert_eq!((d.held.len(), d.seen.len(), d.can_add()), (4, 4, false));
+        d.remove_slot(0);
+        assert!(d.can_add());
+        let long = Missing { held: (1..=5).map(|k| (Some(k), Some(i32::from(k)))).collect(), seen: vec![], round: Some(6), ..Missing::default() };
+        let d = Draft::start(&long);
+        assert_eq!(d.held.iter().map(|(id, _)| id.unwrap()).collect::<Vec<_>>(), vec![2, 3, 4, 5]);
+        assert_eq!((d.seen.len(), d.can_add()), (4, false));
+    }
+
+    /// Removing a held slot removes what the screen showed there with it (review of 1.3.0): with [12, 19, 10] read
+    /// and the first slot removed, the 19 slot is not said to have read 12. A slot added on the left showed nothing.
+    #[test]
+    fn a_removed_slot_takes_its_seen_line_along() {
+        let m = Missing { held: vec![(Some(12), None), (Some(19), Some(5)), (Some(10), Some(6))], seen: vec![Some(Some(12)), Some(Some(19)), Some(Some(10))], round: Some(6), ..Missing::default() };
+        let mut d = Draft::start(&m);
+        d.remove_slot(0);
+        assert_eq!((d.seen_at(0), d.seen_at(1)), (Some(Some(19)), Some(Some(10))));
+        assert_eq!((seen_line(Some(19), d.seen_at(0)), seen_line(Some(10), d.seen_at(1))), (None, None));
+        d.add_left();
+        assert_eq!((d.seen_at(0), d.seen_at(1)), (None, Some(Some(19))));
+    }
+
+    /// Using one entry keeps the others typed (review of 1.3.0): a card's name used, the tank's values being typed
+    /// stay, as do the held slots when the same ones are offered.
+    #[test]
+    fn using_one_entry_keeps_the_others() {
+        let m = Missing { held: vec![(Some(6), None)], seen: vec![Some(None)], cards: vec![0, 1], tanks: vec![2], round: Some(6), ..Missing::default() };
+        let mut d = Draft::start(&m);
+        d.held[0].1 = "3".into();
+        d.cards[1].1 = Some("y".into());
+        d.tanks[0] = (2, Some(::vorax::Archetype::Pest), None, "5".into(), "2".into());
+        let after = Missing { cards: vec![1], ..m.clone() };
+        let d = d.carried(&after);
+        assert_eq!((d.held[0].1.as_str(), d.cards.clone(), d.tanks[0].3.as_str(), d.tanks[0].4.as_str()), ("3", vec![(1, Some("y".to_string()))], "5", "2"));
+        assert_eq!(d.made_for.as_ref(), Some(&after));
+        // Another hand (a reroll, second review of 1.3.0): no card name carried; the tank's values stay.
+        let mut d = Draft::start(&m);
+        d.cards[1].1 = Some("y".into());
+        d.tanks[0].3 = "5".into();
+        let rerolled = Missing { hand: m.hand + 1, ..after.clone() };
+        let d = d.carried(&rerolled);
+        assert_eq!((d.cards.clone(), d.tanks[0].3.as_str()), (vec![(1, None)], "5"));
+    }
+
+    #[test]
+    fn the_reasons_follow_the_fields() {
+        let statue = instrument_label(19);
+        let m = Missing { held: vec![(Some(6), Some(1)), (Some(19), Some(5)), (Some(10), None)], round: Some(6), ..Missing::default() };
+        let d = Draft::start(&m);
+        let reasons = fill_reasons(&m, &d);
+        assert_eq!(reasons.len(), 1, "{reasons:?}");
+        assert!(!reasons.iter().any(|r| r.contains(&statue)), "{reasons:?}");
+        assert_eq!(held_ready(&d, 6), Some(vec![(6, 1), (19, 5), (10, 5)]));
+        assert!(d.held.iter().all(|(id, r)| slot_need(*id, round_field(r, 6)).is_none()));
+        // The statue's round blank: it is named, its field marked, and the instruments cannot be used yet.
+        let m = Missing { held: vec![(Some(6), Some(1)), (Some(19), None), (Some(10), None)], round: Some(6), ..Missing::default() };
+        let d = Draft::start(&m);
+        let reasons = fill_reasons(&m, &d);
+        assert_eq!(reasons.len(), 2, "{reasons:?}");
+        assert!(reasons[1].starts_with(&statue), "{reasons:?}");
+        assert_eq!(slot_need(Some(19), round_field("", 6)), Some(SlotNeed::Round));
+        assert_eq!(slot_need(Some(10), round_field("", 6)), None);
+        assert_eq!(held_ready(&d, 6), None);
+        // An icon not recognized, a round not of this game: each its line.
+        let m = Missing { held: vec![(None, None), (Some(10), None)], round: Some(6), ..Missing::default() };
+        let mut d = Draft::start(&m);
+        d.held[1].1 = "9".into();
+        let reasons = fill_reasons(&m, &d);
+        assert_eq!(reasons.len(), 3, "{reasons:?}");
+        assert_eq!(slot_need(None, RoundField::Blank), Some(SlotNeed::Instrument));
+        assert_eq!(slot_need(Some(10), round_field("9", 6)), Some(SlotNeed::BadRound));
+        // Cards and tanks: their own lines; none once given.
+        let m = Missing { cards: vec![1], tanks: vec![2], ..Missing::default() };
+        let mut d = Draft::start(&m);
+        assert_eq!(fill_reasons(&m, &d).len(), 4);
+        d.cards[0].1 = Some("x".into());
+        d.tanks[0] = (2, Some(::vorax::Archetype::Pest), Some(Rarity::Normal), "5".into(), "24".into());
+        assert_eq!(fill_reasons(&m, &d).len(), 2);
+    }
+
+    /// A blank round of an instrument that does not act every N rounds is taken from the order: the nearest round on
+    /// its left (1 for the first), but no later than the nearest one given on its right.
+    #[test]
+    fn blank_rounds_are_taken_from_the_order() {
+        assert_eq!(resolve_rounds(&[Some(1), None, Some(5), None]), [1, 1, 5, 5]);
+        assert_eq!(resolve_rounds(&[None, Some(3), None]), [1, 3, 3]);
+        assert_eq!(resolve_rounds(&[None, None]), [1, 1]);
+        // A right bound lower than the left round: the nearest round that keeps the order on its right.
+        assert_eq!(resolve_rounds(&[Some(4), None, Some(2)]), [4, 2, 2]);
+        // Rounds given that go down cannot be used.
+        let d = Draft { held: vec![(Some(6), "4".into()), (Some(10), String::new()), (Some(12), "2".into())], ..Draft::default() };
+        assert_eq!(held_ready(&d, 6), None);
+        let d = Draft { held: vec![(Some(6), String::new()), (Some(10), "3".into()), (Some(12), String::new())], ..Draft::default() };
+        assert_eq!(held_ready(&d, 6), Some(vec![(6, 1), (10, 3), (12, 3)]));
+    }
+
+    /// A slot whose instrument is not what the screen showed there says what it showed (the player, 2026-11-12: to
+    /// match the panel against the game's icons): another instrument, an icon not recognized, or nothing read.
+    #[test]
+    fn a_slot_says_what_the_screen_showed() {
+        assert_eq!(seen_line(Some(19), Some(Some(19))), None);
+        let other = seen_line(Some(6), Some(Some(19))).unwrap();
+        assert!(other.starts_with(zt("畫面上讀到：", "Read on screen: ")) && other.ends_with(&instrument_label(19)), "{other}");
+        assert!(seen_line(Some(6), Some(None)).unwrap().starts_with(zt("畫面上讀到：", "Read on screen: ")));
+        assert_eq!(seen_line(Some(6), None).as_deref(), Some(zt("畫面上這格讀不到", "Nothing read on screen in this slot")));
+        // Drawn under the row in the card.
+        let mut v = preview_view("none");
+        v.missing = Some(Missing { held: vec![(Some(6), Some(1)), (Some(19), None)], seen: vec![None, Some(Some(19))], round: Some(6), ..Missing::default() });
+        let (text, _) = drawn_at(296.0, |ui| {
+            let mut d = Draft::start(v.missing.as_ref().unwrap());
+            let m = v.missing.clone().unwrap();
+            let mut fields = |ui: &mut egui::Ui| {
+                manual_fields(ui, &m, &mut d);
+            };
+            draw_panel_with(&v, ui, false, Some(&mut fields));
+        });
+        assert_eq!(text.matches(zt("畫面上這格讀不到", "Nothing read on screen in this slot")).count(), 1, "{text}");
+        assert!(!text.contains(zt("畫面上讀到：", "Read on screen: ")), "{text}");
+    }
+
+    /// The line on the game follows the card: it shows while the card asks for fields, naming what was not read, and
+    /// goes once the advice comes (the gaps filled in, or read).
+    #[test]
+    fn the_game_line_shows_while_fields_are_asked_for() {
+        let mut v = preview_view("none");
+        assert_eq!(fill_line(&v), None, "unreadable with nothing to fill in");
+        v.missing = Some(Missing { held: vec![(Some(6), Some(1)), (Some(19), None)], round: Some(6), ..Missing::default() });
+        let line = fill_line(&v).expect("the line while the card asks");
+        assert!(line.contains(zt("手術用具", "held instruments")) && !line.contains(zt("卡片", "cards")), "{line}");
+        v.missing = Some(Missing { cards: vec![1], tanks: vec![2], ..Missing::default() });
+        let line = fill_line(&v).unwrap();
+        assert!(line.contains(zt("卡片", "cards")) && line.contains(zt("水箱", "tanks")) && !line.contains(zt("手術用具", "held instruments")), "{line}");
+        // Filled in: the advice comes, the line goes.
+        let advised = View { missing: None, ..preview_view("advice") };
+        assert_eq!(fill_line(&advised), None);
+        // Still unreadable for something that cannot be filled in: no line.
+        let v = View { missing: None, ..preview_view("none") };
+        assert_eq!(fill_line(&v), None);
+    }
+
+    /// While the screen is unreadable with fields to fill in (layout A, 2026-11-12), the fields are drawn in the advice
+    /// card, framed in the warning colour under its title, above the tanks and the ranking; no fill-in block is left
+    /// below. A readable screen draws its card as before and never draws the fields.
+    #[test]
+    fn the_fields_to_fill_in_are_in_the_card() {
+        let mut v = preview_view("none");
+        v.missing = Some(Missing { held: vec![(Some(6), Some(1)), (Some(19), None)], round: Some(6), ..Missing::default() });
+        let (text, strokes) = drawn_at(296.0, |ui| {
+            let mut fields = |ui: &mut egui::Ui| {
+                ui.label("FIELDS");
+            };
+            assert!(draw_panel_with(&v, ui, false, Some(&mut fields)).is_some());
+        });
+        let at = |s: &str| text.find(s).unwrap_or_else(|| panic!("{s} not drawn in\n{text}"));
+        assert!(at(zt("讀不到，需要你補", "Can't read it: fill it in")) < at("FIELDS") && at("FIELDS") < at(tr("Full ranking")), "{text}");
+        assert_eq!(text.matches("FIELDS").count(), 1);
+        assert!(!text.contains(zt("手動補上讀不到的項目", "Fill in what was not read")), "{text}");
+        assert!(strokes.iter().any(|&(w, c)| w >= 1.5 && c == theme::WARN), "{strokes:?}");
+        // The compact panel likewise.
+        let (text, _) = drawn_at(296.0, |ui| {
+            let mut fields = |ui: &mut egui::Ui| {
+                ui.label("FIELDS");
+            };
+            compact_body(&v, ui, false, Some(&mut fields));
+        });
+        assert!(text.contains(zt("讀不到，需要你補", "Can't read it: fill it in")) && text.matches("FIELDS").count() == 1, "{text}");
+        // Readable: the card as before, the fields never drawn.
+        let advised = preview_view("advice");
+        let (text, _) = drawn_at(296.0, |ui| {
+            let mut fields = |_: &mut egui::Ui| panic!("no fields on a readable screen");
+            assert!(draw_panel_with(&advised, ui, false, Some(&mut fields)).is_none());
+        });
+        assert!(!text.contains(zt("讀不到，需要你補", "Can't read it: fill it in")), "{text}");
+    }
+
     /// The compact panel draws the 2026-11-08 layout too (the user saw the old one in a 397x392 window): the six
     /// tanks in a row, each named (an empty one `Empty`), the advised card's two tanks framed in gold (2 wide) and
     /// the rest not, and the ranking's tanks column (from 300 wide); stale advice frames them grey, and with no advice
@@ -2269,7 +3096,7 @@ mod tests {
         assert_eq!(crate::lang::lang(), crate::lang::Lang::En, "the tests run in English");
         let tank = |empty: bool, archetype: ::vorax::Archetype| read::Tank { empty, name: Some("Leech".into()), archetype: Some(archetype), rarity: Some(Rarity::Rare), activity: Some(1200), quantity: Some(3), total: Some(3600), ..read::Tank::default() };
         let tanks = vec![tank(false, ::vorax::Archetype::Pest), tank(false, ::vorax::Archetype::Aemberon), tank(true, ::vorax::Archetype::Pest), tank(false, ::vorax::Archetype::BoneSentry), tank(false, ::vorax::Archetype::Agito), tank(true, ::vorax::Archetype::Pest)];
-        let row = |label: &str, best: bool| AdviceRow { name: String::new(), targets: vec![], label: label.into(), mean: 812_000.0, reached: Some(0.5), refresh: false, best };
+        let row = |label: &str, best: bool| AdviceRow { name: String::new(), targets: vec![], label: label.into(), mean: 812_000.0, raw: 812_000.0, reached: Some(0.5), refresh: false, best };
         let rows = vec![row("Bewitching Tincture \u{2192} Tank 1", true), row("Reroll", false), row("Potion Kit (Large)", false), row("Bone Saw", false)];
         let method = "Potions: each option played to the end; mean is the final Ultimate Activity, capped at 840k.".to_string();
         let advice = crate::vorax::AdviceRows { headline: "Bewitching Tincture \u{2192} Tank 1".into(), note: Some("Something else.".into()), rows, method, unknown: vec![] };

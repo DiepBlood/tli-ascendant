@@ -50,7 +50,7 @@ use super::settings::Settings;
 use super::vorax_learn::Learn;
 use crate::reader::Rgba;
 use crate::vorax::read::{self, Kind, Reading};
-use crate::vorax::{AdviceRows, HeldOverride, What, advice_rows, describe, signature, targets, to_screen};
+use crate::vorax::{AdviceRows, HeldOverride, What, advice_rows, describe, signature, targets, to_screen_in_app};
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
@@ -437,6 +437,43 @@ impl GameSummary {
     }
 }
 
+/// The unreadable parts of a selection screen the panel offers to fill in by hand ([`View::missing`]).
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Missing {
+    /// The held instruments, left to right, when they are what keeps the screen from being solved: the list this game
+    /// tracked when there is one, else the icons read (None for one not recognized), each with its pick round when
+    /// known. Empty when the instruments read are fine.
+    pub held: Vec<(Option<u8>, Option<i32>)>,
+    /// What the screen showed in each slot of `held`: the icons read lined up on the right (they are counted from the
+    /// right), an icon not recognized as Some(None), a slot with no icon read (left of them) as None. The panel writes
+    /// it beside a slot whose instrument differs, for the player to match against the game's icons.
+    pub seen: Vec<Option<Option<u8>>>,
+    /// The round on show: a pick round entered is at most this.
+    pub round: Option<i32>,
+    /// The kind of the screen's cards, for the names offered for an unknown card.
+    pub category: Option<crate::vorax::names::Category>,
+    /// Cards whose name did not read (index from the left).
+    pub cards: Vec<usize>,
+    /// Tanks with an unknown or inconsistent value (index from the left).
+    pub tanks: Vec<usize>,
+    /// The hand it was made for: the count of confirms, rerolls and deals so far ([`VoraxSession::moves`]). The panel
+    /// carries a card name chosen only within the same hand (a reroll deals new cards on the same round and screen).
+    #[serde(skip)]
+    pub hand: u32,
+}
+
+/// Something the player entered on the panel for an unreadable selection screen ([`VoraxSession::enter`]).
+#[derive(Clone, Debug, PartialEq)]
+pub enum Manual {
+    /// The held instruments in pick order with their pick rounds: they stand for the icons for the rest of the game.
+    Held(Vec<(u8, i32)>),
+    /// Card `index`'s name (English, as the name table has it), for this hand.
+    Card(usize, String),
+    /// Tank `index`'s monster for this hand: archetype, rarity, activity and quantity.
+    Tank(usize, ::vorax::Archetype, ::vorax::Rarity, i64, i64),
+}
+
 /// Everything the window needs to display.
 #[derive(Clone, Debug, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -483,6 +520,12 @@ pub struct View {
     pub blocked: Option<String>,
     /// Observe mode note (the log folder's disk has under 5 GB, so only the log is written, no frames); normally None.
     pub learn_note: Option<String>,
+    /// What the player may fill in on the panel while the selection screen is unreadable ([`Missing`]); None when
+    /// nothing unreadable can be filled in.
+    pub missing: Option<Missing>,
+    /// One line on what was entered by hand ([`VoraxSession::enter`]): what it stands for, or that a read differs and
+    /// the read was taken.
+    pub manual_note: Option<String>,
     /// Incremented every time the content changes.
     pub version: u64,
 }
@@ -1104,6 +1147,14 @@ struct Game {
     /// The last final activity read on a board with no pending `+N` after the last round's pick (the fallback when
     /// the result screen is not read); see `final_picked`.
     last_ultimate: Option<i64>,
+    /// The held instruments were entered by hand ([`Manual::Held`], now `held`): logged and noted when a read differs.
+    manual_held: bool,
+    /// Icons read beyond the held instruments entered by hand that still match them ([`manual_held_matches`]): as many
+    /// as the read had more than the list entered, the slots the player removed as not held.
+    manual_extra: usize,
+    /// Cards and tanks entered by hand for one hand ([`Manual::Card`], [`Manual::Tank`]): the round and kind of the
+    /// screen they were entered on, and the entries; another hand's screen drops them.
+    manual_hand: Option<(Option<i32>, Kind, Vec<Manual>)>,
     /// The interface scale measured on this game's frames while the game log has given none ([`VoraxSession::ui`]):
     /// later frames are read at it directly instead of first as at the original setting and then again.
     measured_ui: Option<f64>,
@@ -1540,6 +1591,107 @@ fn battle_line(b: &read::Battle) -> String {
 /// The held instruments that were read (not counting the ones revealed at the start), left to right.
 fn held_ids(r: &Reading) -> Vec<Option<u8>> {
     r.held.iter().filter(|h| !h.opening).map(|h| h.id).collect()
+}
+
+/// The icons read (`now`, left to right) lined up with `slots` slots on the right, as the icons are counted from the
+/// right ([`Missing::seen`]): None for a slot left of every icon read. More icons than slots keep the rightmost.
+fn icons_by_slot(now: &[Option<u8>], slots: usize) -> Vec<Option<Option<u8>>> {
+    let shown = &now[now.len().saturating_sub(slots)..];
+    (0..slots).map(|k| (k + shown.len()).checked_sub(slots).map(|i| shown[i])).collect()
+}
+
+/// Whether the icons read (`now`, left to right) are the instruments tracked this game (`tracked`, in pick order),
+/// allowing for the two ways the icons were seen to fail on 2026-11-11_21-08-23 round 6 (tracked 6, 19, then 10
+/// picked): the leftmost icons unread, and one icon read as another instrument.
+/// - The icons are counted from the right up to the first empty-looking slot, so a missed icon is always one of the
+///   leftmost, the earliest picked: the dark `攣縮指爪` went unseen and the read was [19, 10]. Fewer icons than tracked
+///   stand for the tracked ones on the right.
+/// - The VSR fallback once read `疫區聖母像` as `獸筋絞肉索` ([6, 11, 10]): one slot may read otherwise, unknown or
+///   another instrument.
+///
+/// Slots recorded from the card (`from_card`) ignore their icon, as before. An instrument is never given up during a
+/// game, so a read that is the tracked list with gaps is that list; one that differs more is not taken for it: at
+/// most one slot read otherwise, and at least as many slots read the same as slots missing or read otherwise (so a
+/// lone icon never confirms a list, and two of three icons different is another set).
+fn held_matches(now: &[Option<u8>], tracked: &[(u8, i32)], from_card: &BTreeSet<usize>) -> bool {
+    let Some(missing) = tracked.len().checked_sub(now.len()) else { return false };
+    let (mut same, mut other) = (0, 0);
+    for (i, n) in now.iter().enumerate() {
+        let at = missing + i;
+        if from_card.contains(&at) {
+            continue;
+        }
+        if *n == Some(tracked[at].0) { same += 1 } else { other += 1 }
+    }
+    if missing == 0 && other == 0 {
+        return true;
+    }
+    other <= 1 && same >= 1 && same >= missing + other
+}
+
+/// [`held_matches`] for held instruments entered by hand (`entered`): the player said what is held because the icons
+/// would not read, so the icons are not asked to confirm it, only not to contradict it. An icon not recognized (None)
+/// is no difference, nor is an icon more than entered (a slot the player removed as not held: the entered list is
+/// lined up with the icons read in order, leaving out the extra ones where that contradicts it least). The read is
+/// taken over the entry only when two slots or more read as another known instrument ([`MANUAL_OTHERS`]). Without
+/// this, a lone icon not recognized ([None] against one entered), two of three not recognized, or one slot removed
+/// never matched, and the panel kept saying the read was taken and offered the fields again.
+///
+/// Two bounds keep a list that has fallen behind from standing for good:
+/// - at most `extra` icons more than entered (the slots the player removed, [`Game::manual_extra`]): one more is an
+///   instrument picked since, or one the list left out, and the read is taken (and the fields offered again) rather
+///   than every later solve leaving it out;
+/// - with fewer icons than entered, at least one slot reads as its entered instrument: no icon at all, or none the
+///   same, is no confirmation (a new game not noticed would keep the last one's list); the list entered is kept and
+///   the next read judged again.
+fn manual_held_matches(now: &[Option<u8>], entered: &[(u8, i32)], extra: usize, from_card: &BTreeSet<usize>) -> bool {
+    if now.len() > entered.len() + extra {
+        return false;
+    }
+    if let Some(missing) = entered.len().checked_sub(now.len()).filter(|&m| m > 0)
+        && !now.iter().enumerate().any(|(i, &n)| !from_card.contains(&(missing + i)) && n == Some(entered[missing + i].0))
+    {
+        return false;
+    }
+    other_known(now, entered, from_card) < MANUAL_OTHERS
+}
+
+/// Slots read as another known instrument that make a read differ from the held instruments entered by hand.
+const MANUAL_OTHERS: usize = 2;
+
+/// The fewest slots of `now` read as a known instrument other than the one of `tracked` lined up with them. With no
+/// more icons than tracked they line up on the right, as in [`held_matches`]; with more, `tracked` is lined up with
+/// the icons in order, any extra icons left out (the fewest over every way of leaving them out). Slots recorded from
+/// the card (`from_card`) are not compared.
+fn other_known(now: &[Option<u8>], tracked: &[(u8, i32)], from_card: &BTreeSet<usize>) -> usize {
+    let differs = |n: Option<u8>, at: usize| !from_card.contains(&at) && n.is_some_and(|id| id != tracked[at].0);
+    if let Some(missing) = tracked.len().checked_sub(now.len()) {
+        return now.iter().enumerate().filter(|&(i, &n)| differs(n, missing + i)).count();
+    }
+    // best[j]: the fewest differing slots with the first j tracked lined up with icons read so far
+    let mut best = vec![usize::MAX; tracked.len() + 1];
+    best[0] = 0;
+    for &n in now {
+        for j in (1..=tracked.len()).rev() {
+            if best[j - 1] != usize::MAX {
+                best[j] = best[j].min(best[j - 1] + usize::from(differs(n, j - 1)));
+            }
+        }
+    }
+    best[tracked.len()]
+}
+
+/// The icon of a pending pick ([`PendingPick`], `before` instruments held before it) on a read `now`, once it shows:
+/// the rightmost icon, when there is one more than before, or when the icons left of it are the tracked ones with
+/// the leftmost unread ([`held_matches`]) while the whole read is not (the new icon has not come yet). None while the
+/// pick does not show.
+fn pick_shown(now: &[Option<u8>], before: usize, tracked: &[(u8, i32)], from_card: &BTreeSet<usize>) -> Option<Option<u8>> {
+    if now.len() == before + 1 {
+        return now.last().copied();
+    }
+    let (last, rest) = now.split_last()?;
+    let gap = before == tracked.len() && !rest.is_empty() && now.len() <= before && held_matches(rest, tracked, from_card) && !held_matches(now, tracked, from_card);
+    gap.then_some(*last)
 }
 
 fn hand(r: &Reading) -> Vec<Option<String>> {
@@ -2475,10 +2627,16 @@ impl VoraxSession {
         if cue == Cue::CardClick {
             self.game.click_at = Some(at);
         }
-        // A new deal, a reroll or a confirm: the next hand's names are never carried from this one's.
+        // A new deal, a reroll or a confirm: the next hand's names are never carried from this one's. Nor are the cards
+        // entered by hand ([`Manual::Card`]): a reroll or an opened potion kit deals a new hand on the same round and
+        // screen, which is all an entry was matched on, so a card of the new hand that did not read took the old name.
+        // The tanks entered stay (the tanks do not change with the hand).
         if matches!(cue, Cue::Shuffle | Cue::Dealt | Cue::Synced | Cue::Reroll { .. } | Cue::Confirm | Cue::Picked | Cue::PotionUsed) {
             (self.game.named_hand, self.game.prev_named) = (None, None);
             self.game.hand_from = self.game.hand_from.max(at);
+            if let Some((_, _, entries)) = &mut self.game.manual_hand {
+                entries.retain(|m| !matches!(m, Manual::Card(..)));
+            }
         }
         match cue {
             Cue::Synced => self.synced(at),
@@ -3548,10 +3706,10 @@ impl VoraxSession {
             return;
         }
         let Some(p) = &self.game.pending_pick else { return };
-        // A newly acquired icon is added at the far right.
+        // A newly acquired icon is added at the far right (see `pick_shown`).
         let now = held_ids(r);
-        if now.len() == p.before + 1 {
-            match (now.last(), p.id) {
+        if let Some(icon) = pick_shown(&now, p.before, &self.game.held, &self.game.from_card) {
+            match (Some(&icon), p.id) {
                 // The card and the new icon do not match: the card wins (tonight 39 agreed and 1 disagreed, the wrong one being the VSR fallback recognizing `疫區聖母像`
                 // as `獸筋絞肉索` at 0.97); one entry goes in the log.
                 // Unless the card the tooltip named at confirm is the icon's: two witnesses against a raised flag
@@ -3610,8 +3768,8 @@ impl VoraxSession {
             && let Some(p) = &self.game.pending_pick
         {
             let now = held_ids(r);
-            if now.len() == p.before + 1 {
-                match (now.last(), p.id) {
+            if let Some(icon) = pick_shown(&now, p.before, &tracked, &from_card) {
+                match (Some(&icon), p.id) {
                     // The same rule as when it becomes steady: the icon when the hovered card agrees with it.
                     (Some(Some(icon)), Some(card)) if *icon != card && p.hovered != Some(*icon) => {
                         from_card.insert(tracked.len());
@@ -3632,12 +3790,16 @@ impl VoraxSession {
     }
 
     fn screen_state_with(&self, r: &Reading, tracked: &[(u8, i32)], from_card: &BTreeSet<usize>) -> Result<(ScreenState, bool), Vec<String>> {
+        // The cards and tanks entered by hand for this hand fill what the read left unknown.
+        let filled = self.with_manual(r);
+        let r = &filled;
         let now = held_ids(r);
         // When only part is known, none of it is given (ScreenState::instruments in advisor.rs). The slots recorded from the card
-        // ignore the icons (unrecognized, or when they do not match the card the card wins); other slots must be recognized and identical.
-        let known = now.len() == tracked.len() && now.iter().zip(tracked).enumerate().all(|(i, (n, (id, _)))| *n == Some(*id) || from_card.contains(&i));
+        // ignore the icons (unrecognized, or when they do not match the card the card wins); the other slots must be the tracked
+        // ones, the leftmost unread or one read otherwise allowed (`held_matches`).
+        let known = self.held_known(&now, tracked, from_card);
         let held: Option<HeldOverride> = known.then(|| tracked.iter().map(|&(id, round)| (id, Some(round))).collect());
-        let mut x = to_screen(r, held.as_ref())?;
+        let mut x = to_screen_in_app(r, held.as_ref())?;
         // The reroll count that is off screen: the one seen last, or the opening count if it was never seen.
         match x.phase {
             ScreenPhase::Potion => x.instrument_refreshes = Some(self.game.instrument_rerolls.unwrap_or_else(|| self.opening_instrument_rerolls())),
@@ -3649,6 +3811,7 @@ impl VoraxSession {
 
     /// A steady selection screen: show the advice if there is some, otherwise solve.
     fn choice(&mut self, at: i64) {
+        self.view.manual_note = self.stable.as_ref().and_then(|st| self.manual_note_for(&st.reading));
         let Some(st) = &self.stable else { return };
         let sig = st.sig.clone();
         if self.advised.as_ref().is_some_and(|a| a.sig == sig) {
@@ -3685,10 +3848,14 @@ impl VoraxSession {
             Err(_) if self.same_hand(&reading) => self.show_advice(),
             Err(why) => {
                 self.keep_stale(&reading);
-                let mut lines = vec![t("讀不到：", "Unreadable:").to_string()];
-                lines.extend(why.into_iter().take(WHY_SHOWN));
+                // The first reason goes on the card's line with `讀不到：` (Unreadable:), the rest below it: the card alone
+                // said `讀不到：` with nothing after it, the reasons cut off in the two lines under it.
+                let mut why = why.into_iter();
+                let mut lines = vec![format!("{}{}", t("讀不到：", "Unreadable: "), why.next().unwrap_or_default())];
+                lines.extend(why.take(WHY_SHOWN - 1));
                 lines.push(t("盤面有讀不到的地方，不用猜的盤面去解。", "Part of the board is unreadable: a guessed board is not solved.").into());
                 self.set_status(Status::Unreadable, lines);
+                self.view.missing = self.missing(&reading);
             }
             Ok((x, rounds_known)) => {
                 self.keep_stale(&reading);
@@ -3851,6 +4018,168 @@ impl VoraxSession {
 
     fn set_status(&mut self, status: Status, lines: Vec<String>) {
         (self.view.status, self.view.lines) = (status, lines);
+        // Only an unreadable selection screen offers its gaps to fill in (see `choice`, which sets them after this).
+        if status != Status::Unreadable {
+            self.view.missing = None;
+        }
+    }
+
+    /// The gaps of unreadable selection screen `r` the panel offers to fill in ([`Missing`]): the held instruments
+    /// when their icons are not the tracked list ([`held_matches`]) and one is unknown or acts every N rounds (its pick
+    /// round is needed), the cards whose name did not read, the tanks with a value unknown. None when there is none.
+    fn missing(&self, r: &Reading) -> Option<Missing> {
+        let filled = self.with_manual(r);
+        let now = held_ids(&filled);
+        let periodic = |id: &u8| vorax::data().instrument(*id).is_some_and(|d| matches!(d.timing, vorax::data::Timing::Periodic(_)));
+        let tracked = &self.game.held;
+        let held_gap = !self.held_known(&now, tracked, &self.game.from_card) && (now.iter().any(Option::is_none) || now.iter().flatten().any(periodic) || tracked.iter().any(|(id, _)| periodic(id)));
+        let held = if !held_gap {
+            Vec::new()
+        } else if !tracked.is_empty() && tracked.len() >= now.len() {
+            // The pick confirmed and not in the list yet goes on the right: offering the list without it, the player
+            // pressing solve left it out of the instruments for the rest of the game.
+            let pending = self.game.pending_pick.as_ref().filter(|p| p.before == tracked.len()).map(|p| (p.id.or(p.hovered), Some(p.round)));
+            tracked.iter().map(|&(id, round)| (Some(id), Some(round))).chain(pending).collect()
+        } else {
+            // The icons read, each with the round this game tracked for it when it is known: a tracked instrument by its
+            // id (the first not yet given), and the pending pick's for the rightmost icon (the one it put there). No
+            // round is guessed for the leftmost icon read: the icons left of it may be the ones unread.
+            let mut left: Vec<(u8, i32)> = tracked.clone();
+            let pending = self.game.pending_pick.as_ref().map(|p| (p.id.or(p.hovered), p.round));
+            let last = now.len().saturating_sub(1);
+            now.iter()
+                .enumerate()
+                .map(|(k, &id)| {
+                    let tracked_round = id.and_then(|id| left.iter().position(|&(t, _)| t == id)).map(|i| left.remove(i).1);
+                    let picked = pending.filter(|&(pid, _)| k == last && (pid.is_none() || pid == id)).map(|(_, round)| round);
+                    (id, tracked_round.or(picked))
+                })
+                .collect()
+        };
+        let cards: Vec<usize> = if filled.kind == Kind::Protocol { Vec::new() } else { filled.cards.iter().enumerate().filter(|(_, c)| c.en.is_none()).map(|(i, _)| i).collect() };
+        let tanks: Vec<usize> = filled.tanks.iter().enumerate().filter(|(_, t)| !t.known() || (!t.empty && (t.activity.is_none() || t.quantity.is_none()))).map(|(i, _)| i).collect();
+        let category = filled.cards.first().map(|c| c.category);
+        let seen = icons_by_slot(&now, held.len());
+        (!held.is_empty() || !cards.is_empty() || !tanks.is_empty()).then_some(Missing { held, seen, round: r.round, category, cards, tanks, hand: self.moves })
+    }
+
+    /// `r` with this hand's cards and tanks entered by hand ([`Manual::Card`], [`Manual::Tank`]) where the read has
+    /// none: an entry stands only on the screen it was entered on (same round and kind), and a name or a value read
+    /// is kept over it (`manual_note` says so).
+    fn with_manual(&self, r: &Reading) -> Reading {
+        let mut out = r.clone();
+        let Some((round, kind, entries)) = &self.game.manual_hand else { return out };
+        if (*round, *kind) != (r.round, r.kind) {
+            return out;
+        }
+        for m in entries {
+            match m {
+                Manual::Card(i, en) => {
+                    if let Some(c) = out.cards.get_mut(*i).filter(|c| c.en.is_none())
+                        && let Some((k, n)) = crate::vorax::names::names().cards.iter().enumerate().find(|(_, n)| n.category == c.category && n.en == *en)
+                    {
+                        (c.index, c.id, c.en, c.zh) = (Some(k), n.id, Some(n.en.clone()), n.zh.clone());
+                    }
+                }
+                &Manual::Tank(i, archetype, rarity, activity, quantity) => {
+                    if let Some(t) = out.tanks.get_mut(i).filter(|t| !t.known() || t.activity.is_none() || t.quantity.is_none()) {
+                        (t.empty, t.archetype, t.rarity) = (false, Some(archetype), Some(rarity));
+                        (t.activity, t.quantity, t.total) = (Some(activity), Some(quantity), Some(activity * quantity));
+                    }
+                }
+                Manual::Held(_) => {}
+            }
+        }
+        out
+    }
+
+    /// Test only (offline screenshots of the panel): the held instruments this game tracked so far, as picks seen
+    /// earlier in the game would have left them; the screen on show is judged again.
+    #[doc(hidden)]
+    pub fn preview_track(&mut self, held: Vec<(u8, i32)>, at: i64) {
+        self.game.held = held;
+        self.advised = None;
+        self.choice(at);
+        self.bump();
+    }
+
+    /// What the player entered on the panel for the unreadable screen on show ([`Manual`]): the held instruments stand
+    /// for the icons for the rest of this game (a new game drops them), a card or tank for this hand only. Logged as a
+    /// `vorax_manual` row, then the screen is solved again.
+    pub fn enter(&mut self, m: Manual, at: i64) {
+        let Some(st) = &self.stable else { return };
+        let r = st.reading.clone();
+        let read = held_ids(&r);
+        match &m {
+            Manual::Held(list) => {
+                // No more than the game's slots ([`crate::vorax::HELD_SLOTS`]; the panel stops there): the rightmost,
+                // the latest picks.
+                let list = &list[list.len().saturating_sub(crate::vorax::HELD_SLOTS)..];
+                self.log_event("vorax_manual", at, json!({ "what": "held", "held": list, "read": read, "tracked": self.game.held, "round": r.round }));
+                // A pick confirmed but not in the list yet stays pending when the list entered has no more instruments
+                // than were held before it (it does not include the pick): it goes in once its icon shows, as without
+                // an entry. A longer list includes it.
+                let pending = self.game.pending_pick.take().filter(|p| list.len() <= p.before).map(|p| PendingPick { before: list.len(), ..p });
+                (self.game.held, self.game.manual_held, self.game.pending_pick) = (list.to_vec(), true, pending);
+                self.game.manual_extra = read.len().saturating_sub(list.len());
+                self.game.from_card.clear();
+            }
+            Manual::Card(i, en) => {
+                self.log_event("vorax_manual", at, json!({ "what": "card", "index": i, "card": en, "read": r.cards.get(*i).map(|c| &c.raw_name), "round": r.round, "screen": r.kind }));
+                self.note_hand(&r, m.clone());
+            }
+            &Manual::Tank(i, archetype, rarity, activity, quantity) => {
+                let read_tank = r.tanks.get(i).map(|t| json!({ "archetype": t.archetype, "rarity": t.rarity, "activity": t.activity, "quantity": t.quantity, "rawTotal": t.raw_total, "rawValues": t.raw_values }));
+                self.log_event("vorax_manual", at, json!({ "what": "tank", "index": i, "archetype": archetype, "rarity": rarity, "activity": activity, "quantity": quantity, "read": read_tank, "round": r.round, "screen": r.kind }));
+                self.note_hand(&r, m.clone());
+            }
+        }
+        self.advised = None;
+        self.choice(at);
+        self.bump();
+    }
+
+    /// [`View::manual_note`] on reading `r`: that a read differs from what was entered ([`VoraxSession::manual_differs`]),
+    /// else that what was entered stands for the read (the held instruments entered, or a card or tank of this hand).
+    fn manual_note_for(&self, r: &Reading) -> Option<String> {
+        if let Some(differs) = self.manual_differs(r) {
+            return Some(differs);
+        }
+        let hand = self.game.manual_hand.as_ref().is_some_and(|(round, kind, entries)| (*round, *kind) == (r.round, r.kind) && !entries.is_empty());
+        (self.game.manual_held || hand).then(|| t("用了你手填的內容。", "Using what you entered.").into())
+    }
+
+    /// Whether the icons read (`now`) are the held instruments `tracked`: [`manual_held_matches`] once the player
+    /// entered them by hand this game, [`held_matches`] otherwise.
+    fn held_known(&self, now: &[Option<u8>], tracked: &[(u8, i32)], from_card: &BTreeSet<usize>) -> bool {
+        if self.game.manual_held { manual_held_matches(now, tracked, self.game.manual_extra, from_card) } else { held_matches(now, tracked, from_card) }
+    }
+
+    /// Keeps a card or tank entered for the hand of `r`, replacing an earlier entry for the same card or tank.
+    fn note_hand(&mut self, r: &Reading, m: Manual) {
+        let same = |a: &Manual, b: &Manual| matches!((a, b), (Manual::Card(i, _), Manual::Card(j, _)) | (Manual::Tank(i, ..), Manual::Tank(j, ..)) if i == j);
+        let hand = self.game.manual_hand.get_or_insert_with(|| (r.round, r.kind, Vec::new()));
+        if (hand.0, hand.1) != (r.round, r.kind) {
+            *hand = (r.round, r.kind, Vec::new());
+        }
+        hand.2.retain(|e| !same(e, &m));
+        hand.2.push(m);
+    }
+
+    /// The line of [`View::manual_note`] for reading `r`: what was entered by hand that a read now differs from, the
+    /// read being taken (held instruments that are not the icons read, a card or tank of this hand read otherwise).
+    fn manual_differs(&self, r: &Reading) -> Option<String> {
+        let held = self.game.manual_held && !manual_held_matches(&held_ids(r), &self.game.held, self.game.manual_extra, &self.game.from_card);
+        let hand = self.game.manual_hand.as_ref().filter(|(round, kind, _)| (*round, *kind) == (r.round, r.kind)).is_some_and(|(_, _, entries)| {
+            entries.iter().any(|m| match m {
+                Manual::Card(i, en) => r.cards.get(*i).and_then(|c| c.en.as_ref()).is_some_and(|read| read != en),
+                &Manual::Tank(i, archetype, rarity, activity, quantity) => r.tanks.get(i).is_some_and(|t| {
+                    t.known() && t.activity.is_some() && (t.archetype, t.rarity, t.activity, t.quantity) != (Some(archetype), Some(rarity), Some(activity), Some(quantity))
+                }),
+                Manual::Held(_) => false,
+            })
+        });
+        (held || hand).then(|| t("讀到的和手填的不同：以讀到的為準。", "What was read differs from what you entered: the read is taken.").into())
     }
 
     fn bump(&mut self) {
@@ -5427,6 +5756,348 @@ mod tests {
         }
     }
 
+    /// 2026-11-11_21-08-23 round 6: `攣縮指爪` (6, round 1) and `疫區聖母像` (19, round 5) tracked, `蛻生腦皮層` (10) picked, and
+    /// the dark claw's icon, leftmost, unread from then on ([19, 10]); once the icons read [6, 11, 10]. The pick is taken
+    /// in, early and steady, and the screens after it are solved on the tracked list, the statue at round 5.
+    #[test]
+    fn the_tracked_list_stands_for_icons_read_with_gaps() {
+        let known = |id: u8| read::Held { id: Some(id), en: None, zh: None, opening: false, score: 1.0 };
+        let with = |held: Vec<read::Held>| Reading { round: Some(6), held, ..potion_board(false, Some(600), 12) };
+        let names = |ids: &[u8]| ids.iter().map(|&id| vorax::data().instrument(id).unwrap().name.clone()).collect::<Vec<_>>();
+        let mut s = session();
+        s.game.held = vec![(6, 1), (19, 5)];
+        let pick = || Some(PendingPick { before: 2, round: 6, card: Value::Null, id: Some(10), hovered: None });
+        s.game.pending_pick = pick();
+        // The new icon not there yet: the old ones, whole or with the claw unread, are no pick.
+        for before in [vec![known(6), known(19)], vec![known(19)]] {
+            let mut t = session();
+            (t.game.held, t.game.pending_pick) = (s.game.held.clone(), pick());
+            t.check_pick(&with(before.clone()), 1_000);
+            assert!(t.game.pending_pick.is_some() && t.game.held.len() == 2, "{before:?}");
+        }
+        let gap = with(vec![known(19), known(10)]);
+        let (x, known_rounds) = s.screen_state_ahead(&gap).unwrap();
+        assert_eq!((x.instruments.clone(), x.instrument_rounds.clone(), known_rounds), (names(&[6, 19, 10]), Some(vec![1, 5, 6]), true));
+        s.check_pick(&gap, 1_000);
+        assert_eq!((s.game.held.clone(), s.game.pending_pick.is_none()), (vec![(6, 1), (19, 5), (10, 6)], true));
+        for read in [vec![known(19), known(10)], vec![known(10)], vec![known(6), known(11), known(10)], vec![known(6), known(19), known(10)]] {
+            let ok = !matches!(read.as_slice(), [_]);
+            match s.screen_state(&with(read.clone())) {
+                Ok((x, true)) => {
+                    assert!(ok, "{read:?}");
+                    assert_eq!((x.instruments, x.instrument_rounds), (names(&[6, 19, 10]), Some(vec![1, 5, 6])), "{read:?}");
+                }
+                // A lone icon does not stand for three: it is solved as read, not on the tracked list.
+                other => assert!(!ok && other.as_ref().map_or(true, |(_, k)| !k), "{read:?}: {other:?}"),
+            }
+        }
+    }
+
+    /// The tracked list stands only for a read that is it with gaps: another set of instruments (a new game the session
+    /// missed, or a read of other icons) is not taken for it, nor is a new pick found in it.
+    #[test]
+    fn other_instruments_are_not_taken_for_the_tracked_ones() {
+        let tracked = [(6, 1), (19, 5), (10, 6)];
+        let none = BTreeSet::new();
+        for read in [vec![Some(12), Some(13)], vec![Some(6), Some(12), Some(13)], vec![Some(13)], vec![Some(6), Some(19), Some(10), Some(12)], vec![None, None, Some(10)], vec![Some(19), Some(13)], vec![]] {
+            assert!(!held_matches(&read, &tracked, &none), "{read:?}");
+        }
+        for read in [vec![Some(6), Some(19), Some(10)], vec![Some(19), Some(10)], vec![Some(6), None, Some(10)], vec![Some(6), Some(11), Some(10)]] {
+            assert!(held_matches(&read, &tracked, &none), "{read:?}");
+        }
+        // A pick after [6, 19]: another set read is no pick, nor is the old list read whole or with gaps.
+        let before = [(6, 1), (19, 5)];
+        for read in [vec![Some(12), Some(13)], vec![Some(6), Some(19)], vec![Some(19)], vec![Some(6), Some(11)]] {
+            assert_eq!(pick_shown(&read, 2, &before, &none), None, "{read:?}");
+        }
+        assert_eq!(pick_shown(&[Some(19), Some(10)], 2, &before, &none), Some(Some(10)));
+        assert_eq!(pick_shown(&[Some(6), Some(19), Some(10)], 2, &before, &none), Some(Some(10)));
+        // On screen: the read set solves as read, not as the tracked list with its rounds.
+        let mut s = session();
+        s.game.held = tracked.to_vec();
+        let known = |id: u8| read::Held { id: Some(id), en: None, zh: None, opening: false, score: 1.0 };
+        let r = Reading { round: Some(6), held: vec![known(12), known(13)], ..potion_board(false, Some(600), 12) };
+        let names: Vec<String> = tracked.iter().map(|&(id, _)| vorax::data().instrument(id).unwrap().name.clone()).collect();
+        let out = s.screen_state(&r);
+        assert!(out.as_ref().map_or(true, |(x, known)| !known && x.instruments != names), "{out:?}");
+    }
+
+    /// The Ascendant window speaks of the icons at the top right; the command line keeps its `--instruments` hints.
+    #[test]
+    fn the_window_gives_no_command_line_hints() {
+        let known = |id: u8| read::Held { id: Some(id), en: None, zh: None, opening: false, score: 1.0 };
+        let unknown = || read::Held { id: None, en: None, zh: None, opening: false, score: 0.4 };
+        for held in [vec![known(19)], vec![unknown()]] {
+            let r = Reading { round: Some(6), held, ..potion_board(false, Some(600), 12) };
+            let app = crate::vorax::to_screen_in_app(&r, None).unwrap_err();
+            let cli = crate::vorax::to_screen(&r, None).unwrap_err();
+            assert!(!app.iter().any(|w| w.contains("--instruments")) && cli.iter().any(|w| w.contains("--instruments")), "{app:?} / {cli:?}");
+        }
+    }
+
+    /// The held instruments entered on the panel stand for the icons (the player asked for it, 2026-11-12): an
+    /// unreadable screen offers its held instruments, the list entered gets advice with its rounds, a later read of
+    /// other instruments is taken over it with a line saying so, and a new game drops it. Each entry is a
+    /// `vorax_manual` row.
+    #[test]
+    fn instruments_entered_by_hand_give_advice() {
+        let known = |id: u8| read::Held { id: Some(id), en: None, zh: None, opening: false, score: 1.0 };
+        let board = |held: Vec<read::Held>| Reading { round: Some(6), held, ..potion_board(false, Some(600), 12) };
+        let (mut s, root) = logged("manual-held");
+        feed(&mut s, board(vec![known(19), known(10)]), 2_000);
+        feed(&mut s, board(vec![known(19), known(10)]), 2_060);
+        assert_eq!(s.view().status, Status::Unreadable, "{:?}", s.view().lines);
+        let m = s.view().missing.clone().expect("the held instruments are offered");
+        assert_eq!((m.held, m.round), (vec![(Some(19), None), (Some(10), None)], Some(6)));
+        s.enter(Manual::Held(vec![(6, 1), (19, 5), (10, 6)]), 2_100);
+        assert!(s.view().advice.is_some() && s.view().missing.is_none(), "{:?}", s.view().lines);
+        assert_eq!(s.view().manual_note.as_deref(), Some(t("用了你手填的內容。", "Using what you entered.")));
+        let (x, known_rounds) = s.screen_state(&board(vec![known(19), known(10)])).unwrap();
+        assert_eq!((x.instrument_rounds, known_rounds), (Some(vec![1, 5, 6]), true));
+        // Another set read: the read is taken, and the line says so.
+        feed(&mut s, board(vec![known(12), known(13)]), 3_000);
+        feed(&mut s, board(vec![known(12), known(13)]), 3_060);
+        assert_eq!(s.view().manual_note.as_deref(), Some(t("讀到的和手填的不同：以讀到的為準。", "What was read differs from what you entered: the read is taken.")));
+        if let Ok((x, known_rounds)) = s.screen_state(&board(vec![known(12), known(13)])) {
+            let read: Vec<String> = [12, 13].iter().map(|&id| vorax::data().instrument(id).unwrap().name.clone()).collect();
+            assert!(!known_rounds && x.instruments == read);
+        }
+        s.log().unwrap().wait();
+        let text = std::fs::read_to_string(s.log().unwrap().dir().join("log.jsonl")).unwrap();
+        let rows: Vec<Value> = text.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+        let row = rows.iter().find(|r| r["kind"] == "vorax_manual").expect("a vorax_manual row");
+        assert_eq!((&row["what"], &row["held"], &row["read"]), (&json!("held"), &json!([[6, 1], [19, 5], [10, 6]]), &json!([19, 10])));
+        // A new game drops what was entered.
+        s.reset();
+        assert!(s.game.held.is_empty() && !s.game.manual_held && s.game.manual_hand.is_none() && s.view().manual_note.is_none());
+        drop(s);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Held instruments entered by hand stand for icons that do not contradict them (review of 1.3.0): a lone icon not
+    /// recognized, two of three not recognized, and a slot the player removed (more icons than entered) all match, and
+    /// on screen the list entered is solved with no "read differs" line and no fields offered again. Two slots read as
+    /// other known instruments still take the read. The tracked list (not entered) keeps its stricter rule.
+    #[test]
+    fn held_instruments_entered_by_hand_stand_for_unclear_icons() {
+        let none = BTreeSet::new();
+        assert!(manual_held_matches(&[None], &[(6, 1)], 0, &none));
+        assert!(manual_held_matches(&[None, None, Some(10)], &[(6, 1), (19, 5), (10, 6)], 0, &none));
+        assert!(manual_held_matches(&[Some(6), Some(12), Some(19), Some(10)], &[(6, 1), (19, 5), (10, 6)], 1, &none));
+        assert!(manual_held_matches(&[Some(12), Some(6), Some(19), Some(10)], &[(6, 1), (19, 5), (10, 6)], 1, &none));
+        assert!(manual_held_matches(&[Some(6), Some(11), Some(10)], &[(6, 1), (19, 5), (10, 6)], 0, &none));
+        assert!(!held_matches(&[None], &[(6, 1)], &none) && !held_matches(&[None, None, Some(10)], &[(6, 1), (19, 5), (10, 6)], &none));
+        // Two slots another known instrument: another set.
+        assert!(!manual_held_matches(&[Some(12), Some(13), Some(10)], &[(6, 1), (19, 5), (10, 6)], 0, &none));
+        assert!(!manual_held_matches(&[Some(12), Some(13)], &[(6, 1), (19, 5), (10, 6)], 0, &none));
+        assert!(!manual_held_matches(&[Some(6), Some(12), Some(13), Some(14)], &[(6, 1), (19, 5), (10, 6)], 1, &none));
+        // On screen, each of the three: solved on the list entered, nothing offered, no "read differs" line.
+        let known = |id: u8| read::Held { id: Some(id), en: None, zh: None, opening: false, score: 1.0 };
+        let unknown = || read::Held { id: None, en: None, zh: None, opening: false, score: 0.4 };
+        let board = |held: Vec<read::Held>| Reading { round: Some(6), held, ..potion_board(false, Some(600), 12) };
+        let entered = |list: Vec<(u8, i32)>, read: Vec<read::Held>| {
+            let mut s = session();
+            s.game.manual_extra = read.len().saturating_sub(list.len());
+            (s.game.held, s.game.manual_held) = (list, true);
+            let r = board(read);
+            let known_rounds = s.screen_state(&r).is_ok_and(|(_, k)| k);
+            (known_rounds, s.missing(&r).is_none(), s.manual_differs(&r).is_none())
+        };
+        assert_eq!(entered(vec![(6, 1)], vec![unknown()]), (true, true, true));
+        assert_eq!(entered(vec![(6, 1), (19, 5), (10, 6)], vec![unknown(), unknown(), known(10)]), (true, true, true));
+        assert_eq!(entered(vec![(6, 1), (19, 5), (10, 6)], vec![known(6), known(12), known(19), known(10)]), (true, true, true));
+        // Another known set read: the read is taken and the line says so.
+        let (taken, _, same) = entered(vec![(6, 1), (19, 5), (10, 6)], vec![known(12), known(13), known(10)]);
+        assert!(!taken && !same);
+    }
+
+    /// A list entered by hand that leaves out a pick does not stand for it for the rest of the game (second review of
+    /// 1.3.0). Tracked [6, 19] with 10 just picked and not in the list, [None, 10] read: the panel offers [6, 19, 10];
+    /// entered as [6, 19] anyway, the pick stays pending and goes in when [6, 19, 10] reads. And with the pick gone, an
+    /// icon more than entered is the read, not a slot the player removed. A slot the player did remove still matches,
+    /// one more does not.
+    #[test]
+    fn an_entry_that_leaves_a_pick_out_does_not_stand() {
+        let known = |id: u8| read::Held { id: Some(id), en: None, zh: None, opening: false, score: 1.0 };
+        let unknown = || read::Held { id: None, en: None, zh: None, opening: false, score: 0.4 };
+        let board = |held: Vec<read::Held>| Reading { round: Some(6), held, ..potion_board(false, Some(600), 12) };
+        let pick = || Some(PendingPick { before: 2, round: 6, card: Value::Null, id: Some(10), hovered: None });
+        let start = || {
+            let mut s = session();
+            s.note_cue(Cue::Page(Page::Main, PageState::Run), Some(1_000));
+            (s.game.held, s.game.pending_pick) = (vec![(6, 1), (19, 5)], pick());
+            s
+        };
+        let s = start();
+        let m = s.missing(&board(vec![unknown(), known(10)])).expect("offered");
+        assert_eq!(m.held, vec![(Some(6), Some(1)), (Some(19), Some(5)), (Some(10), Some(6))]);
+        // Entered as [6, 19]: the pick stays pending and goes in when its icon shows.
+        let mut s = start();
+        let r = board(vec![unknown(), known(10)]);
+        feed(&mut s, r.clone(), 2_000);
+        feed(&mut s, r, 2_060);
+        s.enter(Manual::Held(vec![(6, 1), (19, 5)]), 2_100);
+        assert!(s.game.manual_held && s.game.held == vec![(6, 1), (19, 5)]);
+        assert!(s.game.pending_pick.as_ref().is_some_and(|p| p.before == 2) && s.game.manual_extra == 0);
+        let full = board(vec![known(6), known(19), known(10)]);
+        feed(&mut s, full.clone(), 3_000);
+        feed(&mut s, full.clone(), 3_060);
+        assert_eq!(s.game.held, vec![(6, 1), (19, 5), (10, 6)]);
+        assert!(s.screen_state(&full).is_ok_and(|(_, known)| known));
+        // The pick lost (no pending pick): the third icon is not taken for a removed slot.
+        let mut s = start();
+        (s.game.pending_pick, s.game.manual_held, s.game.manual_extra) = (None, true, 0);
+        assert!(!s.held_known(&[Some(6), Some(19), Some(10)], &[(6, 1), (19, 5)], &BTreeSet::new()));
+        assert!(s.manual_differs(&full).is_some());
+        // A slot the player removed (four icons read, three entered): that one more matches, two more do not.
+        let none = BTreeSet::new();
+        assert!(manual_held_matches(&[Some(6), Some(12), Some(19), Some(10)], &[(6, 1), (19, 5), (10, 6)], 1, &none));
+        assert!(!manual_held_matches(&[Some(6), Some(12), Some(13), Some(19), Some(10)], &[(6, 1), (19, 5), (10, 6)], 1, &none));
+        let mut s = start();
+        let four = board(vec![known(6), known(12), known(19), known(10)]);
+        s.game.pending_pick = None;
+        feed(&mut s, four.clone(), 2_000);
+        feed(&mut s, four.clone(), 2_060);
+        s.enter(Manual::Held(vec![(6, 1), (19, 5), (10, 6)]), 2_100);
+        assert_eq!(s.game.manual_extra, 1);
+        assert!(s.screen_state(&four).is_ok_and(|(_, known)| known) && s.manual_differs(&four).is_none());
+    }
+
+    /// A list entered is at most the game's 4 slots (review of 1.3.0, the player asked): a longer one keeps its
+    /// rightmost, the latest picks.
+    #[test]
+    fn no_more_held_instruments_than_slots_are_entered() {
+        let board = |held: Vec<read::Held>| Reading { round: Some(6), held, ..potion_board(false, Some(600), 12) };
+        let unknown = || read::Held { id: None, en: None, zh: None, opening: false, score: 0.4 };
+        let mut s = session();
+        s.note_cue(Cue::Page(Page::Main, PageState::Run), Some(1_000));
+        feed(&mut s, board(vec![unknown(), unknown()]), 2_000);
+        feed(&mut s, board(vec![unknown(), unknown()]), 2_060);
+        s.enter(Manual::Held(vec![(2, 1), (6, 2), (19, 3), (10, 4), (12, 5)]), 2_100);
+        assert_eq!(crate::vorax::HELD_SLOTS, 4);
+        assert_eq!(s.game.held, vec![(6, 2), (19, 3), (10, 4), (12, 5)]);
+    }
+
+    /// With fewer icons than entered, one at least must read as its entered instrument (second review of 1.3.0): no
+    /// icon at all is no confirmation (a new game not noticed), yet the list entered is kept for the next read.
+    #[test]
+    fn no_icon_read_does_not_confirm_an_entry() {
+        let none = BTreeSet::new();
+        let list = [(6, 1), (19, 5), (10, 6)];
+        assert!(!manual_held_matches(&[], &list, 0, &none));
+        assert!(!manual_held_matches(&[None], &list, 0, &none));
+        assert!(!manual_held_matches(&[Some(12)], &list, 0, &none));
+        assert!(manual_held_matches(&[Some(10)], &list, 0, &none));
+        assert!(manual_held_matches(&[None, Some(10)], &list, 0, &none));
+        let board = |held: Vec<read::Held>| Reading { round: Some(6), held, ..potion_board(false, Some(600), 12) };
+        let mut s = session();
+        s.note_cue(Cue::Page(Page::Main, PageState::Run), Some(1_000));
+        (s.game.held, s.game.manual_held) = (list.to_vec(), true);
+        feed(&mut s, board(vec![]), 2_000);
+        feed(&mut s, board(vec![]), 2_060);
+        assert!(!s.held_known(&[], &list, &none));
+        assert!(s.stable.is_some());
+        assert_eq!((s.game.held.clone(), s.game.manual_held), (list.to_vec(), true));
+    }
+
+    /// A card entered by hand names a card of its hand only: after a reroll (or a new deal) on the same round and
+    /// screen, a card of the new hand that does not read is not given the old name; a tank entered stays.
+    #[test]
+    fn a_card_entered_by_hand_is_dropped_on_a_reroll() {
+        let full = potion_board(false, Some(600), 12);
+        let card = full.cards[0].en.clone().unwrap();
+        let tank = full.tanks.iter().position(|t| !t.empty).unwrap();
+        let t0 = full.tanks[tank].clone();
+        let mut gap = full.clone();
+        (gap.cards[0].en, gap.cards[0].id, gap.cards[0].index, gap.cards[0].zh) = (None, None, None, None);
+        let mut s = session();
+        s.note_hand(&gap, Manual::Card(0, card.clone()));
+        s.note_hand(&gap, Manual::Tank(tank, t0.archetype.unwrap(), t0.rarity.unwrap(), t0.activity.unwrap(), t0.quantity.unwrap()));
+        assert_eq!(s.with_manual(&gap).cards[0].en.as_deref(), Some(card.as_str()));
+        for cue in [Cue::Reroll { instrument: false }, Cue::Dealt] {
+            let mut s2 = session();
+            s2.game.manual_hand = s.game.manual_hand.clone();
+            s2.board_cue(cue, 2_500);
+            let mut tank_gap = gap.clone();
+            tank_gap.tanks[tank].activity = None;
+            let filled = s2.with_manual(&tank_gap);
+            assert_eq!(filled.cards[0].en, None, "{cue:?}");
+            assert_eq!(filled.tanks[tank].activity, t0.activity, "{cue:?}");
+        }
+    }
+
+    /// A card or tank entered by hand fills what the read left unknown, on that hand only, and a value read is kept
+    /// over it.
+    #[test]
+    fn a_card_or_tank_entered_by_hand_fills_this_hand_only() {
+        let full = potion_board(false, Some(600), 12);
+        let card = full.cards[0].en.clone().unwrap();
+        let tank = full.tanks.iter().position(|t| !t.empty).unwrap();
+        let t0 = full.tanks[tank].clone();
+        let mut gap = full.clone();
+        (gap.cards[0].en, gap.cards[0].id, gap.cards[0].index, gap.cards[0].zh) = (None, None, None, None);
+        gap.tanks[tank].activity = None;
+        let (mut s, root) = logged("manual-hand");
+        feed(&mut s, gap.clone(), 2_000);
+        feed(&mut s, gap.clone(), 2_060);
+        assert_eq!(s.view().status, Status::Unreadable, "{:?}", s.view().lines);
+        let m = s.view().missing.clone().unwrap();
+        assert_eq!((m.cards, m.tanks, m.held), (vec![0], vec![tank], vec![]));
+        s.enter(Manual::Card(0, card.clone()), 2_100);
+        assert_eq!(s.view().status, Status::Unreadable);
+        s.enter(Manual::Tank(tank, t0.archetype.unwrap(), t0.rarity.unwrap(), t0.activity.unwrap(), t0.quantity.unwrap()), 2_200);
+        assert!(s.view().advice.is_some(), "{:?}", s.view().lines);
+        // Another hand: the entries are not taken.
+        let next = Reading { round: gap.round.map(|r| r + 1), ..gap.clone() };
+        assert!(s.screen_state(&next).is_err());
+        // A name read is kept over the one entered, and the line says so.
+        let mut other = full.clone();
+        other.cards[0] = full.cards[1].clone();
+        assert_eq!(s.with_manual(&other).cards[0].en, full.cards[1].en);
+        assert_eq!(s.manual_note_for(&other).as_deref(), Some(t("讀到的和手填的不同：以讀到的為準。", "What was read differs from what you entered: the read is taken.")));
+        let rows = rows_of(s, &root);
+        assert_eq!(rows.iter().filter(|r| r["kind"] == "vorax_manual").map(|r| r["what"].clone()).collect::<Vec<_>>(), vec![json!("card"), json!("tank")]);
+    }
+
+    /// The held instruments offered on the panel carry the rounds this game tracked (the player asked for them filled
+    /// in, 2026-11-12): a tracked instrument's by its id, the pending pick's on the rightmost icon; an icon with
+    /// What the screen showed in each offered slot lines up on the right, as the icons are counted from the right: the
+    /// slots left of every icon read showed nothing.
+    #[test]
+    fn the_slots_offered_carry_what_the_screen_showed() {
+        assert_eq!(icons_by_slot(&[Some(19), Some(10)], 3), vec![None, Some(Some(19)), Some(Some(10))]);
+        assert_eq!(icons_by_slot(&[Some(6), None, Some(10)], 3), vec![Some(Some(6)), Some(None), Some(Some(10))]);
+        assert_eq!(icons_by_slot(&[Some(6), Some(19), Some(10)], 2), vec![Some(Some(19)), Some(Some(10))]);
+        let known = |id: u8| read::Held { id: Some(id), en: None, zh: None, opening: false, score: 1.0 };
+        let mut s = session();
+        s.game.held = vec![(6, 1), (19, 5), (10, 6)];
+        let r = Reading { round: Some(6), held: vec![known(12), known(13), known(10)], ..potion_board(false, Some(600), 12) };
+        let m = s.missing(&r).expect("the tracked list is offered");
+        assert_eq!(m.seen, vec![Some(Some(12)), Some(Some(13)), Some(Some(10))]);
+    }
+
+    /// neither is left blank. The card's line says why the screen is unreadable after `讀不到：`.
+    #[test]
+    fn the_rounds_tracked_are_filled_in() {
+        let known = |id: u8| read::Held { id: Some(id), en: None, zh: None, opening: false, score: 1.0 };
+        let board = Reading { round: Some(6), held: vec![known(6), known(19), known(10)], ..potion_board(false, Some(600), 12) };
+        let mut s = session();
+        s.game.held = vec![(19, 5)];
+        assert_eq!(s.missing(&board).unwrap().held, vec![(Some(6), None), (Some(19), Some(5)), (Some(10), None)]);
+        s.game.pending_pick = Some(PendingPick { before: 1, round: 6, card: Value::Null, id: Some(10), hovered: None });
+        assert_eq!(s.missing(&board).unwrap().held, vec![(Some(6), None), (Some(19), Some(5)), (Some(10), Some(6))]);
+        // The card's line: `讀不到：` (Unreadable:) and the first reason.
+        let (mut s, root) = logged("why-line");
+        let gap = Reading { held: vec![known(19), known(10)], ..board };
+        feed(&mut s, gap.clone(), 2_000);
+        feed(&mut s, gap, 2_060);
+        let head = t("讀不到：", "Unreadable: ");
+        let line = s.view().lines.first().cloned().unwrap_or_default();
+        assert!(s.view().status == Status::Unreadable && line.starts_with(head) && line.len() > head.len(), "{:?}", s.view().lines);
+        drop(s);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// A garbled read as the mouse slides over the cards (different card count, two unreadable): with no log line it is not a new hand, and the boxes stay;
     /// after a confirm the same read removes the boxes as usual.
     #[test]
@@ -5694,7 +6365,7 @@ mod tests {
     /// (Since 2026-11-04 `solve_now` defaults to racing, so this calls plain `solve_with(.., None, ..)` instead; the assertions are unchanged.)
     #[test]
     fn sliced_solve_equals_advise_plan() {
-        let x = to_screen(&potion_board(false, Some(600), 12), None).unwrap();
+        let x = crate::vorax::to_screen(&potion_board(false, Some(600), 12), None).unwrap();
         let (a, _) = solve_with(None, &x, 1_500, None, &AtomicBool::new(false)).unwrap();
         let b = vorax::advisor::advise_plan(&x, Some(1_500), true);
         assert_eq!((serde_json::to_value(&a.best).unwrap(), serde_json::to_value(&a.ranking).unwrap()), (serde_json::to_value(&b.best).unwrap(), serde_json::to_value(&b.ranking).unwrap()));
@@ -5706,7 +6377,7 @@ mod tests {
     #[test]
     fn raced_solve_equals_advise_raced() {
         use vorax::advisor::{DEFAULT_SEED, advise_raced, choice_key};
-        let x = to_screen(&potion_board(false, Some(600), 12), None).unwrap();
+        let x = crate::vorax::to_screen(&potion_board(false, Some(600), 12), None).unwrap();
         let json = |a: &Advice| (serde_json::to_value(&a.best).unwrap(), serde_json::to_value(&a.ranking).unwrap(), serde_json::to_value(a.refresh_end).unwrap());
         let (a, _) = solve_now(None, &x, 4_096, &AtomicBool::new(false)).unwrap();
         let race = Race { z: RACE_Z.unwrap(), first: RACE_FIRST, step: RACE_STEP, max: 4_096, paired: false };

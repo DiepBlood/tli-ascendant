@@ -1711,6 +1711,8 @@ pub struct Session {
     read_in: Option<std::time::Duration>,
     /// Whether the last read showed anything new, and was off the board, see [`Session::take_news`].
     news: Option<(bool, bool)>,
+    /// Whether the last read that tells showed the prison board, see [`Session::board_shown`].
+    board_shown: bool,
     /// Why auto read read the frame being read, when its scan started and how long it took, for the run log.
     trigger: Option<Trigger>,
     scan_started: Option<std::time::Instant>,
@@ -1861,6 +1863,7 @@ impl Session {
             recheck: false,
             read_in: None,
             news: None,
+            board_shown: false,
             last_kept: None,
             trigger: None,
             scan_started: None,
@@ -1992,6 +1995,14 @@ impl Session {
         self.news.take()
     }
 
+    /// Whether the prison board shows, as the last read that tells saw it: on with a board read (installed or the same
+    /// again), off with a read off the board or between runs; a popup, the theme scroll or a fading board over it
+    /// change nothing. Off from the start and after a pause for Vorax (see `drop_moment`). For the window's switch
+    /// to the Board tab (`auto_tab.rs`).
+    pub fn board_shown(&self) -> bool {
+        self.board_shown
+    }
+
     fn start_scan(&mut self, frame: Rgba, live: bool) {
         self.scan_started = Some(std::time::Instant::now());
         let (tx, rx) = channel();
@@ -2071,6 +2082,14 @@ impl Session {
         // A day banner hides the counter on the board itself: it does not count as off the board.
         let off_board = matches!(&taken, Taken::Kept(line) if (is_line(line, OFF_BOARD) && screen != Screen::DayBanner) || is_line(line, RUN_OVER_WAIT));
         self.news = Some((news, off_board));
+        // For the window's switch to the Board tab (`auto_tab.rs`): a board read says the board shows, a read off the
+        // board or between runs that it does not; a popup, the theme scroll, a fading board and the like over it say
+        // nothing, so they never end the mode.
+        self.board_shown = match &taken {
+            Taken::Installed | Taken::Same => true,
+            _ if off_board => false,
+            _ => self.board_shown,
+        };
         self.last_kept = line;
         match taken {
             Taken::Installed | Taken::Same => {
@@ -4959,6 +4978,8 @@ impl Session {
         let (tx, rx) = channel();
         self.rx = Some(rx);
         self.solving = true;
+        // The game's frame rate while it runs (`super::fps`).
+        super::fps::solve_started();
         (self.advice_steady, self.last_best) = (false, None);
         let (notify, rollouts, race, threads) = (self.notify.clone(), self.rollouts, self.races(), self.threads);
         let unseen = if reading_pick { self.unseen_gifts.clone() } else { Vec::new() };
@@ -5005,6 +5026,9 @@ impl Session {
         self.pick = None;
         self.state = None;
         self.problems.clear();
+        if self.solving {
+            super::fps::solve_ended();
+        }
         self.solving = false;
         self.rx = None;
     }
@@ -5048,6 +5072,7 @@ impl Session {
         self.recheck = false;
         self.read_in = None;
         self.news = None;
+        self.board_shown = false;
         self.trigger = None;
         self.scan_started = None;
         self.reading_scan = None;
@@ -5299,6 +5324,7 @@ impl Session {
             self.note_shown();
         }
         if was_solving && !self.solving {
+            super::fps::solve_ended();
             self.log_advice();
         }
         changed
@@ -5359,6 +5385,7 @@ impl Session {
         self.note_chain_plan();
         self.note_shown();
         if was_solving {
+            super::fps::solve_ended();
             self.log_advice();
         }
         if let Some(log) = &self.log {
@@ -5578,6 +5605,25 @@ mod tests {
         // A cell pick then reads the drop: the hold before the popup no longer counts, and this read is held once.
         assert!(matches!(s.take_read(low.clone(), cell_pick.clone(), size), Taken::Kept(line) if is_line(&line, CHANGED)));
         assert!(!matches!(s.take_read(low, cell_pick, size), Taken::Kept(_)));
+    }
+
+    /// The board on show, for the window's switch to the Board tab (`auto_tab.rs`): off at start, on with a board read,
+    /// kept through a popup over it, off with a read off the board, and off after a pause for Vorax.
+    #[test]
+    fn board_shown_follows_the_reads() {
+        let (high, _) = rat_scenes();
+        let mut s = Session::new(100, Vec::new(), None, Some(10));
+        assert!(!s.board_shown(), "nothing read yet");
+        installs(&mut s, &high, screen_panels(Screen::Manage, Some(10)));
+        assert!(s.board_shown(), "a board read");
+        installs(&mut s, &high, screen_panels(Screen::Popup, None));
+        assert!(s.board_shown(), "a popup over the board says nothing");
+        installs(&mut s, &high, screen_panels(Screen::Unknown, None));
+        assert!(!s.board_shown(), "a read off the board");
+        installs(&mut s, &high, screen_panels(Screen::Manage, Some(10)));
+        assert!(s.board_shown(), "the board again");
+        s.suspend();
+        assert!(!s.board_shown(), "paused for Vorax");
     }
 
     /// The panels of a Consume target screen: Cancel on show, the counter hidden.

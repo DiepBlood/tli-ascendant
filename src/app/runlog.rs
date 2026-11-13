@@ -188,6 +188,10 @@ pub struct RunLog {
     /// Whether this log writes the settings (always, but in tests only where a test asks: the summary is global, and
     /// tests running side by side count their rows).
     settings_rows: bool,
+    /// Whether this log writes the board's `fps` rows ([`super::fps::take_note`]): the Tartarus run log only
+    /// ([`RunLog::in_appdata`]). The seconds waiting are one queue for the app, and a Vorax log writing an event took
+    /// them, so they went into the Vorax game's folder and missed the Tartarus run's.
+    fps_rows: bool,
 }
 
 impl RunLog {
@@ -249,12 +253,19 @@ impl RunLog {
             }
         });
         let dir = root.join(folder_name(SystemTime::now()));
-        RunLog { root, dir, frames: 0, last: None, window: None, geometry: super::capture::with_geometry, tx: Some(tx), writer: Some(writer), settings_seen: std::sync::atomic::AtomicU64::new(0), settings_rows: !cfg!(test) }
+        RunLog { root, dir, frames: 0, last: None, window: None, geometry: super::capture::with_geometry, tx: Some(tx), writer: Some(writer), settings_seen: std::sync::atomic::AtomicU64::new(0), settings_rows: !cfg!(test), fps_rows: false }
     }
 
     /// A log under runs in [`super::settings::app_dir`]; None when APPDATA is not set.
     pub fn in_appdata() -> Option<RunLog> {
-        super::settings::app_dir().map(|d| RunLog::new(d.join("runs")))
+        super::settings::app_dir().map(|d| RunLog::tartarus(d.join("runs")))
+    }
+
+    /// The Tartarus run log under `root`: [`RunLog::new`] that also writes the `fps` rows ([`RunLog::fps_rows`]).
+    pub fn tartarus(root: PathBuf) -> RunLog {
+        let mut log = RunLog::new(root);
+        log.fps_rows = true;
+        log
     }
 
     /// The folder of the run on show.
@@ -329,7 +340,13 @@ impl RunLog {
 
     /// Writes one line: `at`, `kind`, then `fields` (a JSON object).
     pub fn event(&self, kind: &str, at: SystemTime, fields: Value) {
-        self.event_with(kind, at, fields, || super::capture::take_notes().into_iter().chain(load_note()).chain(self.settings_note()).collect());
+        self.event_with(kind, at, fields, || super::capture::take_notes().into_iter().chain(load_note()).chain(self.fps_note(super::fps::take_note)).chain(self.settings_note()).collect());
+    }
+
+    /// The `fps` row from `take` when this log writes them ([`RunLog::fps_rows`]); another log does not call it, so
+    /// the seconds stay for the Tartarus run log.
+    fn fps_note(&self, take: impl FnOnce() -> Option<(SystemTime, &'static str, Value)>) -> Option<(SystemTime, &'static str, Value)> {
+        if self.fps_rows { take() } else { None }
     }
 
     /// A `settings` row when the settings changed since this log last wrote them ([`set_settings`]).
@@ -989,6 +1006,23 @@ mod tests {
     #[test]
     fn keeping_all_until_the_settings_say_otherwise() {
         assert!(KEEP_ALL.load(Ordering::Relaxed), "starts true");
+    }
+
+    /// Only the Tartarus run log takes the board's `fps` rows (review of 1.3.0): a Vorax log writing an event leaves
+    /// the seconds waiting for it.
+    #[test]
+    fn only_the_tartarus_log_takes_the_fps_rows() {
+        let root = temp("fps-rows");
+        let (vorax, tartarus) = (RunLog::new(root.join("vorax")), RunLog::tartarus(root.join("runs")));
+        let taken = std::cell::Cell::new(0);
+        let take = || {
+            taken.set(taken.get() + 1);
+            Some((SystemTime::now(), "fps", serde_json::json!({ "idle": [60.0] })))
+        };
+        assert!(vorax.fps_note(take).is_none() && taken.get() == 0);
+        assert!(tartarus.fps_note(take).is_some() && taken.get() == 1);
+        drop((vorax, tartarus));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

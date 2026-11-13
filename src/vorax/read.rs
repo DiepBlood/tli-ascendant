@@ -683,6 +683,10 @@ pub struct Numbers {
     /// The repair added a `1` to a total activity that was read cleanly yet is not self-consistent: it only
     /// counts once the tanks' sum matches the final activity (see [`read`], after the tanks are built).
     pub needs_sum: bool,
+    /// The total was taken from the product and enough of it was read to stand without the sum (see
+    /// [`from_product`]): it still falls back to the values as read when the final activity is read, settled and
+    /// differs from the tanks' sum.
+    pub undone_by_sum: bool,
 }
 
 /// Maximum number of `?` in one field; together with the restored `1` (at most one), the most places repaired
@@ -703,7 +707,7 @@ const MAX_REPAIRS: usize = 2;
 ///   total's one factor pair that fits the row ([`from_factors`]), counted only once the tanks' sum matches.
 pub fn tank_numbers(raw_values: &str, raw_total: &str) -> Numbers {
     let parsed = raw_values.split_once('x').and_then(|(a, q)| Some((number(a)?, number(q)?)));
-    let read = Numbers { activity: parsed.map(|v| v.0), quantity: parsed.map(|v| v.1), total: number(raw_total), repaired: None, needs_sum: false };
+    let read = Numbers { activity: parsed.map(|v| v.0), quantity: parsed.map(|v| v.1), total: number(raw_total), repaired: None, needs_sum: false, undone_by_sum: false };
     if matches!((read.activity, read.quantity, read.total), (Some(a), Some(q), Some(t)) if a * q == t) {
         return read;
     }
@@ -764,6 +768,7 @@ fn from_factors(raw_values: &str, raw_total: &str) -> Option<Numbers> {
         total: Some(total),
         repaired: Some(format!("活性 x 數量「{raw_values}」→{act}x{qty}（由總活性 {total} 因數分解）")),
         needs_sum: true,
+        undone_by_sum: false,
     })
 }
 
@@ -787,6 +792,7 @@ fn x_from_total(raw_values: &str, raw_total: &str) -> Option<Numbers> {
         total: Some(total),
         repaired: Some(format!("活性 x 數量「{raw_values}」→{a}x{q}（由總活性 {total} 判定）")),
         needs_sum: false,
+        undone_by_sum: false,
     })
 }
 
@@ -804,6 +810,17 @@ fn x_from_total(raw_values: &str, raw_total: &str) -> Option<Numbers> {
 /// A total read cleanly (all digits) that does not match the product is left alone and stays unknown, since
 /// either row may be the misread one; [`repair`] already settles the cases where one field can be fixed from
 /// the other two.
+///
+/// The sum is not waited for when the field itself is check enough ([`SURE_DIGITS`]): it starts with a digit, has
+/// at least that many digits read and exactly one `?`. On the selection screens the card panel covers the final
+/// activity, or it is not read, so a tank waiting for the sum stayed unknown the whole screen: a "44" in the
+/// total is read as one unrecognized glyph (2026-11-10 to 11-11 games: `14?32` with 354x408, `526?` with 164x321,
+/// `748?` with 189x396, `56?8` with 168x336, `118?` with 63x188, `14?17` with 273x529, each the product
+/// 144432, 52644, 74844, 56448, 11844, 144417 as the frames show), and those rounds went without advice. The
+/// factors are misread by a dropped or added glyph far more than by one wrong digit, which changes the product's
+/// length or leading digits; the `?` hides at most two digits, so a wrong product passes only if it differs from
+/// the true one there alone. Even so, once the final activity is read and settled and the tanks' sum is off, the
+/// tank falls back to the values as read (`undone_by_sum`).
 fn from_product(raw_values: &str, raw_total: &str) -> Option<Numbers> {
     let (a, q) = raw_values.split_once('x')?;
     let clean = |s: &str| number(s).filter(|&v| v >= 1 && !s.starts_with('0'));
@@ -817,8 +834,20 @@ fn from_product(raw_values: &str, raw_total: &str) -> Option<Numbers> {
     let same = |s: &[u8], w: &[u8]| s.len() == w.len() && s.iter().zip(w).all(|(s, w)| *s == b'?' || s == w);
     let w = want.as_bytes();
     let fits = same(seen, w) || (seen.len() + 1 == w.len() && (0..seen.len()).any(|p| seen[p] == b'?' && same(&seen[..p], &w[..p]) && same(&seen[p + 1..], &w[p + 2..])));
-    fits.then(|| Numbers { activity: Some(a), quantity: Some(q), total: Some(total), repaired: Some(format!("總活性「{raw_total}」→{total}（由活性×數量補上）")), needs_sum: true })
+    let sure = seen[0].is_ascii_digit() && seen.iter().filter(|b| b.is_ascii_digit()).count() >= SURE_DIGITS && seen.iter().filter(|&&b| b == b'?').count() == 1;
+    fits.then(|| Numbers {
+        activity: Some(a),
+        quantity: Some(q),
+        total: Some(total),
+        repaired: Some(format!("總活性「{raw_total}」→{total}（由活性×數量補上）")),
+        needs_sum: !sure,
+        undone_by_sum: sure,
+    })
 }
+
+/// Digits a partly read total needs, leading digit included and one `?` at most, for the product to count
+/// without the tanks' sum (see [`from_product`]).
+const SURE_DIGITS: usize = 3;
 
 /// The back-derivation of [`tank_numbers`]; None when there is no unique solution.
 fn repair(raw_values: &str, raw_total: &str) -> Option<Numbers> {
@@ -857,7 +886,7 @@ fn repair(raw_values: &str, raw_total: &str) -> Option<Numbers> {
             1 => [x, want, y],
             _ => [x, y, want],
         };
-        let n = Numbers { activity: Some(v[0]), quantity: Some(v[1]), total: Some(v[2]), repaired: Some(format!("{}「{}」→{want}", LABELS[k], fields[k])), needs_sum };
+        let n = Numbers { activity: Some(v[0]), quantity: Some(v[1]), total: Some(v[2]), repaired: Some(format!("{}「{}」→{want}", LABELS[k], fields[k])), needs_sum, undone_by_sum: false };
         match &found {
             Some(f) if (f.activity, f.quantity, f.total) != (n.activity, n.quantity, n.total) => return None,
             Some(_) => {}
@@ -1525,6 +1554,7 @@ fn read_text(img: &Rgba, text: Text) -> Reading {
     // Tanks. Those where a "1" was added to a total activity that was read cleanly are noted, to be checked
     // against the sum.
     let mut needs_sum: Vec<usize> = Vec::new();
+    let mut undone_by_sum: Vec<usize> = Vec::new();
     for i in 0..6 {
         // The monster name is read twice, at 3x and at 2x (OCR is very sensitive to the scale); use first the
         // one that matches the name table.
@@ -1570,6 +1600,9 @@ fn read_text(img: &Rgba, text: Text) -> Reading {
         if numbers.needs_sum {
             needs_sum.push(reading.tanks.len());
         }
+        if numbers.undone_by_sum {
+            undone_by_sum.push(reading.tanks.len());
+        }
         let tank = Tank {
             empty: false,
             name: known.map(|(m, _)| m.clone()).or_else(|| (!raw_name.is_empty()).then(|| raw_name.clone())),
@@ -1591,7 +1624,7 @@ fn read_text(img: &Rgba, text: Text) -> Reading {
         }
         reading.tanks.push(tank);
     }
-    settle_sums(&mut reading, &needs_sum, &mut problems);
+    settle_sums(&mut reading, &needs_sum, &undone_by_sum, &mut problems);
     reading.held = icons::read_held(img);
 
     // Screen kind: the title says which kind of choice it is and the cards can be read; otherwise it is
@@ -1664,8 +1697,9 @@ fn read_text(img: &Rgba, text: Text) -> Reading {
 /// The tanks' sum, and the tanks whose values only count once that sum matches the final activity
 /// (`needs_sum`: a "1" added to a total read cleanly, or a total taken from the product, see [`tank_numbers`]):
 /// when the final activity is unread, still jumping or off, they fall back to the values as read and their
-/// problems are added.
-fn settle_sums(reading: &mut Reading, needs_sum: &[usize], problems: &mut Vec<String>) {
+/// problems are added. The tanks of `undone_by_sum` (a product total that stands on its own) fall back only when
+/// the final activity is read, settled and off.
+fn settle_sums(reading: &mut Reading, needs_sum: &[usize], undone_by_sum: &[usize], problems: &mut Vec<String>) {
     if reading.tanks.iter().all(|t| t.empty || t.consistent()) {
         reading.tank_sum = Some(reading.tanks.iter().filter_map(|t| t.total).sum());
     }
@@ -1679,17 +1713,25 @@ fn settle_sums(reading: &mut Reading, needs_sum: &[usize], problems: &mut Vec<St
     // Tanks where a "1" was added to a total activity that was read cleanly, or the total was taken from the
     // product: the tanks' sum must match the final activity (when it is not jumping) to count, otherwise fall
     // back to the values as read (unknown).
-    if !needs_sum.is_empty() {
-        let summed = !reading.ultimate_pending && reading.ultimate.is_some() && reading.ultimate == reading.tank_sum;
-        if !summed {
-            for &i in needs_sum {
-                let t = &mut reading.tanks[i];
-                let parsed = t.raw_values.split_once('x').and_then(|(a, q)| Some((number(a)?, number(q)?)));
-                (t.activity, t.quantity, t.total, t.repaired) = (parsed.map(|v| v.0), parsed.map(|v| v.1), number(&t.raw_total), None);
-                problems.push(tank_problem(i, t));
-            }
-            reading.tank_sum = None;
-        }
+    let settled = !reading.ultimate_pending && reading.ultimate.is_some();
+    let summed = settled && reading.ultimate == reading.tank_sum;
+    let off = settled && reading.tank_sum.is_some() && !summed;
+    let mut undo: Vec<usize> = Vec::new();
+    if !summed {
+        undo.extend(needs_sum);
+    }
+    if off {
+        undo.extend(undone_by_sum);
+    }
+    undo.sort_unstable();
+    for &i in &undo {
+        let t = &mut reading.tanks[i];
+        let parsed = t.raw_values.split_once('x').and_then(|(a, q)| Some((number(a)?, number(q)?)));
+        (t.activity, t.quantity, t.total, t.repaired) = (parsed.map(|v| v.0), parsed.map(|v| v.1), number(&t.raw_total), None);
+        problems.push(tank_problem(i, t));
+    }
+    if !undo.is_empty() {
+        reading.tank_sum = None;
     }
 }
 
@@ -3033,6 +3075,40 @@ mod tests {
         assert_eq!(got("1?x204", "20?"), None);
     }
 
+    /// A total with one `?` for a "44" read as one glyph, its leading digit and three digits or more read: the
+    /// product counts without the sum (the selection screens of 2026-11-10 to 11-11, the final activity covered),
+    /// and is undone only by a final activity read, settled and off. Fewer digits, a leading `?` or two `?` still
+    /// wait for the sum.
+    #[test]
+    fn a_product_total_read_well_enough_needs_no_sum() {
+        let n = tank_numbers("273x529", "14?17");
+        assert_eq!((n.activity, n.quantity, n.total, n.needs_sum, n.undone_by_sum), (Some(273), Some(529), Some(144_417), false, true));
+        for (v, t, want) in [("354x408", "14?32", 144_432), ("164x321", "526?", 52_644), ("189x396", "748?", 74_844), ("168x336", "56?8", 56_448), ("63x188", "118?", 11_844)] {
+            let n = tank_numbers(v, t);
+            assert_eq!((n.total, n.needs_sum, n.undone_by_sum), (Some(want), false, true), "{v} {t}");
+        }
+        for (v, t) in [("10x204", "20?"), ("164x321", "?644"), ("164x321", "5?6?")] {
+            let n = tank_numbers(v, t);
+            assert!(n.needs_sum && !n.undone_by_sum, "{v} {t}");
+        }
+        let tank = |v: &str, t: &str| {
+            let n = tank_numbers(v, t);
+            Tank { activity: n.activity, quantity: n.quantity, total: n.total, repaired: n.repaired, raw_values: v.into(), raw_total: t.into(), archetype: Some(Archetype::Pest), rarity: Some(Rarity::Normal), ..Tank::default() }
+        };
+        let settle = |ultimate: Option<i64>, pending: bool| {
+            let mut r = Reading { kind: Kind::Protocol, round: Some(13), ultimate, ultimate_pending: pending, panel_covered: ultimate.is_none(), next_reward: None, rerolls: None, tanks: vec![tank("1x261", "261"), tank("273x529", "14?17")], held: vec![], cards: vec![], tank_sum: None, problems: vec![], tooltip: String::new() };
+            let mut problems = Vec::new();
+            settle_sums(&mut r, &[], &[1], &mut problems);
+            (r.tanks[1].total, r.tank_sum, problems.len())
+        };
+        // Covered or still jumping: it stands; read and equal: it stands with the sum.
+        assert_eq!(settle(None, false), (Some(144_417), Some(144_678), 0));
+        assert_eq!(settle(Some(144_000), true), (Some(144_417), Some(144_678), 0));
+        assert_eq!(settle(Some(144_678), false), (Some(144_417), Some(144_678), 0));
+        // Read, settled and off: back to unknown, with its problem.
+        assert_eq!(settle(Some(144_679), false), (None, None, 1));
+    }
+
     /// A tank whose total came from the product (`needs_sum`) counts only when the final activity is read, not
     /// jumping, and equals the tanks' sum; otherwise its values fall back to what was read, with a problem.
     #[test]
@@ -3044,7 +3120,7 @@ mod tests {
         let settle = |ultimate: Option<i64>, pending: bool| {
             let mut r = Reading { kind: Kind::Potion, round: Some(3), ultimate, ultimate_pending: pending, panel_covered: false, next_reward: None, rerolls: None, tanks: vec![tank("1x261", "261"), tank("10x204", "20?")], held: vec![], cards: vec![], tank_sum: None, problems: vec![], tooltip: String::new() };
             let mut problems = Vec::new();
-            settle_sums(&mut r, &[1], &mut problems);
+            settle_sums(&mut r, &[1], &[], &mut problems);
             (r.tanks[1].total, r.tank_sum, problems.len())
         };
         assert_eq!(settle(Some(2301), false), (Some(2040), Some(2301), 0));

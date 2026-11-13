@@ -1171,6 +1171,8 @@ pub fn follow(path: &Path, stopped: &AtomicBool, mut on: impl FnMut(Signal, Opti
     let mut riot = Riot::default();
     let mut outcome = RiotOutcome::default();
     let mut affixes = AffixBlock::default();
+    // The game's frame rate on the board (`super::fps`).
+    let mut frames = super::fps::FrameClock::default();
     let mut missing_since: Option<std::time::Instant> = None;
     let mut last_new = std::time::Instant::now();
     while !stopped.load(Ordering::Relaxed) {
@@ -1192,6 +1194,7 @@ pub fn follow(path: &Path, stopped: &AtomicBool, mut on: impl FnMut(Signal, Opti
             riot = Riot::default();
             outcome = RiotOutcome::default();
             affixes = AffixBlock::default();
+            frames = super::fps::FrameClock::default();
         }
         if len == at {
             continue;
@@ -1223,6 +1226,9 @@ pub fn follow(path: &Path, stopped: &AtomicBool, mut on: impl FnMut(Signal, Opti
             }
             if let Some(signal) = cards.signal(line) {
                 on(signal, game_millis(line));
+            }
+            if let Some(second) = frames.line(line) {
+                super::fps::note_second(second);
             }
         }
         partial.drain(..complete);

@@ -1,0 +1,105 @@
+{
+ "_note": "One-line notes of the Vorax surgical instruments, in our own words, shown when the mouse rests on an instrument in the panel. Keyed by solver id (crates/vorax/data/game.json). Checked against the card text of real games and the simulation (crates/vorax/src/effects.rs) on 2026-11-12.",
+ "instruments": {
+  "1": {
+   "zh": "回合結束時，設蠱蟲組數為 X，隨機怪物 +8 數量，共 X×X 次（同一組可重複中）。",
+   "en": "At round end, with X groups of Pests, +8 Quantity to a random group, X×X times (a group can be hit again)."
+  },
+  "2": {
+   "zh": "有至少 2 組蠱蟲時，每新增一組怪物，所有怪物 +45 數量。",
+   "en": "With at least 2 groups of Pests, +45 Quantity to all monsters each time a monster is added."
+  },
+  "3": {
+   "zh": "有至少 2 組覺醒者時，每回合結束隨機 1 組稀有或首領怪物 +80 活性。",
+   "en": "With at least 2 groups of Agitoes, +80 Activity to 1 random Rare or Boss monster each round."
+  },
+  "4": {
+   "zh": "有稀有或首領覺醒者時，每回合結束隨機 1 組怪物 +80 活性。",
+   "en": "With a Rare or Boss Agito, +80 Activity to 1 random group each round."
+  },
+  "5": {
+   "zh": "有至少 2 組骨衛兵時，每移除一組怪物，隨機 1 組怪物 +180 數量。",
+   "en": "With at least 2 groups of Bone Sentries, +180 Quantity to 1 random group each time a monster is removed."
+  },
+  "6": {
+   "zh": "移除非骨衛兵的怪物時，隨機 1 組怪物 +150 數量。",
+   "en": "When a monster other than a Bone Sentry is removed, +150 Quantity to 1 random group."
+  },
+  "7": {
+   "zh": "有怪物變異成異魔時，所有怪物 +35 活性。",
+   "en": "When a monster mutates into an Aemberon, +35 Activity to all monsters."
+  },
+  "8": {
+   "zh": "有至少 2 組異魔時，每次怪物變異，所有怪物 +20 活性。",
+   "en": "With at least 2 groups of Aemberons, +20 Activity to all monsters on every mutation."
+  },
+  "9": {
+   "zh": "有至少 3 組蠱蟲時，每回合結束新增 1 組蠱蟲（稀有度隨機），並給它 +100 數量。",
+   "en": "With at least 3 groups of Pests, add 1 Pest group (random rarity) with +100 Quantity each round."
+  },
+  "10": {
+   "zh": "回合結束時，隨機 2 組魔法怪物融合成 1 組稀有覺醒者（少於 2 組魔法就不發動）。",
+   "en": "At round end, 2 random Magic monsters fuse into 1 Rare Agito (needs 2 Magic groups)."
+  },
+  "11": {
+   "zh": "回合結束時，若有至少 2 組骨衛兵，移除總活性最低的非骨衛兵怪物，並把它的活性和數量加到隨機 1 組骨衛兵。",
+   "en": "At round end, with at least 2 Bone Sentries, remove the non-Bone-Sentry with the lowest total; a random Bone Sentry gains its Activity and Quantity."
+  },
+  "12": {
+   "zh": "每新增一組怪物，有 75% 機率讓它變異成異魔並 +80 活性。",
+   "en": "Each added monster has a 75% chance to mutate into an Aemberon and gain +80 Activity."
+  },
+  "13": {
+   "zh": "有 3 組（含以上）魔法怪物時，每回合結束總活性最高的 1 組 +100 數量。",
+   "en": "With 3 or more Magic groups, +100 Quantity to the group with the highest total each round."
+  },
+  "14": {
+   "zh": "回合結束時，同一稀有度每湊滿 3 組，就融合成 1 組高一階稀有度的怪物。",
+   "en": "At round end, every 3 monsters of the same rarity fuse into 1 monster one rarity higher."
+  },
+  "15": {
+   "zh": "回合結束時，數量和活性都大於 150 的怪物 +15 活性、+15 數量。",
+   "en": "At round end, +15 Activity and +15 Quantity to monsters with both above 150."
+  },
+  "16": {
+   "zh": "新增怪物時若超過培養皿上限，總活性最低的 1 組 +25 活性、+25 數量。",
+   "en": "When an added monster goes past the tank limit, +25 Activity and +25 Quantity to the lowest-total group."
+  },
+  "17": {
+   "zh": "回合結束時，數量大於 275 的怪物都 +20 活性。",
+   "en": "At round end, +20 Activity to every monster with Quantity above 275."
+  },
+  "18": {
+   "zh": "回合結束時，活性大於 255 的怪物都 +30 數量。",
+   "en": "At round end, +30 Quantity to every monster with Activity above 255."
+  },
+  "19": {
+   "zh": "每 2 回合（從取得那回合算起），每個稀有度各隨機 1 組怪物升一階稀有度。",
+   "en": "Every 2 rounds from its pick, 1 random monster of each rarity awakens one rarity higher."
+  },
+  "20": {
+   "zh": "每 3 回合（從取得那回合算起），所有怪物變異成隨機種族。",
+   "en": "Every 3 rounds from its pick, every monster mutates into a random archetype."
+  },
+  "21": {
+   "zh": "同時有普通、魔法和稀有（或首領）怪物時，每回合結束所有怪物 +20 活性。",
+   "en": "With Normal, Magic and Rare (or Boss) monsters at once, +20 Activity to all monsters each round."
+  },
+  "22": {
+   "zh": "移除怪物時，總活性最高的 1 組 +20 活性、+20 數量。",
+   "en": "When a monster is removed, +20 Activity and +20 Quantity to the highest-total group."
+  },
+  "23": {
+   "zh": "回合結束時，有 2～5 組怪物就新增 1 組隨機怪物；滿 6 組時，總活性最高的吞掉最低的。",
+   "en": "At round end, with 2 to 5 groups add 1 random monster; with 6, the highest total devours the lowest."
+  },
+  "24": {
+   "zh": "有 3 組（含以上）普通怪物時，每回合結束所有怪物 +30 數量。",
+   "en": "With 3 or more Normal groups, +30 Quantity to all monsters each round."
+  },
+  "25": {
+   "zh": "每 3 回合（從取得那回合算起），隨機 2 組蠱蟲融合成 1 組蠱蟲（稀有度隨機）。",
+   "en": "Every 3 rounds from its pick, 2 random Pests fuse into 1 Pest of random rarity."
+  }
+ }
+}

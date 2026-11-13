@@ -1,0 +1,59 @@
+[[zh-TW]]
+Ascendant 1.3.0：詞綴頁改版、讀不到時可以自己補、自動切換分頁
+
+關卡詞綴
+- 詞綴頁的分類可以複選：「等級」（遊戲顏色、危險、警告、不標）和「狀態」（改過的、新）兩排，同一排選多個是其中之一，兩排都選是兩個都要符合（例如改過的且危險）。
+- 「全部已讀」：一次清掉所有「新」標記，等級不變；放在「所有詞綴」標題旁，按下會跳出視窗確認。
+- 「所有分級改回預設」移到「所有詞綴」標題旁，改成跳出視窗確認（取消／確認）。
+- 「目前地圖上」還沒分級的詞綴，卡片照遊戲裡的顏色上色（紅色、橘色），和遊戲畫面上的框一致。
+- 往下捲之後，右下角有「↑ 回到最上方」。
+- 在「不標」和「遊戲顏色」之間切換時，地圖上的框會立刻跟著改（1.2.0 有時不會更新）。
+- 數字被讀成「1 5」這種中間有空格的情形也能對上（例如「玩家額外 −15% 傷害」以前會顯示未知）。
+- 同一條詞綴可以有多種寫法：例如「怪物 +47% 腐蝕抗性」不再顯示未知。
+
+塔羅斯
+- 連吃時，下一口的目標剛好在正在吃的那隻正上方（兩側的牢房），被「連吃」字樣蓋住也讀得到，選目標畫面會有建議。
+- 開門時的路徑光不會再讓旁邊的牢房短暫被讀成劃痕門。
+- 本局分析不再把人形棺的「換掉」、去事變格當場完成目標的移動記成沒照建議。
+
+渴血
+- 持有三個手術用具時，最左邊比較暗的圖示（例如攣縮指爪）也讀得到；偶爾漏讀一格時，用這局記住的用具繼續給建議，不再整場沒有建議。
+- 讀不到時，面板上方會出現黃框「讀不到，需要你補」，直接在框裡補手術用具（含取得回合，程式記得的先幫你填好）、卡名、水箱，補完立刻給建議；遊戲畫面上方也會提示一行。補過的用具這局會記住，之後讀到的不同時以讀到的為準並提示。
+- 讀不到時的說明改成一般說法（不再出現命令列的用語）。
+- 手術用具可以看說明：補用具的下拉選單、選好的那一格、持有用具列，滑鼠移上去就有；畫面讀到的和這局記得的不同時，那一格會寫出畫面上讀到什麼。
+- 水箱的總活性讀不全時（例如兩個相連的 4），用「活性 × 數量」補上，不再因此整步沒有建議。
+- 前期的預測校正：第 10 回合以前，預測分數依實戰資料每剩一回合加 8k（只改顯示的分數，建議和判定不變）。
+
+其他
+- 偵測到玩法時自動切換分頁：進入塔羅斯、渴血時切到「盤面」，地圖頁出現關卡詞綴時切到「詞綴」；同一段玩法只切一次，你自己換頁後不會被拉回去，開著設定頁時不切。設定頁可以關掉（預設開）。
+- 本局檢查和回報檔多記一行遊戲幀率（塔羅斯盤面開著時，有沒有在求解各多少），電腦變慢時比較好查（不影響使用）。
+
+[[en]]
+Ascendant 1.3.0: a reworked Affixes page, fill in what can't be read, and tabs that follow the game
+
+Map affixes
+- The Affixes page filters can be combined: two rows, Grade (game colour, danger, warning, not framed) and State (changed, new); several in one row are any of them, both rows are both (changed and danger, say).
+- "Mark all as read" clears every New mark at once, grades untouched; it sits beside the "Every affix" heading and asks first in a window.
+- "Reset every grade" moved beside the "Every affix" heading and asks in a window (Cancel / Confirm).
+- On this map, ungraded affixes' cards take the colour the game shows them in (red, orange), as the frames on the game do.
+- Scrolled down, "↑ Back to top" shows at the bottom right.
+- Switching between "Not framed" and the game's colour changes the frame on the map at once (1.2.0 sometimes kept the old one).
+- Numbers read with a space inside, like "1 5", still find their affix ("-15% damage for you" used to be unknown).
+- An affix may be written more than one way: a monster Erosion Resistance affix in the Chinese client's other wording is no longer unknown.
+
+Tartarus
+- When the next chain target is right above the eater (the side cells), the "Chain" label over it no longer hides it, and the target pick gets advice.
+- The light along the path when a door opens no longer makes a cell beside it read as a scratched door for a moment.
+- The run analysis no longer counts a Severed Iron Maiden replace, or the move to an incident cell that completes the objective, as not followed.
+
+Vorax
+- With three instruments held, a dark icon on the left (Contracted Claws, say) is read too; when one slot is missed now and then, the instruments remembered for this game carry the advice, instead of no advice for the rest of the game.
+- When something can't be read, a yellow box at the top of the panel, "Can't read it: fill it in", takes instruments (with the round each was picked, prefilled from what the app tracked), card names and tanks, and the advice comes at once; a line on the game says so too. Instruments filled in are kept for the game; a later read that differs wins, with a line saying so.
+- The explanation when something can't be read is in plain words (no command-line terms).
+- Instruments show a short note on hover in the fill-in pickers, the picked slot and the held row; a slot whose screen icon differs from what this game remembers says what the screen showed.
+- A tank total read only in part (two 4s side by side, say) is taken from activity x quantity, instead of no advice for that pick.
+- Early predictions corrected: before round 10 the predicted score adds 8k per round left, fitted on real games (only the shown score; the advice and its verdict are the same).
+
+Other
+- Tabs follow the game: entering Tartarus or Vorax switches to Board, affixes on a map page switch to Affixes; once per stretch of play, a tab you pick stays, and the Settings tab is never left. Turn it off in Settings (on by default).
+- The run check and the report file note the game's frame rate on the Tartarus board (with and without a solve running), which helps when the computer slows down (nothing changes in use).

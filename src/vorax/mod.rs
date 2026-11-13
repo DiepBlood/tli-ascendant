@@ -52,6 +52,10 @@ pub fn icon_features(img: &Rgba) -> Vec<Vec<f32>> {
 
 pub use icons::{IconEval, VsrPick};
 
+/// The instrument slots at the top right of the game ([`icons::SLOTS`], 4, the opening instruments included): the
+/// most held instruments the panel lets the player enter (the solver would drop those past its own limit unsaid).
+pub const HELD_SLOTS: usize = icons::SLOTS;
+
 /// For evaluation (the #[ignore] evaluation in tests/vorax_read.rs): the held icon of each cell in a reference-size
 /// frame, left to right, with the results of our own templates and of the VSR signatures separately.
 #[doc(hidden)]
@@ -107,6 +111,23 @@ pub fn parse_instruments(value: &str) -> Result<HeldOverride, String> {
 /// Convert to solver input; when an "unknown" is read or things do not add up, return the reasons instead of a
 /// state. `held` is the manually specified held instruments (replacing what the icons read).
 pub fn to_screen(r: &Reading, held: Option<&HeldOverride>) -> Result<ScreenState, Vec<String>> {
+    to_screen_for(r, held, false)
+}
+
+/// [`to_screen`] for the Ascendant window: `held` is the list the session tracked, and the reasons about the held
+/// instruments speak of the icons at the top right, not of the command line's `--instruments`.
+pub fn to_screen_in_app(r: &Reading, held: Option<&HeldOverride>) -> Result<ScreenState, Vec<String>> {
+    to_screen_for(r, held, true)
+}
+
+/// An instrument's name as the window shows it: the name table's Traditional Chinese name in the Chinese window,
+/// else the English client's (None when the name table has no such instrument).
+fn shown_name(id: u8) -> Option<String> {
+    let c = names().cards.iter().find(|c| c.category == Category::Instrument && c.id == Some(id))?;
+    Some(if lang::zh() { c.zh.clone().unwrap_or_else(|| c.en.clone()) } else { c.client_en.clone().unwrap_or_else(|| c.en.clone()) })
+}
+
+fn to_screen_for(r: &Reading, held: Option<&HeldOverride>, app: bool) -> Result<ScreenState, Vec<String>> {
     let mut why = Vec::new();
     let phase = match r.kind {
         Kind::Potion => ScreenPhase::Potion,
@@ -159,11 +180,18 @@ pub fn to_screen(r: &Reading, held: Option<&HeldOverride>) -> Result<ScreenState
             // block advice.
             for (k, h) in r.held.iter().enumerate().filter(|(_, h)| !h.opening) {
                 match h.id {
+                    None if app => why.push(trf2("右上角第 {} 個手術用具圖示認不出，暫時不給建議。", "Held instrument icon {} isn't recognized: no advice for now.", k + 1)),
                     None => why.push(trf2("右上角第 {} 個手術用具圖示認不出（可用 --instruments 指定）。", "Held instrument icon {} is unknown (give them with --instruments).", k + 1)),
                     Some(id) => {
                         let def = vorax::data().instrument(id).expect("template id");
                         if matches!(def.timing, Timing::Periodic(_)) {
-                            why.push(format!("{}「{}」{}", zh_en("每 N 回合生效的手術用具", "The periodic instrument"), def.name, zh_en("取得回合看不到，請用 --instruments id@回合 指定。", "'s pick round isn't on screen: give it with --instruments id@round.")));
+                            if app {
+                                // The session tracks each pick's round; it has none here only when the icons read are
+                                // not the instruments it tracked (some unread, or read as others).
+                                why.push(format!("{}「{}」{}", zh_en("右上角的手術用具沒讀全或和這場記到的對不上：", "The held instruments at the top right weren't all read or don't match the ones tracked this game: "), shown_name(id).unwrap_or_else(|| def.name.clone()), zh_en("每 N 回合生效，要知道是第幾回合拿的，暫時不給建議。", " acts every N rounds and needs the round it was picked, so no advice for now.")));
+                            } else {
+                                why.push(format!("{}「{}」{}", zh_en("每 N 回合生效的手術用具", "The periodic instrument"), def.name, zh_en("取得回合看不到，請用 --instruments id@回合 指定。", "'s pick round isn't on screen: give it with --instruments id@round.")));
+                            }
                         }
                         out.0.push(def.name.clone());
                         out.1.push(1);
@@ -324,6 +352,11 @@ pub struct AdviceRow {
     /// card with no target.
     pub targets: Vec<u8>,
     pub mean: f64,
+    /// The solver's expected score, before the display-only early-round correction ([`shown_mean`]): the rows are
+    /// ordered and the verdict (`都可以` / `明顯較好`) is judged on it, as the correction caps at 840k and would make
+    /// options near the cap look alike (800k and 780k in round 1 both shown as 840k). Not written out.
+    #[serde(skip)]
+    pub raw: f64,
     /// Probability of reaching 840k (0 to 1); None when the solver does not give it.
     pub reached: Option<f64>,
     /// This row is the reroll.
@@ -351,7 +384,28 @@ pub struct AdviceRows {
     pub unknown: Vec<String>,
 }
 
+/// Display-only correction of the expected score, per potion round still to come after this one (rounds 1 to 9;
+/// none from round 10 on). The solver's futures are played by its own bot, weaker than advice re-solved every
+/// round, so early expected scores come out low: over 61 games with a final activity (2026-11-03 to 11-11, home
+/// vorax logs) the capped final activity minus the advised option's expected score was +81k in round 1 and fell
+/// to about 0 by round 10, a slope of +7.9k ± 2.4k per round left (5-fold cross-validation by game: 7.9k ± 1.2k;
+/// fitted on the games before 11-11, 8.5k, which took the 22 games of 11-11 from +62k to -8k in round 1). Every
+/// option of a hand gets the same amount, so the order and the advice do not change; the share reaching 840k is
+/// left as solved. The run log keeps the solver's own numbers.
+pub const EARLY_SHIFT_PER_ROUND: f64 = 8_000.0;
+
+/// The expected score shown for `mean` solved in `round`: [`EARLY_SHIFT_PER_ROUND`] per round left before round
+/// 10, capped at the 840k the score counts up to. Unchanged when the round is not known.
+pub fn shown_mean(mean: f64, round: Option<i32>) -> f64 {
+    let left = round.map_or(0, |r| (10 - r).clamp(0, 9));
+    if left == 0 {
+        return mean;
+    }
+    (mean + EARLY_SHIFT_PER_ROUND * f64::from(left)).min(vorax::value::TARGET as f64)
+}
+
 /// Convert advice `a` of `x` into text for humans. Protocols have no ranking (the solver does not solve them).
+/// The expected scores are shown with the early-round correction ([`shown_mean`]).
 pub fn advice_rows(x: &ScreenState, a: &Advice) -> AdviceRows {
     let category = if x.phase == ScreenPhase::Instrument { Category::Instrument } else { Category::Potion };
     let zh = lang::zh();
@@ -379,11 +433,13 @@ pub fn advice_rows(x: &ScreenState, a: &Advice) -> AdviceRows {
         .iter()
         .map(|r| {
             let no_effect = if r.no_effect == Some(true) { zh_en("（無效果）", " (no effect)") } else { "" };
+            let mean = r.end.map_or(r.value, |e| e.activity);
             AdviceRow {
                 label: label(r.index, &r.targets) + no_effect,
                 name: name_of(r.index) + no_effect,
                 targets: r.targets.clone(),
-                mean: r.end.map_or(r.value, |e| e.activity),
+                mean,
+                raw: mean,
                 reached: r.end.map(|e| e.reached),
                 refresh: false,
                 best: best_card.as_ref().is_some_and(|(i, t)| *i == r.index && *t == r.targets),
@@ -394,12 +450,16 @@ pub fn advice_rows(x: &ScreenState, a: &Advice) -> AdviceRows {
     if let Some(e) = a.refresh_end {
         let at = rows.iter().position(|r| r.mean < e.activity).unwrap_or(rows.len());
         let reroll = zh_en("重擲", "Reroll").to_string();
-        rows.insert(at, AdviceRow { label: reroll.clone(), name: reroll, targets: Vec::new(), mean: e.activity, reached: Some(e.reached), refresh: true, best: a.best == Best::Refresh });
+        rows.insert(at, AdviceRow { label: reroll.clone(), name: reroll, targets: Vec::new(), mean: e.activity, raw: e.activity, reached: Some(e.reached), refresh: true, best: a.best == Best::Refresh });
+    }
+    // After the reroll is placed by the solver's numbers, so its place does not change.
+    for r in rows.iter_mut() {
+        r.mean = shown_mean(r.mean, x.round);
     }
     let method = if a.plan {
-        zh_en("藥劑：每個選項模擬到終局；期望分數是終局最終活性的平均（上限 840k）。", "Potions: each option played to the end; mean is the final Ultimate Activity, capped at 840k.")
+        zh_en("藥劑：每個選項模擬到終局；期望分數是終局最終活性的平均（上限 840k），第 10 回合前每剩一回合加 8k（實戰校正）。", "Potions: each option played to the end; mean is the final Ultimate Activity, capped at 840k, plus 8k per round left before round 10 (calibrated on real games).")
     } else {
-        zh_en("手術用具：每個選項模擬到終局；期望分數是終局最終活性的平均（上限 840k）。", "Instruments: each option played to the end; mean is the final Ultimate Activity, capped at 840k.")
+        zh_en("手術用具：每個選項模擬到終局；期望分數是終局最終活性的平均（上限 840k），第 10 回合前每剩一回合加 8k（實戰校正）。", "Instruments: each option played to the end; mean is the final Ultimate Activity, capped at 840k, plus 8k per round left before round 10 (calibrated on real games).")
     };
     let (cannot, unknown): (Vec<String>, Vec<String>) = a.unknown.iter().cloned().partition(|n| unsimulated(n));
     let mut lines: Vec<String> = a.note.iter().flat_map(|n| n.split('\n')).map(str::to_string).collect();

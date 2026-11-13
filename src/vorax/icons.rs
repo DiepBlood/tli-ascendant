@@ -44,11 +44,24 @@ pub fn slot(k: usize) -> Rect {
     Rect::new(SLOT_X[k] - IW as i32 * CELL / 2, TOP, IW as i32 * CELL, IH as i32 * CELL)
 }
 
+/// A cell holds an icon when at least BRIGHT_MIN of its pixels are brighter than luminance 70, or at least DIM_MIN
+/// brighter than DIM_LUM. The dark `攣縮指爪` has few bright pixels: in the third cell of a frame unscaled from
+/// `PageScale` 0.672568 (s = 1.0083, see `ui_scale`) it kept 13-14 above 70, the cell read as empty, the icons were
+/// counted from the right up to it and the claw was never read (2026-11-11_21-08-23 from round 6: [19, 10] for
+/// [6, 19, 10]; 9 games of 2026-11-10/11, 92 board frames), nor an opening instrument left of it. Under a card's
+/// tooltip, which dims the board, it kept 0 above 70 and 124 above 40 (that game's frame-0039), and at the original
+/// scale a claw alone in the first cell 7 and 160 (2026-11-04_12-52-39 frame-0021). Over the 1639 saved frames read as
+/// a board, the empty cell left of the icons read has at most 3 pixels above 40, and every icon read at least 149.
+const BRIGHT_MIN: usize = 15;
+const DIM_LUM: u32 = 40;
+const DIM_MIN: usize = 60;
+
 /// RGB grid features of one cell (row-major, R, G, B per cell); None when this cell has no icon (all dark).
 pub fn feature(img: &Rgba, r: Rect) -> Option<Vec<f32>> {
     let lum = |p: [u8; 3]| (u32::from(p[0]) * 77 + u32::from(p[1]) * 150 + u32::from(p[2]) * 29) >> 8;
-    let bright = (r.y..r.y + r.h).flat_map(|y| (r.x..r.x + r.w).map(move |x| (x, y))).filter(|&(x, y)| lum(img.rgb(x, y)) > 70).count();
-    if bright < 15 {
+    let lums: Vec<u32> = (r.y..r.y + r.h).flat_map(|y| (r.x..r.x + r.w).map(move |x| (x, y))).map(|(x, y)| lum(img.rgb(x, y))).collect();
+    let above = |t: u32| lums.iter().filter(|&&v| v > t).count();
+    if above(70) < BRIGHT_MIN && above(DIM_LUM) < DIM_MIN {
         return None;
     }
     let mut f = vec![0f32; IW * IH * 3];

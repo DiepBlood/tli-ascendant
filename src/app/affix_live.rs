@@ -211,8 +211,9 @@ fn ms(d: Duration) -> u64 {
 /// One entry on the map page now, top to bottom (the affix page lists them first, unknown ones too).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Seen {
-    /// Found: the sentence's index in the table.
-    Known(usize),
+    /// Found: the sentence's index in the table, and the grade its game colour frames it with (Grade::None: white, or
+    /// not read: named by the game log), shown on the affix page while the user has not graded it.
+    Known(usize, Grade),
     /// Not found: the text as read; `ambiguous` when it reads like sentences of different grades (not framed), `cut`
     /// when the panel's bottom cuts it; `game`, the grade its game colour frames it with (none for an ambiguous one).
     Unknown { text: String, ambiguous: bool, cut: bool, game: Grade },
@@ -224,12 +225,12 @@ impl Seen {
     /// The table's sentence of game id `id`, else the id alone.
     fn of_id(dict: &Dict, id: u32) -> Seen {
         let id_text = id.to_string();
-        dict.sentences().iter().position(|s| s.ids.contains(&id_text)).map_or(Seen::Logged(id), Seen::Known)
+        dict.sentences().iter().position(|s| s.ids.contains(&id_text)).map_or(Seen::Logged(id), |i| Seen::Known(i, Grade::None))
     }
 
     fn of(panel: &Panel, e: &crate::affix::Entry) -> Seen {
         match e.lookup {
-            Lookup::Found { index, .. } => Seen::Known(index),
+            Lookup::Found { index, .. } => Seen::Known(index, frames::game_grade(e.colour)),
             other => Seen::Unknown {
                 text: e.text.clone(),
                 ambiguous: other == Lookup::Ambiguous,
@@ -658,10 +659,14 @@ impl AffixLive {
         }
         let table = Dict::builtin().with_learned(learned).with_grades(grades);
         let mut dict = self.dict.lock().unwrap_or_else(PoisonError::into_inner);
-        // the same sentences in the same places (a grade picked changes no more), and the same grades too
+        // the same sentences in the same places (a grade picked changes no more), and the same grades too, the user's or
+        // not: "not framed" (the user's None) and the game's colour (a `game` sentence not graded, None too) differ, and
+        // so do a table warning and the user's Warn (framed by the game's colour, by the grade). Comparing the grade
+        // alone kept the old table on those changes (1.2.0, 2026-11-11). The other wordings too: one more learned for a
+        // sentence changes nothing else, and the old table, without it, was kept until Ascendant restarted.
         let same_list = dict.sentences().len() == table.sentences().len()
-            && dict.sentences().iter().zip(table.sentences()).all(|(a, b)| a.en == b.en && a.zh == b.zh && a.ids == b.ids);
-        let same = same_list && dict.sentences().iter().zip(table.sentences()).all(|(a, b)| a.grade == b.grade);
+            && dict.sentences().iter().zip(table.sentences()).all(|(a, b)| a.en == b.en && a.zh == b.zh && a.ids == b.ids && a.alt == b.alt);
+        let same = same_list && dict.sentences().iter().zip(table.sentences()).all(|(a, b)| (a.grade, a.graded) == (b.grade, b.graded));
         if !same {
             *dict = table;
             // the map shown: the log's ids again in the new table (an affix of it just learned gets its words); a
@@ -745,9 +750,9 @@ impl AffixLive {
         let logged: Vec<Seen> = a.ids().iter().map(|&id| Seen::of_id(&dict, id)).collect();
         // the read of the page closed just before, when the level is its map
         let read = self.map.take().filter(|m| m.log.is_none() && m.closed.elapsed() <= LEVEL_WITHIN).map(|m| m.seen);
-        let known = |list: &[Seen]| list.iter().filter_map(|s| if let Seen::Known(i) = s { Some(*i) } else { None }).collect::<Vec<usize>>();
+        let known = |list: &[Seen]| list.iter().filter_map(|s| if let Seen::Known(i, _) = s { Some(*i) } else { None }).collect::<Vec<usize>>();
         let (read_known, log_known) = (known(read.as_deref().unwrap_or_default()), known(&logged));
-        let missing: Vec<u32> = a.ids().iter().zip(&logged).filter(|(_, s)| !matches!(s, Seen::Known(i) if read_known.contains(i))).map(|(&id, _)| id).collect();
+        let missing: Vec<u32> = a.ids().iter().zip(&logged).filter(|(_, s)| !matches!(s, Seen::Known(i, _) if read_known.contains(i))).map(|(&id, _)| id).collect();
         let extra: Vec<String> = read_known.iter().filter(|i| !log_known.contains(i)).map(|&i| dict.sentences()[i].key().to_string()).collect();
         drop(dict);
         let agrees = read.as_ref().is_some_and(|r| missing.is_empty() && extra.is_empty() && r.len() == logged.len());
@@ -760,6 +765,12 @@ impl AffixLive {
             _ => (logged, true),
         };
         self.map = Some(MapShown { seen, log: Some(a.ids().to_vec()), from_log, at: SystemTime::now(), closed: Instant::now() });
+    }
+
+    /// The map page on show, as the game log last said (shown, then hidden or closed), whether the frames are on or not;
+    /// none when no page shows. For the window's switch to the Affixes tab (`auto_tab.rs`).
+    pub fn shown_page(&self) -> Option<MapPage> {
+        self.page
     }
 
     /// Whether the frames need looking after on this tick: a page shows and frames keep coming, or frames are up.
@@ -1448,6 +1459,23 @@ mod tests {
         assert_eq!(live.wants_shot_in(), Some(QUICK_EVERY));
     }
 
+    /// The page on show for the window's switch to the Affixes tab: from the log's lines alone, the frames off too.
+    #[test]
+    fn the_page_shown_follows_the_log() {
+        let mut live = AffixLive::new(|| {});
+        live.configure(false, FrameStyle::default(), &Grades::new(), &[]);
+        assert_eq!(live.shown_page(), None);
+        for (page, state, want) in [
+            (MapPage::Normal, PageState::Shown, Some(MapPage::Normal)),
+            (MapPage::Normal, PageState::Hidden, None),
+            (MapPage::Boss, PageState::Shown, Some(MapPage::Boss)),
+            (MapPage::Boss, PageState::Closed, None),
+        ] {
+            live.note(Signal::MapPage { page, state });
+            assert_eq!(live.shown_page(), want, "{page:?} {state:?}");
+        }
+    }
+
     /// A small 16:9 frame of one grey. Dark (up to 80) is the panel on screen, bright the map before it.
     /// A dark one also has a line of "text" (bright pixels) at a row of its text area given by its grey, so two panels
     /// of different greys have different words too (the panel's sameness is told by its words, `panel::text_print`).
@@ -1605,7 +1633,7 @@ mod tests {
         assert_eq!(
             live.seen(),
             [
-                Seen::Known(7),
+                Seen::Known(7, Grade::None),
                 Seen::Unknown { text: "Not in the table".into(), ambiguous: false, cut: false, game: Grade::None },
                 Seen::Unknown { text: "Like two".into(), ambiguous: true, cut: false, game: Grade::None },
                 Seen::Unknown { text: "Cut at the".into(), ambiguous: false, cut: true, game: Grade::None },
@@ -1624,7 +1652,7 @@ mod tests {
         let mut live = AffixLive::new(|| {});
         live.sent = 5;
         live.memory.push(("x".into(), Lookup::Unknown));
-        live.seen = vec![Seen::Known(3)];
+        live.seen = vec![Seen::Known(3, Grade::None)];
         live.configure(true, FrameStyle::Outline, &Grades::new(), &[]);
         assert_eq!((live.shown_seq, live.memory.len(), live.seen.len()), (0, 1, 1), "the same table");
         let (first, was) = live.dict.lock().map(|d| (d.sentences()[0].key().to_string(), d.sentences()[0].grade)).unwrap();
@@ -1636,6 +1664,47 @@ mod tests {
         let learned = [Learned { id: "5888888".into(), en: "#% a new affix".into(), zh: String::new() }];
         live.configure(true, FrameStyle::Outline, &Grades::from([(first, other)]), &learned);
         assert_eq!((live.shown_seq, live.seen.len()), (6, 0), "an affix learned: the sentences seen go");
+    }
+
+    /// Another wording learned for a sentence, and nothing else, is a new table (review of 1.3.0): it is matched from the
+    /// next read on, not after a restart.
+    #[test]
+    fn another_wording_alone_is_a_new_table() {
+        let mut live = AffixLive::new(|| {});
+        live.configure(true, FrameStyle::Outline, &Grades::new(), &[]);
+        live.sent = 7;
+        let wording = Learned { id: "5122006".into(), en: String::new(), zh: "怪物 #% 腐蝕抗性".into() };
+        live.configure(true, FrameStyle::Outline, &Grades::new(), std::slice::from_ref(&wording));
+        assert_eq!(live.shown_seq, 7, "a new table");
+        let d = live.dict.lock().unwrap();
+        let s = d.sentences().iter().find(|s| s.ids.iter().any(|x| x == "5122006")).expect("5122006");
+        assert_eq!(s.alt, ["怪物 #% 腐蝕抗性"]);
+    }
+
+    /// Switching an affix between the game's colour and "not framed", or between the game's colour and the grade the
+    /// table had for it before 1.2.0, is a new table: the next read frames it the new way (the old table was kept, as
+    /// the grade alone was the same: 5634003 framed red after "not framed" was picked, 2026-11-11 17:07).
+    #[test]
+    fn the_games_colour_and_a_grade_alike_are_two_tables() {
+        let mut live = AffixLive::new(|| {});
+        live.configure(true, FrameStyle::Outline, &Grades::new(), &[]);
+        let index = |id: &str| live.dict.lock().unwrap().sentences().iter().position(|s| s.ids.iter().any(|x| x == id)).expect(id);
+        let (game, warn) = (index("5634003"), index("5111003"));
+        {
+            let d = live.dict.lock().unwrap();
+            assert_eq!((d.sentences()[game].grade, d.sentences()[game].graded), (Grade::None, false), "5634003: the game's colour");
+            assert_eq!((d.sentences()[warn].grade, d.sentences()[warn].graded), (Grade::Warn, false), "5111003: a table warning");
+        }
+        let steps: [(&str, Option<Grade>); 6] = [("5634003", Some(Grade::None)), ("5634003", None), ("5634003", Some(Grade::None)), ("5111003", Some(Grade::Warn)), ("5111003", None), ("5111003", Some(Grade::Warn))];
+        for (n, (id, pick)) in steps.into_iter().enumerate() {
+            live.sent = n as u64 + 1;
+            let grades: Grades = pick.map(|g| (id.to_string(), g)).into_iter().collect();
+            live.configure(true, FrameStyle::Outline, &grades, &[]);
+            assert_eq!(live.shown_seq, live.sent, "step {n}: {id} {pick:?} is a new table");
+            let d = live.dict.lock().unwrap();
+            let s = &d.sentences()[if id == "5634003" { game } else { warn }];
+            assert_eq!(s.frame(), pick, "step {n}: {id} framed as picked (None: the game's colour)");
+        }
     }
 
     /// A click takes the frames down at once and drops the reads on the way (of the panel before); frames while the
@@ -1977,18 +2046,18 @@ mod tests {
             live.note(Signal::MapPage { page: MapPage::Normal, state: PageState::Closed });
             live
         };
-        let mut live = read_and_close(vec![Seen::Known(a.0), Seen::Known(b.0)]);
-        assert_eq!(live.seen(), [Seen::Known(a.0), Seen::Known(b.0)], "the last read, the page closed");
+        let mut live = read_and_close(vec![Seen::Known(a.0, Grade::None), Seen::Known(b.0, Grade::None)]);
+        assert_eq!(live.seen(), [Seen::Known(a.0, Grade::None), Seen::Known(b.0, Grade::None)], "the last read, the page closed");
         assert!(matches!(live.hints().map, Some(super::super::affix_page::MapTitle::This { from_log: false })));
         let _ = live.take_notes();
         live.note(Signal::MapAffixes(MapAffixes::of(Some(5308), &[b.1, a.1])));
-        assert_eq!(live.seen(), [Seen::Known(a.0), Seen::Known(b.0)], "the same affixes: the read's list, its order");
+        assert_eq!(live.seen(), [Seen::Known(a.0, Grade::None), Seen::Known(b.0, Grade::None)], "the same affixes: the read's list, its order");
         assert!(matches!(live.take_notes().as_slice(), [Note::LogCheck { read: 2, missing, extra, .. }] if missing.is_empty() && extra.is_empty()));
         // read one wrong, the log names another and one the table lacks
-        let mut live = read_and_close(vec![Seen::Known(a.0), Seen::Unknown { text: "x".into(), ambiguous: false, cut: false, game: Grade::None }]);
+        let mut live = read_and_close(vec![Seen::Known(a.0, Grade::None), Seen::Unknown { text: "x".into(), ambiguous: false, cut: false, game: Grade::None }]);
         let _ = live.take_notes();
         live.note(Signal::MapAffixes(MapAffixes::of(Some(5308), &[b.1, 5_655_555])));
-        assert_eq!(live.seen(), [Seen::Known(b.0), Seen::Logged(5_655_555)], "the log's list");
+        assert_eq!(live.seen(), [Seen::Known(b.0, Grade::None), Seen::Logged(5_655_555)], "the log's list");
         assert!(matches!(live.hints().map, Some(super::super::affix_page::MapTitle::This { from_log: true })));
         let notes = live.take_notes();
         let [Note::LogCheck { missing, extra, .. }] = notes.as_slice() else { panic!("{notes:?}") };
@@ -2002,7 +2071,7 @@ mod tests {
         // nothing read before the page closed: the log's list
         let mut live = read_and_close(Vec::new());
         live.note(Signal::MapAffixes(MapAffixes::of(Some(5308), &[a.1])));
-        assert_eq!(live.seen(), [Seen::Known(a.0)]);
+        assert_eq!(live.seen(), [Seen::Known(a.0, Grade::None)]);
         // a page shown takes over
         live.note(Signal::MapPage { page: MapPage::Normal, state: PageState::Shown });
         assert!(live.hints().map.is_none());
@@ -2333,7 +2402,7 @@ mod tests {
         assert_eq!(feed(&mut live, 40), 2, "the background moved: read");
         live.take(done(&live, vec![entry(&near, false, Lookup::Unknown)]));
         assert_eq!(live.boxes.len(), 1, "found before: still framed");
-        assert_eq!(live.seen(), [Seen::Known(index)]);
+        assert_eq!(live.seen(), [Seen::Known(index, Grade::None)]);
         assert_eq!(feed(&mut live, 10), 3);
         live.take(done(&live, vec![entry("Another affix that reads nothing alike", false, Lookup::Unknown)]));
         assert!(live.boxes.is_empty(), "another panel: its own reads");

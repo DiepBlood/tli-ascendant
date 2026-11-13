@@ -1786,6 +1786,8 @@ fn tartarus_extra(req: &Request, text: &str, cancel: &AtomicBool, status: &dyn F
     };
     let crash = req.app_dir.as_ref().map(|d| d.join("crash.log"));
     if let Some(report) = super::health::check(&req.dir, crash.as_deref()) {
+        // The game's frame rate on the board (`super::fps`) goes into report.txt's notes; its rows are in log.jsonl.
+        notes.extend(report.fps);
         extra.health = report.issues;
     }
     if let Some(text) = crash.and_then(|p| std::fs::read_to_string(p).ok()) {

@@ -50,6 +50,12 @@ pub struct Sentence {
     pub zh: String,
     en_key: String,
     zh_key: String,
+    /// Other wordings of the affix the game writes for another of its ids, either language: a learned text unlike the
+    /// sentence's own in that language (5422003 "怪物 #% 腐蝕抗性" joined 5122006 "#% 怪物腐蝕抗性" by their English,
+    /// 2026-11-11: its Chinese was dropped and every read of it was unknown). One sentence, one grade, every wording
+    /// matched ([`Sentence::keys`]).
+    pub alt: Vec<String>,
+    alt_keys: Vec<String>,
     /// Learned from the game log, not in the default table ([`Dict::with_learned`]): framed by the game's colour on
     /// the panel until the user grades it (`affix::read`, the user's choice of 2026-11-09).
     pub learned: bool,
@@ -80,6 +86,17 @@ impl Sentence {
     /// and a new id joins at the end).
     pub fn key(&self) -> &str {
         &self.ids[0]
+    }
+
+    /// Every key the sentence is matched by: its English and Chinese ones (those it has) and its other wordings'
+    /// ([`Sentence::alt`]).
+    fn keys(&self) -> impl Iterator<Item = &String> {
+        [&self.en_key, &self.zh_key].into_iter().chain(&self.alt_keys).filter(|k| !k.is_empty())
+    }
+
+    /// Whether `k` is one of the sentence's keys.
+    fn has_key(&self, k: &str) -> bool {
+        !k.is_empty() && self.keys().any(|x| x == k)
     }
 
     /// Known only from the screen: every id is `ocr-*` (its texts were read off the screen, not the game's own).
@@ -153,7 +170,8 @@ impl Dict {
     /// - else a new sentence, not framed ([`Grade::None`], [`Sentence::learned`]), after the table's.
     ///
     /// Joining adds the id and fills the languages the sentence lacks; a sentence known only from the screen takes the
-    /// game's words in place of the read ones. When the text filled in is another sentence's already (or near a
+    /// game's words in place of the read ones; other words in a language the sentence has are kept as another wording of
+    /// it ([`Sentence::alt`]), unless another sentence has them. When the text filled in is another sentence's already (or near a
     /// screen-only sentence's), the two are one affix and are folded into one (ids and texts together; a learned
     /// sentence folded with a table one takes the table's grade), unless their words in the other language differ
     /// (two affixes the translation does not tell apart: both kept). Grades follow any of a sentence's ids
@@ -167,7 +185,7 @@ impl Dict {
             }
             let by_id = self.sentences.iter().position(|s| s.ids.contains(&l.id));
             let found = by_id
-                .or_else(|| self.sentences.iter().position(|s| (!en_key.is_empty() && s.en_key == en_key) || (!zh_key.is_empty() && s.zh_key == zh_key)))
+                .or_else(|| self.sentences.iter().position(|s| s.has_key(&en_key) || s.has_key(&zh_key)))
                 .or_else(|| self.near_screen(&en_key, &zh_key, None));
             match found {
                 Some(i) => {
@@ -184,6 +202,8 @@ impl Dict {
                     zh: l.zh.clone(),
                     en_key,
                     zh_key,
+                    alt: Vec::new(),
+                    alt_keys: Vec::new(),
                     learned: true,
                     graded: false,
                     twin: false,
@@ -238,7 +258,17 @@ impl Dict {
                 if zh { s.zh = text.clone() } else { s.en = text.clone() }
                 continue;
             }
-            if have == k || (!have.is_empty() && !screen_only) {
+            if have == k || self.sentences[i].alt_keys.contains(&k) {
+                continue;
+            }
+            if !have.is_empty() && !screen_only {
+                // Another wording of the affix (the game's own, for this id): kept as one, matched as the sentence's
+                // own. Not when another sentence has these words: two affixes that read the same, left to that one.
+                if !self.sentences.iter().enumerate().any(|(j, s)| j != i && s.has_key(&k)) {
+                    let s = &mut self.sentences[i];
+                    s.alt.push(text.clone());
+                    s.alt_keys.push(k);
+                }
                 continue;
             }
             // The same words are another sentence's (or near a screen-only one's): one affix, folded into this one. Not
@@ -269,10 +299,28 @@ impl Dict {
                 if s.zh.is_empty() {
                     (s.zh, s.zh_key) = (other.zh, other.zh_key);
                 }
+                for (text, k) in other.alt.into_iter().zip(other.alt_keys) {
+                    if !s.alt_keys.contains(&k) {
+                        s.alt.push(text);
+                        s.alt_keys.push(k);
+                    }
+                }
                 if s.learned && !other.learned {
                     (s.grade, s.before, s.learned) = (other.grade, other.before, false);
                 }
                 s.twin |= other.twin;
+            }
+            // These words are now this sentence's own: another sentence that kept them as another wording lets them go.
+            // A sentence's own words win over another's other wording, as when the other wording comes second (it is
+            // not kept, above); without this the result hung on the order learned: Z1 learned first as B's other
+            // wording, then as A's own, matched both, and the read was ambiguous or the wrong one (review of 1.3.0).
+            for (j, other) in self.sentences.iter_mut().enumerate() {
+                if j != i
+                    && let Some(p) = other.alt_keys.iter().position(|x| *x == k)
+                {
+                    other.alt.remove(p);
+                    other.alt_keys.remove(p);
+                }
             }
             let s = &mut self.sentences[i];
             if zh {
@@ -319,6 +367,8 @@ impl Dict {
                 before,
                 en_key: key(&en),
                 zh_key: key(&zh),
+                alt: Vec::new(),
+                alt_keys: Vec::new(),
                 en,
                 zh,
                 learned: false,
@@ -354,9 +404,8 @@ impl Dict {
         // every sentence's distance to the text (its nearer language), and whether it passes the fuzzy limits
         let mut all: Vec<(usize, usize, bool)> = Vec::with_capacity(self.sentences.len());
         for (i, s) in self.sentences.iter().enumerate() {
-            let best = [&s.en_key, &s.zh_key]
-                .iter()
-                .filter(|t| !t.is_empty())
+            let best = s
+                .keys()
                 .map(|t| {
                     let d = levenshtein(&k, t);
                     let longest = n.max(t.chars().count());
@@ -389,7 +438,7 @@ impl Dict {
         if cjk
             && n >= CJK_LONG
             && let Some(&(2, i, _)) = all.first()
-            && !swapped_pair(&k, &self.sentences[i].zh_key)
+            && !self.sentences[i].keys().any(|t| swapped_pair(&k, t))
             && all.get(1).is_none_or(|&(d2, _, _)| d2 > 2)
             && !self.sentences[i].en_key.is_empty()
         {
@@ -422,7 +471,7 @@ impl Dict {
         if k.is_empty() {
             return None;
         }
-        let equal: Vec<usize> = (0..self.sentences.len()).filter(|&i| self.sentences[i].en_key == k || self.sentences[i].zh_key == k).collect();
+        let equal: Vec<usize> = (0..self.sentences.len()).filter(|&i| self.sentences[i].has_key(&k)).collect();
         let [i] = equal[..] else { return None };
         let frame = self.sentences[i].frame();
         let read: Vec<char> = k.chars().collect();
@@ -430,7 +479,7 @@ impl Dict {
             if j == i || s.frame() == frame {
                 continue;
             }
-            for t in [&s.en_key, &s.zh_key].into_iter().filter(|t| !t.is_empty()) {
+            for t in s.keys() {
                 // an exact match is ambiguous only for sentences of another grade within one edit
                 if levenshtein(&k, t) > 1 {
                     continue;
@@ -462,7 +511,7 @@ impl Dict {
         let near: Vec<(usize, &Sentence)> = self
             .sentences
             .iter()
-            .filter_map(|s| [&s.en_key, &s.zh_key].iter().filter(|t| !t.is_empty()).map(|t| levenshtein(&k, t)).min().map(|d| (d, s)))
+            .filter_map(|s| s.keys().map(|t| levenshtein(&k, t)).min().map(|d| (d, s)))
             .collect();
         let d = near.iter().map(|(d, _)| *d).min()?;
         // a grade equal to the table's from before 1.2.0 counts as none: such grades were not saved then (equal to the
@@ -481,7 +530,7 @@ impl Dict {
         let dist: Vec<usize> = self
             .sentences
             .iter()
-            .map(|s| [&s.en_key, &s.zh_key].iter().filter(|t| !t.is_empty()).map(|t| levenshtein(&k, t)).min().unwrap_or(usize::MAX))
+            .map(|s| s.keys().map(|t| levenshtein(&k, t)).min().unwrap_or(usize::MAX))
             .collect();
         let best = (0..dist.len()).min_by_key(|&i| dist[i]);
         let rival = best.and_then(|b| (0..dist.len()).filter(|&j| self.sentences[j].frame() != self.sentences[b].frame()).map(|j| dist[j]).min());
@@ -497,8 +546,7 @@ impl Dict {
         let starts: Vec<(usize, usize)> = (0..self.sentences.len())
             .filter_map(|i| {
                 let s = &self.sentences[i];
-                [&s.en_key, &s.zh_key]
-                    .iter()
+                s.keys()
                     .filter(|t| prefix_distance(k, t) <= limit)
                     .map(|t| t.chars().count())
                     .min()
@@ -559,8 +607,20 @@ pub fn key(text: &str) -> String {
             while j < src.len() && src[j].is_whitespace() {
                 j += 1;
             }
-            while j < src.len() && is_digit(src[j]) {
-                j += 1;
+            loop {
+                while j < src.len() && is_digit(src[j]) {
+                    j += 1;
+                }
+                // digits split by spaces are one number: the OCR reads 15 as "1 5" at times (2026-11-11). No game text
+                // has two numbers with only spaces between them (a test checks the table), so none is joined wrongly.
+                let mut k = j;
+                while k < src.len() && src[k].is_whitespace() {
+                    k += 1;
+                }
+                if k == j || !next_digit(&src, k) {
+                    break;
+                }
+                j = k;
             }
             if j + 1 < src.len() && src[j] == '.' && is_digit(src[j + 1]) {
                 j += 1;
@@ -696,6 +756,123 @@ mod tests {
         // 1080p misreads (2026-11-10 04:43)
         assert_eq!(key("魔 法 和 稀 有 怪 物 被 撉 敗 時"), key("魔法和稀有怪物被擊敗時"));
         assert_eq!(key("棸能褔"), key("聚能福"));
+    }
+
+    /// The OCR reads 15 as "1 5" and 12 as "1 2" at times: one number, so these short affixes are found exactly (they
+    /// were unknown, or matched only near, on every such read up to 2026-11-11). Numbers kept apart by anything but
+    /// spaces stay two, and no text of the table has two numbers with only spaces between them.
+    #[test]
+    fn digits_split_by_spaces_are_one_number() {
+        let d = Dict::builtin();
+        let found = |text: &str, id: &str| match d.lookup(text, false) {
+            Lookup::Found { index, exact: true, .. } => assert!(d.sentences()[index].ids.iter().any(|x| x == id), "{text:?}: {:?}", d.sentences()[index].ids),
+            other => panic!("{text:?}: {other:?}"),
+        };
+        found("玩 家 額 外 一 1 5 % 傷 害", "5112001");
+        found("玩 家 額 外 一 1 5 % 投 射 物 傷 害", "5112009");
+        found("怪 物 對 生 命 造 成 額 外 + 1 5 % 傷 害", "5121009");
+        found("怪 物 對 護 盾 造 成 額 外 + 1 5 % 傷 害", "5121010");
+        found("玩 家 生 命 返 還 與 護 盾 返 還 一 1 2 %", "5311009");
+        found("玩 家 受 詛 咒 效 果 時 , 每 2 秒 造 成 的 傷 害 額外 一 1 2 % , 最 高 疊 加 3 次", "5212008");
+        found("稀 有 怪 物 每 被 擊 中 1 次 , 獲 得 3 % 避 免 傷 害 機率 ( 最 多 疊 加 1 5 次 )", "5422014");
+        assert_eq!(key("+1 5% additional Damage"), "#additionaldamage");
+        assert_eq!(key("1 2 . 5 秒"), "##秒", "a decimal point with spaces around it is not joined");
+        assert_eq!(key("2s 3s"), "#s#s");
+        assert_eq!(key("1 , 5"), "##");
+        let two_numbers = |t: &str| {
+            let c: Vec<char> = t.chars().collect();
+            let num = |x: char| x == '#' || is_digit(x);
+            (0..c.len()).any(|i| num(c[i]) && c[i + 1..].iter().position(|x| !x.is_whitespace()).is_some_and(|n| n > 0 && num(c[i + 1 + n])))
+        };
+        assert!(two_numbers("# #") && !two_numbers("#s #"));
+        for s in d.sentences() {
+            for t in [&s.en, &s.zh].into_iter().chain(&s.alt) {
+                assert!(!two_numbers(t), "two numbers with only spaces between them in {t:?}");
+            }
+        }
+    }
+
+    /// A table sentence with English only takes the Chinese learned for its id as its own (not another wording): 5521026
+    /// "稀有怪物每秒施加 # 加劇值" is found once learned, unknown before (2026-11-12: unknown on the visits before the
+    /// game log had taught its Chinese, found on the next one).
+    #[test]
+    fn learned_chinese_fills_a_sentence_with_english_only() {
+        use super::super::learned::Learned;
+        let read = "稀 有 怪 物 每 秒 施 加 3 加 劇 值";
+        let d = Dict::builtin();
+        let i = d.sentences().iter().position(|s| s.ids == ["5521026"]).expect("5521026");
+        assert!(d.sentences()[i].zh.is_empty() && !d.sentences()[i].en.is_empty(), "the table has its English only");
+        assert_eq!(d.lookup(read, false), Lookup::Unknown);
+        let en = d.sentences()[i].en.clone();
+        let learned = d.with_learned(&[Learned { id: "5521026".into(), en: en.clone(), zh: "稀有怪物每秒施加 # 加劇值".into() }]);
+        let s = &learned.sentences()[i];
+        assert_eq!((s.zh.as_str(), s.alt.len(), s.en == en), ("稀有怪物每秒施加 # 加劇值", 0, true));
+        assert!(matches!(learned.lookup(read, false), Lookup::Found { index, exact: true, .. } if index == i));
+    }
+
+    /// A sentence's own words in a language win over another sentence's other wording (`absorb`, review of 1.3.0): the
+    /// result does not hang on which was learned first.
+    #[test]
+    fn the_order_learned_gives_one_table() {
+        use super::super::learned::Learned;
+        // B (5122006) gets Z1 as another wording; A, English only, gets Z1 as its own Chinese.
+        let to_b = Learned { id: "5122006".into(), en: String::new(), zh: "怪物 #% 腐蝕抗性".into() };
+        let a = Learned { id: "5999999".into(), en: "#% Monster Something Else".into(), zh: String::new() };
+        let to_a = Learned { id: "5999999".into(), en: String::new(), zh: "怪物 #% 腐蝕抗性".into() };
+        let words = |d: &Dict| d.sentences().iter().map(|s| (s.ids.clone(), s.en.clone(), s.zh.clone(), s.alt.clone())).collect::<Vec<_>>();
+        let first = Dict::builtin().with_learned(&[to_b.clone(), a.clone(), to_a.clone()]);
+        let second = Dict::builtin().with_learned(&[a, to_a, to_b]);
+        assert_eq!(words(&first), words(&second), "the same table either way");
+        let at = first.sentences().iter().position(|s| s.ids == ["5999999"]).expect("A");
+        assert_eq!(first.sentences()[at].zh, "怪物 #% 腐蝕抗性");
+        let b = first.sentences().iter().find(|s| s.ids.contains(&"5122006".to_string())).expect("B");
+        assert!(b.alt.is_empty(), "{:?}", b.alt);
+        for d in [&first, &second] {
+            assert!(matches!(d.lookup("怪 物 + 47 % 腐 蝕 抗 性", false), Lookup::Found { index, .. } if index == at));
+        }
+    }
+
+    /// 5422003, learned as "#% Monster Erosion Resistance" / "怪物 #% 腐蝕抗性", joins the table's 5122006 ("#% 怪物腐蝕抗性")
+    /// by its English: its Chinese is kept as another wording, so the panel's "怪物 +47% 腐蝕抗性" is found (it was unknown
+    /// on every read, 2026-11-11), both ids share one grade, and the English read stays sure once the user grades either.
+    #[test]
+    fn another_wording_of_a_learned_affix_is_kept() {
+        use super::super::learned::Learned;
+        let erosion = Learned { id: "5422003".into(), en: "#% Monster Erosion Resistance".into(), zh: "怪物 #% 腐蝕抗性".into() };
+        let table = Dict::builtin();
+        let d = table.clone().with_learned(std::slice::from_ref(&erosion));
+        let i = d.sentences().iter().position(|s| s.ids.contains(&"5122006".to_string())).expect("5122006");
+        let s = &d.sentences()[i];
+        assert_eq!(s.ids, ["5122006", "5422003"], "one sentence, both ids");
+        assert_eq!((s.zh.as_str(), s.alt.as_slice()), ("#% 怪物腐蝕抗性", &["怪物 #% 腐蝕抗性".to_string()][..]));
+        assert_eq!(d.sentences().len(), table.sentences().len(), "no sentence added");
+        let (panel, table_words, english) = ("怪 物 + 47 % 腐 蝕 抗 性", "+47% 怪物腐蝕抗性", "+47% Monster Erosion Resistance");
+        assert_eq!(table.lookup(panel, false), Lookup::Unknown, "without the learned wording");
+        for text in [panel, table_words, english] {
+            assert!(matches!(d.lookup(text, false), Lookup::Found { index, exact: true, .. } if index == i), "{text}");
+        }
+        for id in ["5122006", "5422003"] {
+            let graded = d.clone().with_grades(&Grades::from([(id.to_string(), Grade::Danger)]));
+            for text in [panel, table_words, english] {
+                assert!(
+                    matches!(graded.lookup(text, false), Lookup::Found { index, grade: Grade::Danger, exact: true } if index == i),
+                    "graded under {id}: {text} {:?}",
+                    graded.lookup(text, false)
+                );
+            }
+            assert_eq!(graded.exact_only(panel), Some(i), "graded under {id}");
+            // a character of the other wording dropped: not found, but the user's grade frames it
+            assert_eq!(graded.lookup("怪物+47%腐蝕抗", false), Lookup::Unknown);
+            assert_eq!(graded.near_user_grade("怪物+47%腐蝕抗"), Some(Grade::Danger), "graded under {id}");
+        }
+        // learned twice: one wording
+        let twice = table.clone().with_learned(&[erosion.clone(), erosion]);
+        assert_eq!(twice.sentences()[i].alt.len(), 1);
+        // words another sentence has are that sentence's: not kept as another wording
+        let pierce = table.sentences().iter().position(|s| s.ids.contains(&"5521018".to_string())).expect("5521018");
+        let other = table.clone().with_learned(&[Learned { id: "5422098".into(), en: "#% Monster Erosion Resistance".into(), zh: table.sentences()[pierce].zh.clone() }]);
+        assert!(other.sentences()[i].alt.is_empty(), "{:?}", other.sentences()[i].alt);
+        assert!(matches!(other.lookup("稀有怪物 +10% 腐蝕抗性穿透", false), Lookup::Found { index, .. } if index == pierce));
     }
 
     /// No two sentences of the built-in table have the same words in a language: an affix the game writes alike under

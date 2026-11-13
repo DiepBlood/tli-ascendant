@@ -63,6 +63,10 @@ pub struct Settings {
     /// before; a new player starts at the current one. See `ui.rs` `configure_affixes`.
     #[serde(default)]
     pub affix_defaults: u32,
+    /// The learned affixes the user marked read on the affix page ("Mark all as read"), by sentence (its first id): no
+    /// longer marked "New", their grades untouched (the user, 2026-11-12). A value that does not read is none.
+    #[serde(deserialize_with = "affix_read")]
+    pub affix_read: std::collections::BTreeSet<String>,
     /// Keep a log of each run's reads, advice and corrections, with the
     /// frames read, in %APPDATA%\Ascendant\runs, see [`super::runlog`].
     pub run_log: bool,
@@ -139,6 +143,9 @@ pub struct Settings {
     /// [`super::elevation::should_relaunch`]); for a game run as administrator, whose window otherwise keeps the
     /// hotkeys from Ascendant. Off by default and in older files: Windows asks at every start.
     pub start_as_admin: bool,
+    /// Switch the window to the page of a game mode as it comes up: Tartarus's board or Vorax to the Board tab, a map
+    /// page's affix panel to the Affixes tab (see `auto_tab.rs`; 1.3.0). On by default and in older files.
+    pub auto_tab: bool,
 }
 
 impl Default for Settings {
@@ -162,6 +169,7 @@ impl Default for Settings {
             affix_frame_style: crate::affix::FrameStyle::default(),
             affix_grades: crate::affix::Grades::new(),
             affix_defaults: AFFIX_DEFAULTS_GAME_COLOUR,
+            affix_read: std::collections::BTreeSet::new(),
             run_log: true,
             keep_all_logs: false,
             observe: false,
@@ -184,6 +192,7 @@ impl Default for Settings {
             layout: "auto".to_string(),
             game_log: None,
             start_as_admin: false,
+            auto_tab: true,
         }
     }
 }
@@ -212,6 +221,14 @@ fn affix_grades<'de, D: serde::Deserializer<'de>>(d: D) -> Result<crate::affix::
     let value = serde_json::Value::deserialize(d)?;
     let serde_json::Value::Object(map) = value else { return Ok(crate::affix::Grades::new()) };
     Ok(map.into_iter().filter_map(|(k, v)| serde_json::from_value::<crate::affix::Grade>(v).ok().map(|g| (k, g))).collect())
+}
+
+/// [`Settings::affix_read`] as saved: the texts of a list, the rest left out, and none for a value that is not a list
+/// (as [`affix_grades`]).
+fn affix_read<'de, D: serde::Deserializer<'de>>(d: D) -> Result<std::collections::BTreeSet<String>, D::Error> {
+    let value = serde_json::Value::deserialize(d)?;
+    let serde_json::Value::Array(list) = value else { return Ok(std::collections::BTreeSet::new()) };
+    Ok(list.into_iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
 }
 
 /// [`Settings::affix_frame_style`] as saved; the default style for a value that does not read.
@@ -303,6 +320,7 @@ impl Settings {
             "keep_all_logs": self.keep_all_logs,
             "check_updates": self.check_updates,
             "start_as_admin": self.start_as_admin,
+            "auto_tab": self.auto_tab,
             "game_log_set": self.game_log.is_some(),
             "vorax_enabled": self.vorax_enabled,
             "vorax_rollouts": self.vorax_rollouts,
@@ -423,6 +441,15 @@ mod tests {
         assert_eq!((back.affix_grades, back.affix_frame_style), (s.affix_grades, FrameStyle::Bar));
         let none: Settings = serde_json::from_str(r#"{"affix_grades": null, "rollouts": 900}"#).unwrap();
         assert!(none.affix_grades.is_empty());
+        // the affixes marked read: kept through a save, a broken value or entry losing only itself
+        let mut s = Settings::default();
+        s.affix_read.insert("5888888".into());
+        let back: Settings = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+        assert_eq!(back.affix_read, s.affix_read);
+        let broken: Settings = serde_json::from_str(r#"{"affix_read": ["5112001", 7, null], "rollouts": 900}"#).unwrap();
+        assert_eq!((broken.affix_read.len(), broken.rollouts), (1, 900));
+        let broken: Settings = serde_json::from_str(r#"{"affix_read": "all", "rollouts": 900}"#).unwrap();
+        assert!(broken.affix_read.is_empty() && broken.rollouts == 900);
     }
 
     #[test]
@@ -459,6 +486,26 @@ mod tests {
         assert!(on.start_as_admin);
         let back: Settings = serde_json::from_value(serde_json::to_value(&on).unwrap()).unwrap();
         assert!(back.start_as_admin, "written and read back");
+    }
+
+    /// "Switch tabs when a game mode is detected": on by default and in an older file without it; off is written and
+    /// read back, through the settings file too.
+    #[test]
+    fn auto_tab_on_by_default_and_in_older_files() {
+        let old: Settings = serde_json::from_str(r#"{"read_hotkey": "F1", "rollouts": 900}"#).unwrap();
+        assert!(old.auto_tab, "an older file: on");
+        assert!(Settings::default().auto_tab);
+        let off: Settings = serde_json::from_str(r#"{"auto_tab": false}"#).unwrap();
+        assert!(!off.auto_tab);
+        let back: Settings = serde_json::from_value(serde_json::to_value(&off).unwrap()).unwrap();
+        assert!(!back.auto_tab, "written and read back");
+        let root = appdata("auto-tab");
+        let path = root.join("settings.json");
+        std::fs::write(&path, r#"{"rollouts": 900}"#).unwrap();
+        assert!(Settings::load_from(&path).auto_tab, "an older version's file");
+        std::fs::write(&path, serde_json::to_string_pretty(&off).unwrap()).unwrap();
+        assert!(!Settings::load_from(&path).auto_tab, "saved off");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// The click-through hotkey is gone (1.0.2): an older file's `through_hotkey` is ignored, not an error, and its

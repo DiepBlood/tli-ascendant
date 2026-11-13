@@ -259,6 +259,11 @@ pub struct AscendantApp {
     /// The warnings of the last reading, notes left out, so the Board tab
     /// opens when a reading brings the first.
     warned: usize,
+    /// The game modes followed for the switch to their page (`Settings::auto_tab`, see `auto_tab.rs` and
+    /// [`AscendantApp::auto_switch`]).
+    auto_tab: super::auto_tab::AutoTab,
+    /// Started for a preview (an ASCENDANT_PREVIEW_* variable set): the page it asked for stays, no automatic switch.
+    previewing: bool,
     /// This exe; None when Windows can't tell, which hides install and update.
     current: Option<PathBuf>,
     /// This exe runs from the install folder.
@@ -505,6 +510,8 @@ impl AscendantApp {
             nudge_back: None,
             tab: Tab::Board,
             warned: 0,
+            auto_tab: Default::default(),
+            previewing: std::env::vars_os().any(|(k, _)| k.to_string_lossy().starts_with("ASCENDANT_PREVIEW")),
             current,
             installed,
             checking: None,
@@ -1674,7 +1681,7 @@ impl AscendantApp {
         let s = &mut self.settings;
         let seen = self.affix_live.seen().to_vec();
         let hints = self.affix_live.hints();
-        if super::affix_page::draw(ui, &mut self.affix_page, &mut s.affix_frames, &mut s.affix_frame_style, &mut s.affix_grades, &seen, hints) {
+        if super::affix_page::draw(ui, &mut self.affix_page, &mut s.affix_frames, &mut s.affix_frame_style, &mut s.affix_grades, &mut s.affix_read, &seen, hints) {
             self.save();
             self.configure_affixes();
         }
@@ -1757,18 +1764,41 @@ impl AscendantApp {
 
     /// Switches the page; every switch goes through here (the preview entry only sets the first page). The floating
     /// windows that sit over a page close as it is left: "What's new" (opened from the notice or Settings), the
-    /// instruments and theme window and the cell correction window (both opened from the board), and the "Restore
-    /// defaults" confirmation (Settings). They share the spot under the title bar, so one left open would cover the
-    /// next page.
+    /// instruments and theme window and the cell correction window (both opened from the board), the "Restore
+    /// defaults" confirmation (Settings), and the affix page's questions ("Reset every grade?", "Mark all as read?",
+    /// [`super::affix_page::AffixPage::leave`]). They share the spot under the title bar, so one left open would cover
+    /// the next page; the affix page's came back by itself when the page showed again.
     fn set_tab(&mut self, tab: Tab) {
         if self.tab != tab {
             self.floats = Floats::default();
             self.editing = None;
             self.restoring = false;
+            self.affix_page.leave();
             // A hotkey being recorded is on the settings page: leaving it cancels, and the hotkeys come back.
             self.stop_recording();
         }
         self.tab = tab;
+    }
+
+    /// The switch to the page of a game mode that just came up (`Settings::auto_tab`, rules in `auto_tab.rs`): Vorax
+    /// mode ([`VoraxView::active`]) or Tartarus's board on show ([`Session::board_shown`]) to the Board tab, a normal
+    /// map's page (the one with the affix panel, [`super::affix_live::AffixLive::shown_page`]) to the Affixes tab.
+    /// Called on every tick of `logic`, Vorax mode's too, after the reads and the game log's lines were taken.
+    fn auto_switch(&mut self, ctx: &egui::Context) {
+        use super::auto_tab::{Gate, Seen, Target};
+        let vorax = self.vorax.active();
+        let seen = Seen {
+            vorax,
+            // the session is paused in Vorax mode and its reading dropped (`Session::suspend`)
+            tartarus: !vorax && self.session.board_shown(),
+            affix: self.affix_live.shown_page() == Some(gamelog::MapPage::Normal),
+        };
+        let gate = Gate { enabled: self.settings.auto_tab && !self.previewing, on_settings: self.tab == Tab::Settings, typing: ctx.text_edit_focused() };
+        match self.auto_tab.update(seen, Instant::now(), gate) {
+            Some(Target::Board) => self.set_tab(Tab::Board),
+            Some(Target::Affix) => self.set_tab(Tab::Affix),
+            None => {}
+        }
     }
 
     /// Opens "What's new", closing the instruments window at the same spot (see [`Floats`]); with `pending`, the newer
@@ -2327,7 +2357,7 @@ fn preview_health(issues: bool) -> super::health::Report {
     } else {
         Vec::new()
     };
-    super::health::Report { decisions: 312, cards_median: Some(0.42), issues }
+    super::health::Report { decisions: 312, cards_median: Some(0.42), issues, fps: None }
 }
 
 /// Whether Esc (`pressed` this frame) closes "What's new": not while a text box has the keyboard or a hotkey is
@@ -2343,7 +2373,7 @@ fn esc_closes(pressed: bool, busy: bool) -> bool {
 /// cover, so they are as trusted as the program and a fresh install sees the whole history. A new version adds its
 /// file here.
 const RELEASE_NOTES: &[(&str, &str)] =
-    &[("1.2.0", include_str!("../../data/release-notes/1.2.0.txt")), ("1.1.0", include_str!("../../data/release-notes/1.1.0.txt")),("1.0.4", include_str!("../../data/release-notes/1.0.4.txt")),("1.0.3", include_str!("../../data/release-notes/1.0.3.txt")), ("1.0.2", include_str!("../../data/release-notes/1.0.2.txt")), ("1.0.1", include_str!("../../data/release-notes/1.0.1.txt")), ("1.0.0", include_str!("../../data/release-notes/1.0.0.txt"))];
+    &[("1.3.0", include_str!("../../data/release-notes/1.3.0.txt")), ("1.2.0", include_str!("../../data/release-notes/1.2.0.txt")), ("1.1.0", include_str!("../../data/release-notes/1.1.0.txt")),("1.0.4", include_str!("../../data/release-notes/1.0.4.txt")),("1.0.3", include_str!("../../data/release-notes/1.0.3.txt")), ("1.0.2", include_str!("../../data/release-notes/1.0.2.txt")), ("1.0.1", include_str!("../../data/release-notes/1.0.1.txt")), ("1.0.0", include_str!("../../data/release-notes/1.0.0.txt"))];
 
 /// Which of the versions "What's new" lists (in its order, each with whether it is a release not installed yet) starts
 /// unfolded: the release not installed yet when there is one, else the `running` version, else the newest.
@@ -2850,6 +2880,7 @@ impl eframe::App for AscendantApp {
             self.badges.iter_mut().for_each(Notice::hide);
             // While in Vorax mode the Board tab does not show Tartarus's warning count.
             self.warned = 0;
+            self.auto_switch(ctx);
             self.poll_upload();
             return;
         }
@@ -2890,6 +2921,8 @@ impl eframe::App for AscendantApp {
             self.set_tab(Tab::Board);
         }
         self.warned = warned;
+        // a game mode that just came up: its page (the board read and the map page's lines of this tick taken above)
+        self.auto_switch(ctx);
         // The count goes with the held instruments and the theme, so a
         // restart in a new run (a higher count) clears them.
         let held = !self.session.tools.is_empty() || self.session.theme.is_some();
@@ -2955,6 +2988,10 @@ impl eframe::App for AscendantApp {
                 area = area.vertical_scroll_offset(y);
             }
             let tab = self.tab;
+            // the affix page's "Back to top", clicked on the frame before
+            if tab == Tab::Affix && self.affix_page.take_to_top() {
+                area = area.vertical_scroll_offset(0.0);
+            }
             let scrolled = area.show(ui, |ui| {
                 match self.tab {
                     Tab::Board if self.vorax.showing() => {
@@ -2977,6 +3014,9 @@ impl eframe::App for AscendantApp {
                 }
             });
             self.wheel_area = wheel_area(tab, scrolled.content_size.y, scrolled.inner_rect);
+            if tab == Tab::Affix {
+                super::affix_page::top_button(ui.ctx(), &mut self.affix_page, scrolled.state.clamped_offset().y, scrolled.inner_rect);
+            }
             // For testing (ASCENDANT_PREVIEW_MEASURE=<file>): write the content height and visible height, to
             // prove the content fits and there is no scrollbar.
             if let Some(path) = &self.preview_measure {
@@ -4129,6 +4169,14 @@ impl AscendantApp {
                 }
                 self.save();
             }
+            // the switch to a game mode's page (`auto_tab.rs`): never away from this page, so turning it on here
+            // switches nothing at once
+            let mut auto_tab = self.settings.auto_tab;
+            let hover = tr("Entering Tartarus or Vorax switches to the Board tab; affixes on a map page switch to the Affixes tab");
+            if ui.add(Switch::new(&mut auto_tab, tr("Switch tabs when a game mode is detected"))).on_hover_text(hover).changed() {
+                self.settings.auto_tab = auto_tab;
+                self.save();
+            }
         });
         theme::heading(ui, tr("Logs and reports"));
         theme::group_frame().show(ui, |ui| {
@@ -4864,14 +4912,15 @@ impl AscendantApp {
 ///   restoring them would make this run's advice wrong); `run_log` (whether to save run logs is a privacy and
 ///   disk choice, and restoring does not silently turn it on); `keep_all_logs` (restoring must never start
 ///   deleting the player's run logs); `affix_grades` (the grade the user gave each map affix, one
-///   by one: a list of their own rather than a preference, with its own two-click reset on the affix page).
+///   by one: a list of their own rather than a preference, with its own reset on the affix page); `affix_read` (the
+///   learned affixes marked read: as dismissed as `updated_seen`).
 /// - Back to default: `affix_frames` (on) and `affix_frame_style` (A frame).
 /// - Back to default: `read_hotkey`, `auto_hotkey`, `click_through` (off), `opacity`,
 ///   `window_title`, `rollouts`, `auto_read`, `auto_place`, `window_pos` and `window_size` (back to 296×520 on
 ///   the next launch and placed by the game panel again), `float_pos` (the small windows open over the main window
 ///   again), `observe`, `highlight`, `show_value`, `font_scale` (standard),
 ///   `vorax_enabled`, `vorax_rollouts`, `vorax_learn`, `vorax_strips`, `game_log` (automatic again), `start_as_admin`
-///   ("Start as administrator", off).
+///   ("Start as administrator", off), `auto_tab` ("Switch tabs when a game mode is detected", on).
 ///
 /// A field added later that is not listed as kept returns to the default. The run log files themselves are not
 /// deleted.
@@ -4896,6 +4945,8 @@ fn restored(old: &Settings) -> Settings {
         keep_all_logs: old.keep_all_logs,
         // The user's own grade of each map affix: kept (the affix page has its own reset).
         affix_grades: old.affix_grades.clone(),
+        // The learned affixes marked read: dismissed, not a preference (as `updated_seen`).
+        affix_read: old.affix_read.clone(),
         ..Settings::default()
     }
 }
@@ -6709,7 +6760,7 @@ mod tests {
             "check_updates":false,"updated_seen":"1.0.1","offer_install":false,"share_logs":true,"shared_from":"2026-11-01_00-00-00",
             "install_id":"abc","desktop_shortcut":true,"highlight":true,"show_value":false,"language":"zh-TW","vorax_enabled":false,
             "vorax_rollouts":1024,"vorax_learn":false,"vorax_strips":true,"vorax_give_up_hint":true,"font_scale":1.3,"layout":"compact",
-            "game_log":"D:/Logs/UE_game.log"}"#,
+            "game_log":"D:/Logs/UE_game.log","auto_tab":false}"#,
         )
         .unwrap();
         // the affix page's settings, off their defaults
@@ -6718,6 +6769,7 @@ mod tests {
             c.affix_frames = false;
             c.affix_frame_style = crate::affix::FrameStyle::Bar;
             c.affix_grades.insert("3500300".into(), crate::affix::Grade::None);
+            c.affix_read.insert("5888888".into());
             c
         };
         let json = |s: &Settings| serde_json::to_value(s).unwrap();
@@ -6727,8 +6779,8 @@ mod tests {
             // Every field of the test data differs from the default, so the comparison is meaningful (a new
             // field must be added to the JSON above).
             assert_ne!(&custom_v[key], default, "{key} 和預設相同");
-            // the user's affix grades are kept too
-            let kept = KEPT.contains(&key.as_str()) || key == "affix_grades";
+            // the user's affix grades and the affixes marked read are kept too
+            let kept = KEPT.contains(&key.as_str()) || key == "affix_grades" || key == "affix_read";
             let want = if kept { &custom_v[key] } else { default };
             assert_eq!(&restored_v[key], want, "{key}");
         }

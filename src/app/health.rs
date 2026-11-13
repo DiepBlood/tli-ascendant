@@ -39,6 +39,8 @@ pub struct Report {
     pub cards_median: Option<f64>,
     /// One line per thing to look at.
     pub issues: Vec<String>,
+    /// The game's frame rate on the board, with and without a solve running (`super::fps`); not an issue.
+    pub fps: Option<String>,
 }
 
 impl Report {
@@ -69,9 +71,9 @@ impl Report {
         }
     }
 
-    /// The summary and every issue, a line each, for health.txt.
+    /// The summary, the game's frame rate, and every issue, a line each, for health.txt.
     pub fn text(&self) -> String {
-        std::iter::once(self.summary()).chain(self.issues.iter().map(|i| format!("- {i}"))).collect::<Vec<_>>().join("\n") + "\n"
+        std::iter::once(self.summary()).chain(self.fps.clone()).chain(self.issues.iter().map(|i| format!("- {i}"))).collect::<Vec<_>>().join("\n") + "\n"
     }
 }
 
@@ -109,7 +111,7 @@ pub fn check(dir: &Path, crash_log: Option<&Path>) -> Option<Report> {
     let text = std::fs::read_to_string(dir.join("log.jsonl")).ok()?;
     let rows: Vec<Value> = text.lines().filter_map(|l| serde_json::from_str(l).ok()).collect();
     rows.iter().find(|r| r["kind"] == "run_end")?;
-    let mut report = Report::default();
+    let mut report = Report { fps: super::fps::summary(&rows).line(), ..Report::default() };
     let mut day = 0;
     // The advice on show: label, screen, since when its mark has shown, and
     // the longest it showed unbroken before (a held advice can flash its
